@@ -1,0 +1,28 @@
+# Advisories appear after a commit is merged, so this runs on a schedule as well as on
+# every change to a lock file. The local pre-push hook runs the same tool, but only when
+# someone happens to push.
+name: audit
+
+on:
+  push:
+    paths: ['**/Cargo.lock', '**/Cargo.toml', '.github/workflows/audit.yml']
+  pull_request:
+    paths: ['**/Cargo.lock', '**/Cargo.toml']
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit --file firmware/Cargo.lock
+      - run: cargo audit --file cli/Cargo.lock

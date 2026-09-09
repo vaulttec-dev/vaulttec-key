@@ -1,0 +1,14 @@
+# Words the spell checker flags that are correct here. Each one is a name from
+# somewhere else - an API, a package, a diagram node - not prose we chose.
+[default.extend-identifiers]
+nin = "nin"          # csv-core read_record: bytes consumed
+nout = "nout"        # csv-core read_record: bytes written
+
+[default.extend-words]
+BA = "BA"            # mermaid node id, docs/threat-model.md
+BK = "BK"            # mermaid node id, docs/threat-model.md
+gir = "gir"          # the Debian package gir1.2-vte-2.91
+Unparented = "Unparented"   # GTK term: a widget with no parent
+
+[files]
+extend-exclude = ["*.bin", "*.pem", "Cargo.lock"]

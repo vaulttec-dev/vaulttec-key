@@ -1,0 +1,45 @@
+# One board = one folder. This file is the board's identity for everything outside the
+# firmware: the CLI reads it at build time and embeds the images listed here, and
+# tools/build-vaultkey.sh reads `chip` and `target` to build and flash.
+
+name = "esp32c6-zero"
+chip = "esp32c6"                          # as espflash names it
+target = "riscv32imac-unknown-none-elf"   # rustup target the firmware is built for
+
+# How the CLI recognises the board on the USB bus.
+usb_vid = 0x303A
+usb_pid = 0x1001
+
+# What is printed on the button the user is asked to press. This board has two, and
+# the other one (RESET) reboots the chip, so "press the button" is not an instruction.
+button = "BOOT"
+
+# What `vkey setup` writes, in flash order. `secure_boot` says which chips an image is
+# for: `true` only where the Secure Boot eFuse is burned (the ROM is asked first),
+# `false` only where it is not, absent for both. A Secure Boot bootloader on a plain
+# chip would burn the eFuses itself; a plain bootloader on a Secure Boot chip does not
+# boot. The bootloaders and the table come from tools/build-bootloader.sh, the
+# signed images from tools/sign-vaultkey.sh, vaultkey.bin from tools/build-vaultkey.sh.
+[[image]]
+offset = 0x0
+file = "images/bootloader.bin"
+secure_boot = false
+
+[[image]]
+offset = 0x0
+file = "images/bootloader-sb.signed.bin"
+secure_boot = true
+
+[[image]]
+offset = 0xC000
+file = "images/partition-table.bin"
+
+[[image]]
+offset = 0x10000
+file = "images/vaultkey.bin"
+secure_boot = false
+
+[[image]]
+offset = 0x10000
+file = "images/vaultkey.signed.bin"
+secure_boot = true

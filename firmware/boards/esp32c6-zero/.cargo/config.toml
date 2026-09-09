@@ -1,0 +1,7 @@
+# Build from inside this folder so this file applies: `cargo build --release`.
+[build]
+target = "riscv32imac-unknown-none-elf"
+
+[target.riscv32imac-unknown-none-elf]
+runner = "espflash flash --chip esp32c6 --monitor"
+rustflags = ["-C", "force-frame-pointers"]

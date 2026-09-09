@@ -1,0 +1,149 @@
+# The same checks the local git hooks run (tools/checks.sh), so a pull request from
+# someone without those hooks is held to the same bar. Split into jobs by how long each
+# takes: the Rust checks are fast, the image job installs an embedded toolchain.
+#
+# Every action is pinned to a full commit SHA, not a tag: a tag can be moved to point at
+# other code. `persist-credentials: false` keeps the checkout token out of the runner's
+# git config, where a later step could read it. Both are enforced by the zizmor job below.
+name: ci
+
+on:
+  push:
+    branches: [develop]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# No global RUSTFLAGS: setting it replaces the `rustflags` in a board's
+# .cargo/config.toml rather than adding to it, and the board needs its own. Clippy gets
+# `-D warnings` on its own command line instead.
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: fmt, clippy, tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
+        with:
+          components: rustfmt, clippy
+          targets: riscv32imac-unknown-none-elf
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: firmware -> target
+      - name: rustfmt
+        run: |
+          cargo fmt --all --check --manifest-path firmware/Cargo.toml
+          cargo fmt --check --manifest-path cli/Cargo.toml
+      - name: clippy - firmware core
+        run: cargo clippy -p vaultkey-core --all-targets --locked -q --manifest-path firmware/Cargo.toml -- -D warnings
+      - name: clippy - board
+        working-directory: firmware/boards/esp32c6-zero
+        run: cargo clippy --locked -q -- -D warnings
+      - name: clippy - cli
+        run: cargo clippy --all-targets --locked -q --manifest-path cli/Cargo.toml -- -D warnings
+      - name: rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc -p vaultkey-core --no-deps --locked -q --manifest-path firmware/Cargo.toml
+          cargo doc --no-deps --locked -q --manifest-path cli/Cargo.toml
+      - name: tests
+        run: |
+          cargo test -p vaultkey-core --locked -q --manifest-path firmware/Cargo.toml
+          cargo test --locked -q --manifest-path cli/Cargo.toml
+
+  scripts:
+    name: shellcheck, mypy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: pipx install mypy
+      - name: shellcheck
+        run: git ls-files -- '*.sh' '.githooks/*' | xargs shellcheck -x -S style --
+      - name: mypy
+        run: git ls-files -- '*.py' | xargs -r mypy --strict --ignore-missing-imports --
+
+  workflows:
+    name: actionlint, zizmor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: pipx install actionlint-py zizmor
+      # actionlint checks the workflow syntax and shellchecks every `run:` block; zizmor
+      # audits the workflows themselves for the ways CI gets turned into a supply chain
+      # attack - unpinned actions, leaked credentials, template injection.
+      - run: actionlint
+      - run: zizmor --persona=regular .github/workflows/
+
+  typos:
+    name: typos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      # Exceptions live in _typos.toml, one line each with the reason.
+      - uses: crate-ci/typos@d43b6c087ac471e2ea7b8af622ff15f05c0c365b # v1.50.1
+
+  images:
+    name: firmware image is reproducible and signed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
+        with:
+          targets: riscv32imac-unknown-none-elf
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: firmware -> target
+      - run: cargo install espflash --locked
+      - run: pipx install esptool
+      # The point of the whole job: the binary in git must be what these sources build.
+      # Anyone can repeat this locally and get the same bytes, which is the only reason
+      # to trust a firmware image published as a binary.
+      - name: rebuild and compare
+        run: |
+          SKIP_CLI=1 ./tools/build-vaultkey.sh
+          git diff --exit-code -- 'firmware/boards/*/images/*' \
+            || { echo "::error::the committed image differs from a fresh build"; exit 1; }
+      # No secret is involved: a signature is checked with the public half alone.
+      - name: signatures verify under the project key
+        run: |
+          pub=firmware/secure-boot/public.pem
+          espsecure digest-sbv2-public-key --keyfile "$pub" --output /tmp/digest.bin
+          cmp /tmp/digest.bin firmware/secure-boot/digest.bin
+          for s in firmware/boards/*/images/*.signed.bin; do
+            plain="${s%.signed.bin}.bin"
+            cmp -n "$(stat -c %s "$plain")" "$plain" "$s"
+            espsecure verify-signature --version 2 --keyfile "$pub" "$s"
+          done
+
+  wording:
+    name: no forbidden marketing claim
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      # docs/threat-model.md defines these as project failure and quotes them itself,
+      # so it is the one file excluded.
+      - run: |
+          banned='military[ -]?grade|unbreakable|hardware-grade security'
+          banned+='|bank[ -]?level security|(more|safer) secure than[^.]{0,20}yubikey'
+          hits=$(git ls-files -- '*.md' '*.rs' | grep -v '^docs/threat-model\.md$' \
+                 | xargs grep -HniE "$banned" || true)
+          [ -z "$hits" ] || { echo "::error::$hits"; exit 1; }

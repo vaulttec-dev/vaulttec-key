@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+#
+# Refuses a commit that does not pass every check in tools/checks.sh. The checks read
+# the working tree, so the tree must match what is being committed: unstaged edits to
+# checked files, or new source files nobody added, stop the commit before anything runs.
+#
+# Enabled per clone by:  git config core.hooksPath .githooks   (tools/build-vaultkey.sh does it)
+
+set -euo pipefail
+ROOT="$(git rev-parse --show-toplevel)"
+# shellcheck source=tools/checks.sh
+. "$ROOT/tools/checks.sh"
+
+paths=('*.rs' '*.toml' '*.lock' '*.sh' '*.py' '.githooks/*' 'firmware/boards/*/images/*')
+
+git diff --cached --quiet && fail "nothing staged"
+
+unstaged=$(git -C "$ROOT" diff --name-only -- "${paths[@]}")
+[[ -z "$unstaged" ]] || fail "unstaged changes in files the checks read - stage or stash them:
+$unstaged"
+
+untracked=$(git -C "$ROOT" ls-files --others --exclude-standard -- '*.rs' '*.py' '*.sh')
+[[ -z "$untracked" ]] || fail "source files that are not in git would not be in the commit - add or delete them:
+$untracked"
+
+check_all
+printf '\n\033[32mpre-commit: all checks passed\033[0m\n'

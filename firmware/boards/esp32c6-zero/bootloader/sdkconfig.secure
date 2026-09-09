@@ -1,0 +1,24 @@
+# The bootloader for a chip with Secure Boot v2 (RSA-3072): boots only an app whose
+# signature block matches a digest in eFuse. Signed by tools/sign-vaultkey.sh, not
+# during the build, so the private key never reaches the build.
+#
+# ROM download mode stays fully enabled on purpose: the "secure" download mode
+# refuses the flasher stub espflash uses and espefuse altogether, and the key's
+# threat model does not lose anything to a full download mode once nothing unsigned
+# boots (docs/decisions.md). Never CONFIG_SECURE_DISABLE_ROM_DL_MODE.
+#
+# WARNING: on a chip whose Secure Boot eFuses are not burned yet, this bootloader
+# burns them itself on first boot (esp_secure_boot_v2_permanently_enable). It goes
+# only onto a chip where SECURE_BOOT_EN is already 1; `vkey setup` checks.
+CONFIG_IDF_TARGET="esp32c6"
+CONFIG_BOOTLOADER_COMPILE_TIME_DATE=n
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0xC000
+CONFIG_SECURE_BOOT=y
+CONFIG_SECURE_BOOT_V2_ENABLED=y
+CONFIG_SECURE_SIGNED_APPS_RSA_SCHEME=y
+CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES=n
+CONFIG_SECURE_BOOT_FLASH_BOOTLOADER_DEFAULT=n
+CONFIG_SECURE_BOOT_ENABLE_AGGRESSIVE_KEY_REVOKE=n
+CONFIG_SECURE_INSECURE_ALLOW_DL_MODE=y

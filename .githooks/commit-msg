@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+#
+# The commit message: a subject that fits, with nobody but the developer credited.
+
+set -euo pipefail
+ROOT="$(git rev-parse --show-toplevel)"
+# shellcheck source=tools/checks.sh
+. "$ROOT/tools/checks.sh"
+
+body=$(grep -v '^#' "$1" || true)
+subject=$(sed -n '/./{p;q}' <<<"$body")
+
+[[ -n "$subject" ]] || fail "empty commit message"
+(( ${#subject} <= 72 )) || fail "the subject is ${#subject} characters; 72 is the limit"
+# Trailers and badges a tool would add; a file called CLAUDE.md may be mentioned freely.
+if grep -qiE '^[[:space:]]*co-authored-by:|generated with|claude\.ai|noreply@anthropic|🤖' <<<"$body"; then
+    fail "no attribution lines: the author of a change is the developer"
+fi

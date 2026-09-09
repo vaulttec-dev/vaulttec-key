@@ -1,0 +1,4 @@
+# The key's flash as the bootloader sees it: one app, nothing else. The vault lives
+# past the end of this table (docs/hardware.md) and is not a partition on purpose.
+# Name,   Type, SubType, Offset,  Size
+factory,  app,  factory, 0x10000, 1M

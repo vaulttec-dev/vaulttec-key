@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+#
+# Everything pre-commit checks, run once more on the exact tree being pushed: the tree
+# must be clean, so what leaves this machine is what was checked.
+#
+# The checks read the working tree, which is HEAD and nothing else. So a push that would
+# send some other commit - `git push origin feature:main` - is refused rather than
+# waved through unchecked.
+
+set -euo pipefail
+ROOT="$(git rev-parse --show-toplevel)"
+# shellcheck source=tools/checks.sh
+. "$ROOT/tools/checks.sh"
+
+dirty=$(git -C "$ROOT" status --porcelain)
+[[ -z "$dirty" ]] || fail "the working tree is not clean - commit or stash first:
+$dirty"
+
+# git feeds the refs being pushed on stdin: <local ref> <local sha> <remote ref> <remote sha>.
+head=$(git -C "$ROOT" rev-parse HEAD)
+while read -r local_ref local_sha _remote_ref _remote_sha; do
+    # A deletion pushes no commit of ours; nothing to check.
+    [[ "$local_sha" =~ ^0+$ ]] && continue
+    [[ "$local_sha" == "$head" ]] || fail "$local_ref is $local_sha, but the checks can only
+see the working tree, which is HEAD ($head). Check out what you are pushing first."
+done
+
+check_all
+check_audit
+printf '\n\033[32mpre-push: all checks passed\033[0m\n'
