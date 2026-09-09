@@ -30,8 +30,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      # Pinned by SHA, so the toolchain name cannot come from the tag any more and has
+      # to be given explicitly.
       - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
           targets: riscv32imac-unknown-none-elf
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -104,8 +107,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      # Pinned by SHA, so the toolchain name cannot come from the tag any more and has
+      # to be given explicitly.
       - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
         with:
+          toolchain: stable
           targets: riscv32imac-unknown-none-elf
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:

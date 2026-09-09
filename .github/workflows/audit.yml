@@ -22,7 +22,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      # Pinned by SHA, so the toolchain name has to be given explicitly.
       - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
+        with:
+          toolchain: stable
       - run: cargo install cargo-audit --locked
       - run: cargo audit --file firmware/Cargo.lock
       - run: cargo audit --file cli/Cargo.lock

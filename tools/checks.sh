@@ -140,7 +140,8 @@ check_wording() {
     banned+='|bank[ -]?level security|(more|safer) secure than[^.]{0,20}yubikey'
     local -a files hits
     mapfile -t files < <(git -C "$ROOT" ls-files -- '*.md' '*.rs' | grep -v '^docs/threat-model\.md$')
-    mapfile -t hits < <(cd "$ROOT" && grep -HniE "$banned" -- "${files[@]}" || true)
+    # `|| true`: grep exits 1 when it finds nothing, which is the good case here.
+    mapfile -t hits < <(cd "$ROOT" || exit; grep -HniE "$banned" -- "${files[@]}" || true)
     ((${#hits[@]} == 0)) || fail "claims forbidden by docs/threat-model.md, section
 'Marketing wording rules':
 $(printf '%s\n' "${hits[@]}")"

@@ -1,12 +1,18 @@
-# Dependency updates as pull requests. Both Cargo workspaces are separate, and the
-# workflows pin action versions, so they need watching too.
+# Dependency updates as pull requests.
+#
+# The firmware is deliberately limited to zero version-update pull requests. A bump there
+# changes the committed image, so the `images` job fails until someone rebuilds it, and the
+# signed images have to be produced again with the signing key - which costs a PIN and a
+# physical tap. That ceremony is worth it for a security advisory and not for a routine
+# minor bump, so version updates are off and *security* updates still arrive: those come
+# from the repository-level Dependabot security updates, which this limit does not touch.
 version: 2
 updates:
   - package-ecosystem: cargo
     directory: /firmware
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
 
   - package-ecosystem: cargo
     directory: /cli
@@ -14,6 +20,7 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
 
+  # Actions are pinned by commit SHA, so this is the only thing that moves them.
   - package-ecosystem: github-actions
     directory: /
     schedule:
