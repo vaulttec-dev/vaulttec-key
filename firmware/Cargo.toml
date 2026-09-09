@@ -1,0 +1,50 @@
+# One workspace: `core` is the whole key, portable and chip-agnostic; each folder under
+# `boards/` is one board - its pins, its chip crates, its flash layout - and nothing else.
+# Build a board from inside its folder: its .cargo/config.toml selects the target.
+
+[workspace]
+resolver = "2"
+members = ["core", "boards/*"]
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+debug = 2            # symbols for esp-backtrace; not in the flashed image
+incremental = false
+
+[profile.dev]
+opt-level = "s"      # unoptimised builds do not fit the timing of the RMT LED driver
+
+# The same table lives in cli/Cargo.toml; the pre-commit hook fails if they differ.
+# Every warning is an error, unsafe is impossible, every `as` that can lose bits and
+# every `unwrap` must be spelled out and justified with `#[expect(..., reason)]`.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "deny", priority = -1 }
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+unused_import_braces = "deny"
+unused_lifetimes = "deny"
+unused_macro_rules = "deny"
+unused_qualifications = "deny"
+non_ascii_idents = "deny"
+explicit_outlives_requirements = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+# Restriction lints that pay for themselves here.
+unwrap_used = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+mem_forget = "deny"
+exit = "deny"
+missing_assert_message = "deny"
+undocumented_unsafe_blocks = "deny"
+# Pedantic lints that only ask for boilerplate.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

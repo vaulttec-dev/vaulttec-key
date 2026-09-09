@@ -1,0 +1,29 @@
+[package]
+name = "vaultkey-esp32c6-zero"
+version = "0.8.0"
+edition = "2024"
+rust-version = "1.95"
+description = "vaulttecdev hardware TOTP key on the Waveshare ESP32-C6-Zero"
+publish = false
+
+[[bin]]
+name = "vaultkey-esp32c6-zero"
+path = "src/main.rs"
+test = false
+bench = false
+
+[lints]
+workspace = true
+
+[dependencies]
+vaultkey-core = { path = "../../core" }
+
+# Everything below is what this chip needs; the key itself knows none of it.
+esp-hal = { version = "1.2.0", features = ["esp32c6", "rt", "unstable"] }
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32c6"] }
+esp-println = { version = "0.18.0", default-features = false, features = ["esp32c6", "jtag-serial", "critical-section"] }
+esp-backtrace = { version = "0.20.0", features = ["esp32c6", "panic-handler", "println"] }
+esp-storage = { version = "0.10.0", features = ["esp32c6", "embedded-storage"] }
+esp-hal-smartled = { version = "0.18.0", features = ["esp32c6"] }
+smart-leds = "0.4"
+static_cell = "2"

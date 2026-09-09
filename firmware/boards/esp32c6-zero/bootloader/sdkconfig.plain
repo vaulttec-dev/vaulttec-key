@@ -1,0 +1,8 @@
+# The bootloader for a chip without Secure Boot: stock ESP-IDF 5.5, except that the
+# partition table sits at 0xC000 - the Secure Boot bootloader (sdkconfig.secure) is
+# too big for 0x8000, and one table must serve both.
+CONFIG_IDF_TARGET="esp32c6"
+CONFIG_BOOTLOADER_COMPILE_TIME_DATE=n
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0xC000

@@ -1,0 +1,19 @@
+# Rust build output (.elf and .map land here too)
+target/
+
+# tools/tui_snap.py and mypy from tools/checks.sh
+__pycache__/
+.mypy_cache/
+
+# Keys, should any ever appear in the tree: they do not belong in the repository.
+# The one exception is the public half of the firmware signing key
+# (tools/signing-key.sh) - it is not a secret.
+*.key
+*.pem
+!firmware/secure-boot/public.pem
+*.vkb
+
+# Editors
+.vscode/
+.idea/
+*.swp
