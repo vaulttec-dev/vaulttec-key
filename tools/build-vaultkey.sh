@@ -35,6 +35,14 @@ command -v espflash >/dev/null || { echo "espflash is missing:  cargo install es
 # check that rebuilds it and compares could pass on one machine only. Cargo's `trim-paths`
 # would do this in the profile, but it is not stable yet (1.97), hence the flags.
 # Everything the compiler could name is mapped to a fixed stand-in.
+# The ESP-IDF application descriptor carries a build date and time, so without this the
+# image would differ on every compile and "the committed binary is what these sources
+# build" could never be checked. esp-bootloader-esp-idf honours SOURCE_DATE_EPOCH, the
+# reproducible-builds convention; a fixed value rather than the commit date, because the
+# commit that carries the rebuilt image would change its own timestamp. The descriptor's
+# date is informational - the firmware reports its real version through `info`.
+export SOURCE_DATE_EPOCH=0
+
 remap() { printf -- '--remap-path-prefix=%s=%s ' "$1" "$2"; }
 REMAP="$(remap "${CARGO_HOME:-$HOME/.cargo}" /cargo)"
 REMAP+="$(remap "$(rustc --print sysroot)" /rust)"

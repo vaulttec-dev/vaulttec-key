@@ -1,0 +1,11 @@
+# One toolchain for the whole repository, pinned to an exact version.
+#
+# The firmware image is committed as a binary and the CI job `images` rebuilds it and
+# compares byte for byte. That claim only holds against a fixed compiler: a different
+# rustc emits different code, so a floating `stable` would make the image reproducible
+# for nobody. Bumping this line is a deliberate change - it rewrites the image, and the
+# signed images then have to be produced again (tools/sign-vaultkey.sh, PIN and a tap).
+[toolchain]
+channel = "1.97.1"
+targets = ["riscv32imac-unknown-none-elf"]
+components = ["rustfmt", "clippy"]
