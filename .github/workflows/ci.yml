@@ -36,6 +36,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: firmware -> target
+      # serialport finds the board by its USB identity through libudev, so the CLI needs
+      # the headers to build. The firmware does not.
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev
       - name: rustfmt
         run: |
           cargo fmt --all --check --manifest-path firmware/Cargo.toml
