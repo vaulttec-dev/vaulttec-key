@@ -291,7 +291,7 @@ pub fn unlock_loop(dev: &mut Device, ui: &mut dyn PinPrompt) -> Result<(), Error
                 ui.say(&Error::WrongPin(n).to_string());
                 left = n;
             }
-            Err(Error::Value(m)) => ui.say(&m), // not even 6-8 digits: nothing was sent
+            Err(Error::Value(m)) => ui.say(&m), // not even eight digits: nothing was sent
             Err(e) => return Err(e),
         }
     }

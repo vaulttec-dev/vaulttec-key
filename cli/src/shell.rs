@@ -1482,7 +1482,7 @@ impl Shell {
         } else {
             None
         };
-        let Some(new) = self.ask("new PIN (6-8 digits): ", Field::Hidden) else {
+        let Some(new) = self.ask("new PIN (8 digits): ", Field::Hidden) else {
             return Ok(());
         };
         let Some(new) = self.confirmed(new, "PINs") else {
@@ -1637,7 +1637,10 @@ impl Shell {
             return Ok(());
         };
         let path = backup::target(&path)?;
-        let Some(pass) = self.ask("backup passphrase (12+ characters): ", Field::Hidden) else {
+        let Some(pass) = self.ask(
+            "backup passphrase (five or six random words): ",
+            Field::Hidden,
+        ) else {
             return Ok(());
         };
         passphrase(&pass)?;

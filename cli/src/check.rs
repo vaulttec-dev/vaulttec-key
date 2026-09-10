@@ -21,8 +21,8 @@ use crate::device::{
 use crate::totp::{TEST_SECRET, decode_base32, selftest};
 use crate::{backup, boards};
 
-const PIN: &str = "123456";
-const NEW_PIN: &str = "654321";
+const PIN: &str = "12345678";
+const NEW_PIN: &str = "87654321";
 const LOGIN: &str = "me@example.com";
 const PASSWORD: &str = "correct horse battery staple";
 const NOTE: &str = "recovery:\n1234-5678\n8765-4321";
@@ -119,7 +119,7 @@ fn clean_start(d: &mut Device, rep: &mut Report) -> Result<(), Error> {
         println!("  (device has a PIN; exhausting retries to reach a clean state)");
         d.lock()?;
         for _ in 0..MAX_ATTEMPTS {
-            if d.pin_unlock(pin("000000")?) == Err(Error::Incompatible) {
+            if d.pin_unlock(pin("00000000")?) == Err(Error::Incompatible) {
                 // Written under the other key setup: only a wipe clears it.
                 println!(
                     "  >>> the vault is from a different key setup - hold {} down for five \
@@ -130,7 +130,7 @@ fn clean_start(d: &mut Device, rep: &mut Report) -> Result<(), Error> {
                 break;
             }
         }
-    } else if !matches!(d.pin_unlock(pin("000000")?), Err(Error::NoPin)) {
+    } else if !matches!(d.pin_unlock(pin("00000000")?), Err(Error::NoPin)) {
         // No PIN as far as the status can tell, yet the flash is not blank: an image
         // this firmware cannot read (an older layout). Only a wipe clears it, and no
         // attempt was spent finding out.
@@ -374,7 +374,7 @@ fn lock_unlock(d: &mut Device, rep: &mut Report) -> Result<(), Error> {
     );
     rep.expect("env refused while locked", &d.env_get("e"), &Error::Locked);
     rep.expect("list refused while locked", &d.list(), &Error::Locked);
-    match d.pin_unlock(pin("999999")?) {
+    match d.pin_unlock(pin("99999999")?) {
         Err(Error::WrongPin(n)) => rep.check(
             "wrong PIN rejected, counter down",
             n == 7,
@@ -416,7 +416,7 @@ fn wipe(d: &mut Device, rep: &mut Report) -> Result<(), Error> {
     d.lock()?;
     let mut wiped = false;
     for i in 1..=MAX_ATTEMPTS {
-        match d.pin_unlock(pin("000000")?) {
+        match d.pin_unlock(pin("00000000")?) {
             Err(Error::WrongPin(_)) => {}
             Err(Error::Wiped) => {
                 wiped = true;
@@ -440,7 +440,7 @@ fn wipe(d: &mut Device, rep: &mut Report) -> Result<(), Error> {
     rep.check("no entries after wipe", d.list()?.is_empty(), "");
     d.lock()?;
     for _ in 0..8 {
-        let _ = d.pin_unlock(pin("000000")?);
+        let _ = d.pin_unlock(pin("00000000")?);
     }
     rep.check("left without a PIN", !d.pin_status()?.has_pin, "");
     Ok(())

@@ -147,7 +147,10 @@ the protocol and logs — hence the `VTC2` magic word in frames. Pins and pitfal
   `Unbound`; DEK = HMAC(KEK, "vaultkey/dek/v1"); verifier = HMAC(KEK, "vaultkey/verify/v1");
   AEAD with the entry name in the AAD. The header remembers the cost and whether the key is
   chip-bound: firmware answering differently refuses (`Incompatible`) instead of burning
-  attempts. PIN is 6–8 digits.
+  attempts. PIN is exactly 8 digits (`PIN_LEN`, 0.9; it was 6–8 until the brute force through
+  the real firmware with the counter erased was costed: a fortnight for six digits, four years
+  for eight). A backup passphrase is 12–128 bytes, and the CLI asks for five or six random
+  words, because 128 KiB of Argon2id does not make up for a phrase a person invented.
 - The entry kind (`oath::Kind`) decides what may leave the device. `Totp` — codes only,
   after a tap. `Password` — the login with no gesture, the password and note after the same
   tap (blob `login_len | login | password_len | password | note`, assembled only by

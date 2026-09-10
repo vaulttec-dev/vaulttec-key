@@ -1,6 +1,6 @@
 //! Everything that turns a PIN into keys, and keys into sealed blobs.
 //!
-//!   pre      = Argon2id(pin, salt, cost)            - memory-hard: GPUs lose their edge
+//!   pre      = Argon2id(pin, salt, cost)            - memory-hard: blunts a GPU, see Cost
 //!   kek      = `DeviceKey::mac`(pre)                 - chip-bound when the board has a key
 //!   dek      = HMAC(kek, "vaultkey/dek/v1")          - what actually encrypts
 //!   verifier = HMAC(kek, "vaultkey/verify/v1")       - stored, proves the PIN
@@ -27,12 +27,16 @@ pub const SALT_LEN: usize = 16;
 pub const NONCE_LEN: usize = 12;
 pub const TAG_LEN: usize = 16;
 pub const OVERHEAD: usize = NONCE_LEN + TAG_LEN;
-/// Four digits are ten thousand guesses, which no key derivation can make expensive.
-pub const PIN_MIN: usize = 6;
-pub const PIN_MAX: usize = 8;
-/// A backup file has no attempt counter: whoever holds it can guess forever, at the
-/// speed of their own hardware. Twelve characters is the least that makes the guessing
-/// pointless behind Argon2id; the ceiling only bounds the request frame.
+/// Eight digits, no fewer and no more. Whoever holds the board erases the attempt
+/// counter through ROM download mode and guesses through the real firmware at about
+/// 1.3 s a try: six digits fall in a fortnight, seven in five months, eight in four
+/// years. No key derivation rescues a shorter PIN - a second per unlock is already as
+/// slow as the device may be, so length is the only lever left.
+pub const PIN_LEN: usize = 8;
+/// A backup file has no attempt counter: whoever holds it guesses forever, at the speed
+/// of their own hardware, and 128 KiB of Argon2id is not much of a brake. Twelve is a
+/// floor, not a target - twelve characters a person invented are worth far less than
+/// the five or six random words the CLI asks for. The ceiling only bounds the frame.
 pub const PASS_MIN: usize = 12;
 pub const PASS_MAX: usize = 128;
 
@@ -47,6 +51,13 @@ pub const BACKUP_AAD: &[u8] = b"vaultkey/backup/v1";
 
 /// Argon2id cost: memory in KiB and passes over it. Stored per vault, so it can be
 /// raised later without breaking existing ones.
+///
+/// The memory is what the board can spare beside an 80 KiB vault and a 300 KiB stack,
+/// not what a passphrase would like: 128 KiB fits in the cache of any desktop core, so
+/// it costs an attacker time, not the memory bandwidth Argon2 is meant to cost them.
+/// Against the PIN that changes nothing - eight digits behind the attempt counter and
+/// the eFuse key is what protects it. Against a stolen `.vkb` it is the whole defence,
+/// which is why the passphrase must carry the entropy itself.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Cost {
     pub m_kib: u32,
@@ -80,15 +91,16 @@ const _: () = assert!(
     "the board's buffer must hold the largest cost this firmware accepts"
 );
 
-/// `PIN_MIN`..=`PIN_MAX` ASCII digits, checked once at the edge. Anything else is not a
-/// PIN and never reaches the key derivation or the attempt counter.
+/// `PIN_LEN` ASCII digits, checked once at the edge. Anything else is not a PIN and
+/// never reaches the key derivation or the attempt counter - a short PIN costs no
+/// attempt, it is simply not a PIN.
 #[derive(Clone, Copy)]
 pub struct Pin<'a>(&'a [u8]);
 
 impl<'a> Pin<'a> {
     #[must_use]
     pub fn new(bytes: &'a [u8]) -> Option<Self> {
-        let ok = (PIN_MIN..=PIN_MAX).contains(&bytes.len()) && bytes.iter().all(u8::is_ascii_digit);
+        let ok = bytes.len() == PIN_LEN && bytes.iter().all(u8::is_ascii_digit);
         ok.then_some(Pin(bytes))
     }
 

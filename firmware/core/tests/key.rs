@@ -514,10 +514,16 @@ fn seal_and_open_refuse_the_wrong_key_name_or_bytes() {
 fn the_chip_key_changes_every_derived_key() {
     let salt = [3u8; vault::SALT_LEN];
     let mut mem = vec![Block::new(); KDF_BLOCKS];
-    let plain = vault::derive(pin("123456"), &salt, Cost::CURRENT, &mut Unbound, &mut mem)
-        .expect("derives");
+    let plain = vault::derive(
+        pin("12345678"),
+        &salt,
+        Cost::CURRENT,
+        &mut Unbound,
+        &mut mem,
+    )
+    .expect("derives");
     let bound = vault::derive(
-        pin("123456"),
+        pin("12345678"),
         &salt,
         Cost::CURRENT,
         &mut ChipKey([9; 32]),
@@ -525,7 +531,7 @@ fn the_chip_key_changes_every_derived_key() {
     )
     .expect("derives");
     let other = vault::derive(
-        pin("123456"),
+        pin("12345678"),
         &salt,
         Cost::CURRENT,
         &mut ChipKey([10; 32]),
@@ -541,7 +547,7 @@ fn the_chip_key_changes_every_derived_key() {
     let mut short = vec![Block::new(); 8];
     assert!(
         vault::derive(
-            pin("123456"),
+            pin("12345678"),
             &salt,
             Cost::CURRENT,
             &mut Unbound,
@@ -556,11 +562,13 @@ fn the_chip_key_changes_every_derived_key() {
 
 #[test]
 fn only_valid_values_exist() {
-    assert!(Pin::new(b"12345").is_none(), "five digits are too few");
-    assert!(Pin::new(b"123456").is_some());
+    assert!(
+        Pin::new(b"1234567").is_none(),
+        "seven digits fall to a brute force in months"
+    );
     assert!(Pin::new(b"12345678").is_some());
     assert!(Pin::new(b"123456789").is_none());
-    assert!(Pin::new(b"12a456").is_none());
+    assert!(Pin::new(b"12a45678").is_none());
     assert!(Pin::new(b"").is_none());
 
     assert!(Name::new(b"").is_none());
@@ -795,14 +803,14 @@ fn pin_then_credentials() {
     let mut dev = tapping(&flash);
     let st = dev.pin_status();
     assert!(!st.has_pin && !st.unlocked && st.retries_left == MAX_ATTEMPTS && !st.chip_bound);
-    assert_eq!(dev.pin_unlock(pin("123456")), Err(Fail::NoPin));
+    assert_eq!(dev.pin_unlock(pin("12345678")), Err(Fail::NoPin));
     assert_eq!(
         dev.add(&entry("github", b"secret"), false),
         Err(Fail::Locked)
     );
 
-    assert_eq!(dev.pin_set(pin("123456")), Ok(()));
-    assert_eq!(dev.pin_set(pin("123456")), Err(Fail::PinExists));
+    assert_eq!(dev.pin_set(pin("12345678")), Ok(()));
+    assert_eq!(dev.pin_set(pin("12345678")), Err(Fail::PinExists));
     assert!(dev.pin_status().unlocked, "setting the PIN unlocks");
 
     assert_eq!(dev.add(&entry("github", b"secret"), false), Ok(()));
@@ -835,7 +843,7 @@ fn pin_then_credentials() {
     );
     assert_eq!(dev.delete(name("github")), Err(Fail::Locked));
 
-    assert_eq!(dev.pin_unlock(pin("123456")), Ok(()));
+    assert_eq!(dev.pin_unlock(pin("12345678")), Ok(()));
     assert_eq!(dev.delete(name("github")), Ok(()));
     assert!(names(&mut dev).expect("unlocked").is_empty());
     assert_eq!(dev.delete(name("github")), Err(Fail::NotFound));
@@ -845,18 +853,18 @@ fn pin_then_credentials() {
 fn eight_wrong_pins_wipe_everything() {
     let flash = MemFlash::blank();
     let mut dev = flash.key();
-    dev.pin_set(pin("123456")).expect("set");
+    dev.pin_set(pin("12345678")).expect("set");
     dev.add(&entry("github", b"secret"), false).expect("add");
     env_put(&mut dev, "proj", b"A=1\n", false).expect("put");
     dev.lock();
     for left in (1..MAX_ATTEMPTS).rev() {
-        assert_eq!(dev.pin_unlock(pin("000000")), Err(Fail::WrongPin(left)));
+        assert_eq!(dev.pin_unlock(pin("00000000")), Err(Fail::WrongPin(left)));
     }
-    assert_eq!(dev.pin_unlock(pin("000000")), Err(Fail::Wiped));
+    assert_eq!(dev.pin_unlock(pin("00000000")), Err(Fail::Wiped));
     assert!(!dev.pin_status().has_pin);
     assert!(flash.erased(), "wiped means erased, not marked");
     assert_eq!(
-        dev.pin_set(pin("999999")),
+        dev.pin_set(pin("99999999")),
         Ok(()),
         "a wiped key starts over"
     );
@@ -868,14 +876,14 @@ fn state_and_spent_attempts_survive_a_power_cycle() {
     let moment = 1_700_000_000;
     let before = {
         let mut dev = tapping(&flash);
-        dev.pin_set(pin("246800")).expect("set");
+        dev.pin_set(pin("24680246")).expect("set");
         dev.add(&entry("github", b"secret"), false).expect("add");
         dev.add(&password("mail", b"correct horse battery staple"), false)
             .expect("add");
         let c = code(&mut dev, "github", moment).expect("code");
         dev.lock();
-        assert_eq!(dev.pin_unlock(pin("000000")), Err(Fail::WrongPin(7)));
-        assert_eq!(dev.pin_unlock(pin("000000")), Err(Fail::WrongPin(6)));
+        assert_eq!(dev.pin_unlock(pin("00000000")), Err(Fail::WrongPin(7)));
+        assert_eq!(dev.pin_unlock(pin("00000000")), Err(Fail::WrongPin(6)));
         c
     };
     // Power off, power on: RAM is gone, flash is not - and neither are the two
@@ -884,7 +892,7 @@ fn state_and_spent_attempts_survive_a_power_cycle() {
     let st = dev.pin_status();
     assert!(st.has_pin && !st.unlocked);
     assert_eq!(st.retries_left, 6);
-    assert_eq!(dev.pin_unlock(pin("246800")), Ok(()));
+    assert_eq!(dev.pin_unlock(pin("24680246")), Ok(()));
     assert_eq!(dev.pin_status().retries_left, MAX_ATTEMPTS);
     assert_eq!(names(&mut dev).expect("unlocked"), ["github", "mail"]);
     assert_eq!(code(&mut dev, "github", moment).expect("code"), before);
@@ -894,27 +902,27 @@ fn state_and_spent_attempts_survive_a_power_cycle() {
 fn pin_change_reseals_every_entry() {
     let flash = MemFlash::blank();
     let mut dev = tapping(&flash);
-    dev.pin_set(pin("123456")).expect("set");
+    dev.pin_set(pin("12345678")).expect("set");
     for i in 0..5u8 {
         dev.add(&entry(&format!("acct{i}"), &[i + 1; 10]), false)
             .expect("add");
     }
     let before = code(&mut dev, "acct3", 99).expect("code");
     assert_eq!(
-        dev.pin_change(pin("000000"), pin("654321")),
+        dev.pin_change(pin("00000000"), pin("87654321")),
         Err(Fail::WrongPin(7)),
         "the old PIN is checked"
     );
-    assert_eq!(dev.pin_change(pin("123456"), pin("654321")), Ok(()));
+    assert_eq!(dev.pin_change(pin("12345678"), pin("87654321")), Ok(()));
     assert_eq!(code(&mut dev, "acct3", 99).expect("code"), before);
     dev.lock();
-    assert_eq!(dev.pin_unlock(pin("123456")), Err(Fail::WrongPin(7)));
-    assert_eq!(dev.pin_unlock(pin("654321")), Ok(()));
+    assert_eq!(dev.pin_unlock(pin("12345678")), Err(Fail::WrongPin(7)));
+    assert_eq!(dev.pin_unlock(pin("87654321")), Ok(()));
     assert_eq!(dev.pin_status().retries_left, MAX_ATTEMPTS);
 
     let mut fresh = tapping(&flash);
     fresh
-        .pin_unlock(pin("654321"))
+        .pin_unlock(pin("87654321"))
         .expect("the new PIN is in flash");
     assert_eq!(code(&mut fresh, "acct3", 99).expect("code"), before);
 }
@@ -923,7 +931,7 @@ fn pin_change_reseals_every_entry() {
 fn the_table_has_thirty_two_slots() {
     let flash = MemFlash::blank();
     let mut dev = flash.key();
-    dev.pin_set(pin("123456")).expect("set");
+    dev.pin_set(pin("12345678")).expect("set");
     for i in 0..MAX_ENTRIES {
         dev.add(&entry(&format!("acct{i}"), b"s"), false)
             .expect("room");
@@ -941,13 +949,13 @@ fn a_vault_from_the_other_key_setup_is_refused_not_guessed_at() {
         let clock = Ticker::default();
         let mut bound = flash.key_with(Button::new(&clock, Finger::Away), clock, ChipKey([1; 32]));
         assert!(bound.pin_status().chip_bound);
-        bound.pin_set(pin("123456")).expect("set");
+        bound.pin_set(pin("12345678")).expect("set");
         bound.add(&entry("github", b"secret"), false).expect("add");
     }
     // The same flash in a firmware without the chip key: the right PIN cannot work,
     // so it must not be tried - the attempts stay untouched.
     let mut plain = flash.key();
-    assert_eq!(plain.pin_unlock(pin("123456")), Err(Fail::Incompatible));
+    assert_eq!(plain.pin_unlock(pin("12345678")), Err(Fail::Incompatible));
     assert_eq!(plain.pin_status().retries_left, MAX_ATTEMPTS);
     assert_eq!(
         plain.list(|_, _| {}),
@@ -959,7 +967,7 @@ fn a_vault_from_the_other_key_setup_is_refused_not_guessed_at() {
     let clock = Ticker::default();
     let mut other = flash.key_with(Button::new(&clock, Finger::Away), clock, ChipKey([2; 32]));
     assert_eq!(
-        other.pin_unlock(pin("123456")),
+        other.pin_unlock(pin("12345678")),
         Err(Fail::WrongPin(7)),
         "same setup, wrong chip: a wrong PIN, as it should look"
     );
@@ -972,7 +980,7 @@ fn a_torn_write_falls_back_to_the_previous_image() {
     let flash = MemFlash::blank();
     {
         let mut dev = flash.key();
-        dev.pin_set(pin("123456")).expect("set");
+        dev.pin_set(pin("12345678")).expect("set");
         dev.add(&entry("first", b"s"), false).expect("add");
         dev.add(&entry("second", b"s"), false).expect("add");
     }
@@ -985,7 +993,7 @@ fn a_torn_write_falls_back_to_the_previous_image() {
     flash.flip(newest + 100);
 
     let mut dev = flash.key();
-    dev.pin_unlock(pin("123456"))
+    dev.pin_unlock(pin("12345678"))
         .expect("the PIN is in both copies");
     assert_eq!(
         names(&mut dev).expect("unlocked"),
@@ -1005,7 +1013,7 @@ fn unreadable_flash_is_refused_until_wiped() {
     let flash = MemFlash::blank();
     {
         let mut dev = flash.key();
-        dev.pin_set(pin("123456")).expect("set");
+        dev.pin_set(pin("12345678")).expect("set");
         dev.add(&entry("a", b"s"), false).expect("add");
     }
     for copy in [LAYOUT.state_a, LAYOUT.state_b] {
@@ -1014,7 +1022,7 @@ fn unreadable_flash_is_refused_until_wiped() {
     let mut dev = flash.key();
     assert!(!dev.pin_status().has_pin, "nothing can be read");
     assert_eq!(
-        dev.pin_set(pin("123456")),
+        dev.pin_set(pin("12345678")),
         Err(Fail::Internal),
         "and nothing is written over it"
     );
@@ -1024,7 +1032,7 @@ fn unreadable_flash_is_refused_until_wiped() {
     let mut dev = flash.key_with(Button::new(&clock, Finger::Hold(6_000)), clock, Unbound);
     assert_eq!(dev.wipe(), Ok(()));
     assert!(flash.erased());
-    assert_eq!(dev.pin_set(pin("123456")), Ok(()));
+    assert_eq!(dev.pin_set(pin("12345678")), Ok(()));
 }
 
 #[test]
@@ -1032,7 +1040,7 @@ fn a_header_asking_for_hours_of_work_is_corrupt() {
     let flash = MemFlash::blank();
     {
         let mut dev = flash.key();
-        dev.pin_set(pin("123456")).expect("set");
+        dev.pin_set(pin("12345678")).expect("set");
     }
     // The pass count lives right after the salt; setting its high byte asks for
     // sixteen million passes. Both copies, so there is nothing to fall back to.
@@ -1043,7 +1051,7 @@ fn a_header_asking_for_hours_of_work_is_corrupt() {
     // The status row answers from the head alone, without the CRC or the cost: it
     // still says a PIN is set. The first real operation is what refuses.
     assert!(dev.pin_status().has_pin);
-    assert_eq!(dev.pin_unlock(pin("123456")), Err(Fail::Internal));
+    assert_eq!(dev.pin_unlock(pin("12345678")), Err(Fail::Internal));
 }
 
 // --- the button and the clock ---------------------------------------------------------
@@ -1053,7 +1061,7 @@ fn the_button_must_be_pressed_after_the_request() {
     let flash = MemFlash::blank();
     let clock = Ticker::default();
     let mut dev = flash.key_with(Button::new(&clock, Finger::TapOnce), clock, Unbound);
-    dev.pin_set(pin("123456")).expect("set");
+    dev.pin_set(pin("12345678")).expect("set");
     dev.add(&entry("bank", b"s"), false).expect("add");
     assert!(code(&mut dev, "bank", 0).is_ok(), "a fresh press confirms");
     assert_eq!(
@@ -1064,7 +1072,7 @@ fn the_button_must_be_pressed_after_the_request() {
 
     let clock = Ticker::default();
     let mut taped = flash.key_with(Button::new(&clock, Finger::Taped), clock, Unbound);
-    taped.pin_unlock(pin("123456")).expect("unlock");
+    taped.pin_unlock(pin("12345678")).expect("unlock");
     assert_eq!(
         code(&mut taped, "bank", 0),
         Err(Fail::Refused),
@@ -1081,7 +1089,7 @@ fn a_tap_never_wipes() {
     let flash = MemFlash::blank();
     {
         let mut dev = flash.key();
-        dev.pin_set(pin("123456")).expect("set");
+        dev.pin_set(pin("12345678")).expect("set");
         dev.add(&entry("github", b"secret"), false).expect("add");
         dev.add(&password("mail", b"hunter2"), false).expect("add");
         env_put(&mut dev, "proj", b"A=1\n", false).expect("put");
@@ -1089,7 +1097,7 @@ fn a_tap_never_wipes() {
     let unlocked = |finger: Finger| {
         let clock = Ticker::default();
         let mut dev = flash.key_with(Button::new(&clock, finger), clock, Unbound);
-        dev.pin_unlock(pin("123456")).expect("unlock");
+        dev.pin_unlock(pin("12345678")).expect("unlock");
         dev
     };
 
@@ -1138,7 +1146,7 @@ fn a_tap_never_wipes() {
 fn a_rename_keeps_the_secret_and_the_slot() {
     let flash = MemFlash::blank();
     let mut dev = tapping(&flash);
-    dev.pin_set(pin("123456")).expect("set");
+    dev.pin_set(pin("12345678")).expect("set");
     dev.add(&entry("github", b"secret"), false).expect("add");
     dev.add(&password("mail", b"hunter2"), false).expect("add");
     let before = code(&mut dev, "github", 1_700_000_000).expect("unlocked");
@@ -1163,7 +1171,7 @@ fn a_seed_never_comes_out_and_a_password_never_makes_codes() {
     let flash = MemFlash::blank();
     let clock = Ticker::default();
     let mut dev = flash.key_with(Button::new(&clock, Finger::Hold(6_000)), clock, Unbound);
-    dev.pin_set(pin("123456")).expect("set");
+    dev.pin_set(pin("12345678")).expect("set");
     dev.add(&entry("github", b"secret"), false).expect("add");
     dev.add(&password("mail", b"hunter2"), false).expect("add");
     // Refused by kind before the light ever comes on: no gesture can change it.
@@ -1176,7 +1184,7 @@ fn two_idle_minutes_lock_the_key() {
     let flash = MemFlash::blank();
     let clock = Ticker::default();
     let mut dev = flash.key_with(Button::new(&clock, Finger::Away), clock.clone(), Unbound);
-    dev.pin_set(pin("123456")).expect("set");
+    dev.pin_set(pin("12345678")).expect("set");
     clock.jump(119_000);
     dev.tick();
     assert!(dev.pin_status().unlocked, "a minute and change is fine");
@@ -1197,7 +1205,7 @@ fn a_kind_rewritten_in_flash_reveals_nothing() {
     let flash = MemFlash::blank();
     {
         let mut dev = flash.key();
-        dev.pin_set(pin("123456")).expect("set");
+        dev.pin_set(pin("12345678")).expect("set");
         dev.add(&entry("github", b"secret"), false).expect("add");
     }
     let newest = if flash.word(LAYOUT.state_a + 4) > flash.word(LAYOUT.state_b + 4) {
@@ -1212,7 +1220,7 @@ fn a_kind_rewritten_in_flash_reveals_nothing() {
     flash.patch(newest + IMAGE - 4, &crc);
 
     let mut dev = tapping(&flash);
-    dev.pin_unlock(pin("123456")).expect("unlock");
+    dev.pin_unlock(pin("12345678")).expect("unlock");
     assert_eq!(
         names(&mut dev).expect("unlocked"),
         ["github"],
@@ -1240,7 +1248,7 @@ fn an_env_blob_comes_back_whole_after_a_tap() {
         .collect();
     {
         let mut dev = flash.key(); // nobody touches the button
-        dev.pin_set(pin("123456")).expect("set");
+        dev.pin_set(pin("12345678")).expect("set");
         assert_eq!(env_put(&mut dev, "proj", &blob, false), Ok(()));
         assert_eq!(
             env_put(&mut dev, "big", &vec![1; oath::ENV_MAX + 1], false),
@@ -1263,7 +1271,7 @@ fn an_env_blob_comes_back_whole_after_a_tap() {
         assert_eq!(env_put(&mut dev, "x", b"x", false), Err(Fail::Locked));
     }
     let mut dev = tapping(&flash);
-    dev.pin_unlock(pin("123456")).expect("unlock");
+    dev.pin_unlock(pin("12345678")).expect("unlock");
     assert_eq!(
         env_get(&mut dev, "proj"),
         Ok(blob),
@@ -1281,13 +1289,13 @@ fn env_blobs_survive_a_pin_change_and_a_power_cycle() {
     let flash = MemFlash::blank();
     {
         let mut dev = flash.key();
-        dev.pin_set(pin("123456")).expect("set");
+        dev.pin_set(pin("12345678")).expect("set");
         env_put(&mut dev, "proj", b"A=1\nB=2\n", false).expect("put");
-        dev.pin_change(pin("123456"), pin("654321"))
+        dev.pin_change(pin("12345678"), pin("87654321"))
             .expect("change");
     }
     let mut dev = tapping(&flash);
-    dev.pin_unlock(pin("654321")).expect("the new PIN");
+    dev.pin_unlock(pin("87654321")).expect("the new PIN");
     assert_eq!(
         env_get(&mut dev, "proj"),
         Ok(b"A=1\nB=2\n".to_vec()),
@@ -1299,7 +1307,7 @@ fn env_blobs_survive_a_pin_change_and_a_power_cycle() {
 fn env_and_table_names_never_collide() {
     let flash = MemFlash::blank();
     let mut dev = tapping(&flash);
-    dev.pin_set(pin("123456")).expect("set");
+    dev.pin_set(pin("12345678")).expect("set");
     dev.add(&entry("github", b"secret"), false).expect("add");
     assert_eq!(env_put(&mut dev, "github", b"x", false), Err(Fail::Exists));
     assert_eq!(
@@ -1339,7 +1347,7 @@ fn a_torn_env_write_keeps_the_previous_blob() {
     let flash = MemFlash::blank();
     {
         let mut dev = flash.key();
-        dev.pin_set(pin("123456")).expect("set");
+        dev.pin_set(pin("12345678")).expect("set");
         env_put(&mut dev, "proj", b"one", false).expect("put");
         env_put(&mut dev, "proj", b"two", true).expect("put again");
     }
@@ -1354,7 +1362,7 @@ fn a_torn_env_write_keeps_the_previous_blob() {
     flash.flip(newest + 60);
 
     let mut dev = tapping(&flash);
-    dev.pin_unlock(pin("123456")).expect("unlock");
+    dev.pin_unlock(pin("12345678")).expect("unlock");
     assert_eq!(
         env_get(&mut dev, "proj"),
         Ok(b"one".to_vec()),
@@ -1383,7 +1391,7 @@ fn a_blob_name_rewritten_in_flash_opens_for_nobody() {
     let flash = MemFlash::blank();
     {
         let mut dev = flash.key();
-        dev.pin_set(pin("123456")).expect("set");
+        dev.pin_set(pin("12345678")).expect("set");
         env_put(&mut dev, "proj", b"SECRET=1\n", false).expect("put");
     }
     let copy = LAYOUT.env; // the first write lands in slot 0, copy A
@@ -1396,7 +1404,7 @@ fn a_blob_name_rewritten_in_flash_opens_for_nobody() {
     flash.patch(copy + 48 + len.next_multiple_of(4), &crc);
 
     let mut dev = tapping(&flash);
-    dev.pin_unlock(pin("123456")).expect("unlock");
+    dev.pin_unlock(pin("12345678")).expect("unlock");
     assert_eq!(
         names(&mut dev).expect("unlocked"),
         ["prox"],
@@ -1415,7 +1423,7 @@ fn a_blob_name_rewritten_in_flash_opens_for_nobody() {
 fn stocked() -> MemFlash {
     let flash = MemFlash::blank();
     let mut dev = flash.key();
-    dev.pin_set(pin("123456")).expect("set");
+    dev.pin_set(pin("12345678")).expect("set");
     dev.add(&entry("github", b"secret"), false).expect("add");
     let mail = Entry::password(name("mail"), b"me@example.com", b"hunter2", b"codes\n1234")
         .expect("a valid test entry");
@@ -1428,7 +1436,7 @@ fn stocked() -> MemFlash {
 fn a_backup_restores_every_entry_onto_another_chip() {
     let flash = stocked();
     let mut dev = double_tapping(&flash);
-    dev.pin_unlock(pin("123456")).expect("unlock");
+    dev.pin_unlock(pin("12345678")).expect("unlock");
     let (head, items) = export(&mut dev, "correct horse battery").expect("export");
     assert_eq!(items.len(), 3, "one item per entry and blob");
     for item in &items {
@@ -1489,13 +1497,13 @@ fn a_backup_restores_every_entry_onto_another_chip() {
 fn a_backup_opens_only_as_written() {
     let flash = stocked();
     let mut dev = double_tapping(&flash);
-    dev.pin_unlock(pin("123456")).expect("unlock");
+    dev.pin_unlock(pin("12345678")).expect("unlock");
     let (head, items) = export(&mut dev, "correct horse battery").expect("export");
 
     let fresh = || {
         let other = MemFlash::blank();
         let mut dev = other.key();
-        dev.pin_set(pin("123456")).expect("set");
+        dev.pin_set(pin("12345678")).expect("set");
         dev
     };
     let mut dev = fresh();
@@ -1541,7 +1549,7 @@ fn only_two_taps_let_a_backup_out() {
     let unlocked = |finger: Finger| {
         let clock = Ticker::default();
         let mut dev = flash.key_with(Button::new(&clock, finger), clock, Unbound);
-        dev.pin_unlock(pin("123456")).expect("unlock");
+        dev.pin_unlock(pin("12345678")).expect("unlock");
         dev
     };
     assert_eq!(
@@ -1593,7 +1601,7 @@ fn a_damaged_env_key_refuses_blobs_but_not_the_pin() {
     let flash = MemFlash::blank();
     {
         let mut dev = flash.key();
-        dev.pin_set(pin("123456")).expect("set");
+        dev.pin_set(pin("12345678")).expect("set");
         env_put(&mut dev, "proj", b"A=1\n", false).expect("put");
     }
     for copy in [LAYOUT.state_a, LAYOUT.state_b] {
@@ -1608,7 +1616,7 @@ fn a_damaged_env_key_refuses_blobs_but_not_the_pin() {
     }
     let mut dev = tapping(&flash);
     assert_eq!(
-        dev.pin_unlock(pin("123456")),
+        dev.pin_unlock(pin("12345678")),
         Ok(()),
         "the PIN and the entries do not depend on the env key"
     );

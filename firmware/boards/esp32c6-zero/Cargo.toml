@@ -1,6 +1,6 @@
 [package]
 name = "vaultkey-esp32c6-zero"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.95"
 description = "vaulttecdev hardware TOTP key on the Waveshare ESP32-C6-Zero"

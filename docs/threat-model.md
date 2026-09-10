@@ -5,14 +5,14 @@
 > There is no sale today, and the document holds all the same: the owner must not rely
 > on guarantees the device does not give.
 
-Last reviewed 2026-09-09. Revisited on every hardware or firmware change. Reporting
+Last reviewed 2026-09-10. Revisited on every hardware or firmware change. Reporting
 policy: [`SECURITY.md`](../SECURITY.md). Board details: [`docs/hardware.md`](hardware.md).
 
 ## What the device is
 
 A USB key on an ESP32-C6 running its own firmware (`firmware/core` plus a board
 directory). It stores TOTP secrets, passwords and project `.env` files under
-AES-256-GCM, keyed from a 6–8 digit PIN that is never stored. Every code, password and
+AES-256-GCM, keyed from an 8-digit PIN that is never stored. Every code, password and
 `.env` requires a physical button press; eight wrong PINs in a row wipe every secret.
 The protocol has no "read the TOTP secret" command; passwords and `.env` files do pass
 through the computer. The only other path a secret takes out is the encrypted backup below.
@@ -28,7 +28,7 @@ FE would protect only firmware code that is open anyway.
 
 ```mermaid
 flowchart TD
-  PIN["PIN, 6-8 digits<br/>typed, never stored"] --> A
+  PIN["PIN, 8 digits<br/>typed, never stored"] --> A
   SALT["salt + cost<br/>vault header"] --> A
   A["Argon2id<br/>128 KiB, t measured for ~1 s"] --> PRE["pre"]
   PRE --> DK["hal::DeviceKey::mac<br/>eFuse HMAC key, chip only<br/>or Unbound if not burned"]
@@ -52,10 +52,10 @@ An unlock is checked against the verifier; nothing derived from the PIN is store
 
 | Choice | Reason |
 |---|---|
-| Argon2id, 128 KiB, no allocator | Memory hardness removes the GPU advantage of PBKDF2 |
+| Argon2id, 128 KiB, no allocator | Memory hardness costs an attacker more than PBKDF2 does — but 128 KiB is what the board can spare beside an 80 KiB vault and a 300 KiB stack, and it fits in the cache of any desktop core, so it buys time, not the memory bandwidth Argon2 is meant to charge for. Against the PIN that changes nothing (the counter and the eFuse key do the work); against a stolen `.vkb` it is the whole defence, hence the passphrase rule below |
 | Cost `t` in the vault header, bounded above | A forged header cannot park the key for hours |
 | Not `scrypt`, not `balloon-hash` | `scrypt` needs `alloc`; `balloon-hash` doubles the crypto crates |
-| PIN 6–8 digits | 4 digits is 10 000 candidates, which no KDF rescues |
+| PIN exactly 8 digits (0.9; was 6–8) | The counter can be erased through download mode, so the real cost of a guess is one firmware unlock, ~1.3 s. That is a fortnight for six digits, five months for seven and four years for eight — the only lever is length, because a slower KDF makes every honest unlock slower too. A PIN of the wrong length is refused before the wire and costs no attempt |
 | Chip key as a trait, `hal::DeviceKey` | The board supplies `esp_hal::hmac` when `KEY_PURPOSE_0 = HMAC_UP` (`ChipKey::detect`), else `Unbound`; the header records the binding, so firmware answering differently returns `Incompatible` instead of burning attempts |
 | Kind in the AAD with the name | The kind sits in flash as plaintext; without it one rewritten byte plus CRC would turn a TOTP secret into a "password" the reveal gesture hands out |
 
@@ -117,7 +117,11 @@ equipment and time. It protects against what the owner did not intend to do.
 item is sealed by **the device itself** (AES-256-GCM) as `kind | name | secret` under a key
 derived from a backup passphrase (Argon2id, fresh salt, same cost as the PIN; 12–128
 characters, because the file is brute-forced offline with no attempt counter) and
-**without** the chip key, or the file would not open on another board. The host assembles
+**without** the chip key, or the file would not open on another board. Twelve characters
+is a floor the frame enforces, not advice: at 128 KiB the KDF blunts a GPU rather than
+stopping it, and the entropy has to come from the passphrase itself. **Five or six words
+chosen by dice** — which is what the CLI asks for — and never a phrase a person invented,
+because that is the one place in this design where a weak choice loses everything at once. The host assembles
 the file (`cli/src/backup.rs`) and never looks inside: a TOTP secret does not leave in the
 clear here either. `BACKUP_AAD` plus the item index covers each item's position, so a
 reordered, substituted or repeated item does not open; a truncated file restores what it
@@ -187,13 +191,43 @@ Listed openly so nobody has to discover them.
    without it there is no firmware update and no eFuse read — so anyone holding the board
    can **erase or rewrite flash** without running any code. In practice: erase the attempt
    sector and brute force the PIN through the real firmware over USB at ~1.3 s per attempt
-   with a rewrite after every seven (8 digits means years), or erase the vault, the same
-   effect as eight wrong PINs.
+   with a rewrite after every seven, or erase the vault, the same effect as eight wrong
+   PINs. What that costs, and why the PIN is eight digits and not six as it was until 0.9:
+
+   | PIN | Whole space at ~1.3 s a guess | On average |
+   |---|---|---|
+   | 6 digits | ~15 days | ~8 days |
+   | 7 digits | ~5 months | ~2.5 months |
+   | 8 digits | ~4 years | ~2 years |
+
+   Eight digits is therefore not a preference but the floor at which this path costs more
+   than glitching the chip does. It is also the ceiling of what length can buy here: the
+   attempt counter cannot be made to survive an erase, and the KDF cannot be made slower
+   without making every honest unlock slower too.
 3. **The signing key is part of the model.** Losing it freezes the firmware forever;
    leaking it returns everything to the pre-Secure-Boot state.
-4. **The app image is not padded to the 64 KiB MMU page.** espflash cannot do
-   `--secure-pad-v2`, so the tail of the last page after the signature is mapped
-   unverified. Practical exploitability has not been assessed.
+4. **The app image is not padded to the 64 KiB MMU page.** espflash (4.5) has no
+   `--secure-pad-v2`, so the last page the image occupies is not filled to its end and the
+   remainder is outside what the signature covers. Measured on the current build
+   (2026-09-10): the app is 187 520 bytes, the signed image 192 512 (espsecure pads to the
+   next 4 KiB, then appends a 4 KiB signature block), and it is flashed at 0x10000 — so
+   0x10000…0x3F000 is verified and **0x3F000…0x40000, 4 KiB, is not**. Those 4 KiB sit
+   inside the 1 MiB `factory` partition, are erased today, and anyone with download mode
+   can write them — which is no new power, since the same access rewrites the whole flash;
+   what the signature guarantees is only that rewritten *code* will not boot. The
+   unverified tail therefore matters only if something ever maps and reaches it. Nothing
+   does: no segment covers it, no code jumps there, and it is not parsed at boot. It is an
+   amplifier for some other bug, not a way in — and it is the last unverified byte in the
+   chain, so it stays on this list until it is gone.
+
+   Not fixable by padding the file afterwards: `--secure-pad-v2` works by adding a padding
+   *segment* to the image, so the padding is inside the length the bootloader computes from
+   the segment headers and inside the hash. Zeros appended to the finished `.bin` would
+   instead push the signature block past where the bootloader looks for it, and the board
+   would boot nothing. Closing it means either espflash gaining the option, or building the
+   app image with `esptool elf2image --secure-pad-v2` (esptool is already present — it is
+   what signs) and re-doing the reproducible-image check around it. Either way it needs a
+   flash-and-boot test on a Secure Boot chip before it is believed.
 5. **The encryption key is bound to an eFuse HMAC key** (burned 2026-09-08), so a flash
    dump alone no longer allows offline PIN brute-forcing — an attacker also needs the chip,
    and no copy of the key exists. The attempt counter still protects only the path over the
@@ -209,7 +243,7 @@ Listed openly so nobody has to discover them.
 |---|---|---|---|
 | Secret never leaves the device in the clear | **Yes**; backup is encrypted on the device itself, behind a separate gesture | No: cloud backup, plaintext export | Yes |
 | Button press per code | **Yes** | No | Yes (touch) |
-| PIN with wipe | **Yes**, 6–8 digits, Argon2id | Phone passcode | OATH password |
+| PIN with wipe | **Yes**, 8 digits, Argon2id | Phone passcode | OATH password |
 | Passwords and their notes (recovery codes) | **Yes**, shown only after a press | Separate app | No (OATH) |
 | Project `.env` files | **Yes**, whole, after a press; up to 16 files of 8000 bytes | 1Password Environments, in the cloud | No |
 | Resistance to physical attacks | Partial: flash dump useless without the chip, foreign firmware will not run (Secure Boot v2); with the chip — PIN brute force through the real firmware with the counter erased, power glitching | No | Secure element, not absolute |

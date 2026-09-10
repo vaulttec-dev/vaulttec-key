@@ -1,37 +1,47 @@
 # vkey — a hardware key for TOTP codes, passwords and `.env` files
 
-An open-source USB-C security key on a Waveshare ESP32-C6-Zero, with bare-metal Rust
-firmware and a single-binary host CLI.
+Your project's `.env` and your TOTP seeds on a $6 board instead of on your disk and in your
+phone. An open-source USB-C key on a Waveshare ESP32-C6-Zero: bare-metal Rust firmware, a
+single-binary host CLI, and a press of the board's button for every secret that comes out.
 
 > **Status: a personal key, not a product** (2026-09-07). It runs on real hardware, its TOTP is
 > checked against the RFC 6238 vectors, and the author uses it for his own accounts. No sales, no
 > batch, no certification. Read [docs/threat-model.md](docs/threat-model.md) before relying on it,
 > and keep the recovery codes your services give you.
 
-## How it works
+## In ten seconds
 
-```mermaid
-flowchart LR
-    vkey["vkey CLI (host)<br/>subcommands · shell · flashing"] --- w1["wire.rs"]
-    w1 <-->|"VTC2 frames over USB Serial/JTAG"| w2["wire.rs"]
-    subgraph core["firmware/core — no chip name"]
-        w2 --- proto["proto — frames"] --> devi["device — PIN, entries"]
-        devi --> vault["vault — Argon2id, AES-256-GCM"] & store["store — flash, A/B image"] & oath["oath — HOTP / TOTP"]
-    end
-    board["firmware/boards/&lt;board&gt;/ — pins, board.toml"]
-    board -->|"four traits: flash · entropy · clock · button+LED"| core
+```console
+$ vkey totp add GitHub:me
+stored 'GitHub:me' - codes need a tap on the button
+
+$ vkey get GitHub:me
+tap the BOOT button on the board...
+734128   (17s left)  copied
 ```
 
-`wire.rs` is one file compiled on both ends of the cable: a command, error code or flag
-that is not in it exists on neither side. The device has no clock — the host sends the time.
+```console
+$ vkey env add myapp .env
+stored 'myapp' - it comes back whole after a tap:  vkey get myapp
+
+$ rm .env                      # the project's secrets are off the disk now
+
+$ env $(vkey get myapp) npm start
+tap the BOOT button on the board...
+```
+
+Nothing came back without a press, and the TOTP secret behind that code has no way out of
+the device at all — there is no command for it.
 
 ## What it is
 
 - **TOTP secrets**, **passwords** (login, password, note) and whole project **`.env` files**,
   encrypted with AES-256-GCM.
-- The key comes from a 6–8 digit PIN through Argon2id (128 KiB) and an HMAC key burned into eFuse,
-  so a flash dump without the chip is useless. JTAG is disabled; Secure Boot v2 (RSA-3072) is on;
-  Flash Encryption is deliberately not used.
+- The key comes from an 8-digit PIN through Argon2id (128 KiB) and an HMAC key burned into eFuse,
+  so a flash dump without the chip is useless. Eight digits and not fewer: whoever holds the board
+  can erase the attempt counter through download mode and guess through the firmware at ~1.3 s a
+  try, which is four years for eight digits and a fortnight for six. JTAG is disabled; Secure Boot
+  v2 (RSA-3072) is on; Flash Encryption is deliberately not used.
 - Every code, password and `.env` needs a button gesture. Eight wrong PINs wipe everything.
 - A TOTP secret goes in once and never comes out in the clear — there is no command for it. The one
   way out is `vkey backup`, which reseals every item under a backup passphrase.
@@ -119,9 +129,17 @@ wipe or an export: the gesture the owner makes for one satisfies neither of the 
 | `.env` blobs | 16, up to 8000 bytes each |
 | Entry name | 32 bytes; names are one namespace |
 | Login, password, note | 255 bytes each, 256 per entry in total |
-| PIN | 6–8 digits, 8 attempts |
+| PIN | exactly 8 digits, 8 attempts |
+| Backup passphrase | 12–128 characters; five or six random words, not an invented one |
 
 ## Build
+
+> **Upgrading a key whose PIN is shorter than eight digits: change the PIN first.** From
+> version 0.9 a PIN is exactly eight digits, checked before anything is sent, so a key holding
+> a six- or seven-digit PIN will not unlock under the new firmware — and a vault that does not
+> unlock is a vault that is gone. With the *currently installed* `vkey`, run `vkey pin change`
+> to an eight-digit PIN, then build and flash. A short PIN costs no attempt and cannot wipe the
+> key; it simply never opens it.
 
 ```bash
 rustup target add riscv32imac-unknown-none-elf && cargo install espflash   # once
@@ -145,6 +163,23 @@ CI runs the same set on every pull request, plus `cargo audit` weekly, a spell c
 byte, and verifies both signed images against `firmware/secure-boot/public.pem` — no secret
 involved, so anyone can repeat it. That is the only honest reason to trust a firmware image
 published as a binary.
+
+## How it works
+
+```mermaid
+flowchart LR
+    vkey["vkey CLI (host)<br/>subcommands · shell · flashing"] --- w1["wire.rs"]
+    w1 <-->|"VTC2 frames over USB Serial/JTAG"| w2["wire.rs"]
+    subgraph core["firmware/core — no chip name"]
+        w2 --- proto["proto — frames"] --> devi["device — PIN, entries"]
+        devi --> vault["vault — Argon2id, AES-256-GCM"] & store["store — flash, A/B image"] & oath["oath — HOTP / TOTP"]
+    end
+    board["firmware/boards/&lt;board&gt;/ — pins, board.toml"]
+    board -->|"four traits: flash · entropy · clock · button+LED"| core
+```
+
+`wire.rs` is one file compiled on both ends of the cable: a command, error code or flag
+that is not in it exists on neither side. The device has no clock — the host sends the time.
 
 ## Layout
 

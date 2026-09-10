@@ -15,7 +15,7 @@ pub use vaultkey_core::oath::{
     Algo, Digits, ENV_MAX, Entry, Kind, NAME_MAX, Name, Params, SECRET_MAX,
 };
 pub use vaultkey_core::store::MAX_ATTEMPTS;
-pub use vaultkey_core::vault::{PASS_MIN, PIN_MAX, PIN_MIN, Passphrase, Pin};
+pub use vaultkey_core::vault::{PASS_MIN, PIN_LEN, Passphrase, Pin};
 use vaultkey_core::wire::{BAD_LEN, Cmd, FLAG_REPLACE, Fail, MAGIC, OK, frame_head, scan_magic};
 pub use vaultkey_core::wire::{BackupHead, PinStatus};
 use zeroize::Zeroizing;
@@ -216,14 +216,15 @@ pub fn port_or_find(path: Option<&str>) -> Result<String, Error> {
 /// What the firmware accepts as a PIN, checked here first so a typo costs nothing.
 pub fn pin(text: &str) -> Result<Pin<'_>, Error> {
     Pin::new(text.as_bytes())
-        .ok_or_else(|| Error::Value(format!("PIN must be {PIN_MIN}-{PIN_MAX} digits")))
+        .ok_or_else(|| Error::Value(format!("PIN must be exactly {PIN_LEN} digits")))
 }
 
 /// What the firmware accepts as a backup passphrase, checked here first.
 pub fn passphrase(text: &str) -> Result<Passphrase<'_>, Error> {
     Passphrase::new(text.as_bytes()).ok_or_else(|| {
         Error::Value(format!(
-            "the passphrase must be at least {PASS_MIN} characters, one line, no control characters"
+            "the passphrase must be at least {PASS_MIN} characters, one line, no control \
+             characters - five or six random words, not a password you invented"
         ))
     })
 }

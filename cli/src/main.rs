@@ -344,7 +344,10 @@ fn run_info(dev: &mut Device, version: &str) -> Result<u8, Error> {
 
 fn run_backup(dev: &mut Device, version: &str, file: &Path) -> Result<u8, Error> {
     let file = backup::target(file)?;
-    let pass = twice("backup passphrase (12+ characters)", "passphrases")?;
+    let pass = twice(
+        "backup passphrase (five or six random words)",
+        "passphrases",
+    )?;
     passphrase(&pass)?;
     let button = boards::button(Some(version));
     let n = with_unlock(dev, |d| {
@@ -424,7 +427,7 @@ fn twice(label: &str, what: &str) -> Result<Zeroizing<String>, Error> {
 }
 
 fn new_pin() -> Result<Zeroizing<String>, Error> {
-    let a = twice("new PIN (6-8 digits)", "PINs")?;
+    let a = twice("new PIN (8 digits)", "PINs")?;
     pin(&a)?;
     Ok(a)
 }
