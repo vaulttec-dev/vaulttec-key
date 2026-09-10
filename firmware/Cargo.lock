@@ -553,8 +553,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4fbfed00e884572d620a6958b13456fc2bb8ab75802b5adc8afc224f97cdebad"
 dependencies = [
  "document-features",
- "esp-config 0.8.0",
- "esp-metadata-generated 0.5.1",
+ "esp-config",
+ "esp-metadata-generated",
  "esp-println",
  "heapless 0.9.3",
  "riscv",
@@ -563,32 +563,19 @@ dependencies = [
 
 [[package]]
 name = "esp-bootloader-esp-idf"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35ffc117c3a9859835d89d0e90f5ee9886ce2264a71a849a7a22ab5308f6653c"
+checksum = "ba0e487f6843419bb085d871f6e860da1bb8c267ce1c5db1051b83882e943054"
 dependencies = [
- "cfg-if",
  "document-features",
- "embedded-storage",
- "esp-config 0.7.0",
- "esp-hal-procmacros 0.22.0",
- "esp-metadata-generated 0.4.0",
+ "esp-config",
+ "esp-hal-procmacros",
+ "esp-metadata-generated",
  "esp-rom-sys",
+ "esp-storage",
  "jiff",
+ "sha2",
  "strum",
-]
-
-[[package]]
-name = "esp-config"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d9b92fd9cfb0b4f8f1b6219b9763269a335571e307b014903b8201619374b80"
-dependencies = [
- "document-features",
- "esp-metadata-generated 0.4.0",
- "serde",
- "serde_yaml",
- "somni-expr 0.2.0",
 ]
 
 [[package]]
@@ -598,10 +585,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fcd577a122ec917691f6820a3df54388ecebc750f071b060f5e83707bc415512"
 dependencies = [
  "document-features",
- "esp-metadata-generated 0.5.1",
+ "esp-metadata-generated",
  "serde",
  "serde_yaml",
- "somni-expr 0.3.2",
+ "somni-expr",
 ]
 
 [[package]]
@@ -628,9 +615,9 @@ dependencies = [
  "embedded-io-async 0.6.1",
  "embedded-io-async 0.7.0",
  "enumset",
- "esp-config 0.8.0",
- "esp-hal-procmacros 0.23.0",
- "esp-metadata-generated 0.5.1",
+ "esp-config",
+ "esp-hal-procmacros",
+ "esp-metadata-generated",
  "esp-riscv-rt",
  "esp-rom-sys",
  "esp-sync",
@@ -664,20 +651,6 @@ dependencies = [
 
 [[package]]
 name = "esp-hal-procmacros"
-version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6aebfabb2c21bec45e575e4f6cb6bb7aa8e1b33e7ac45b5dffa0f9d33ff59105"
-dependencies = [
- "document-features",
- "proc-macro-crate",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
- "termcolor",
-]
-
-[[package]]
-name = "esp-hal-procmacros"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a8733fdeadc349ba1e4a345c7bfb74d195d8c98fd3be9d2c15bfd78601cbc44"
@@ -706,12 +679,6 @@ dependencies = [
 
 [[package]]
 name = "esp-metadata-generated"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42c2ee95b945a4780796e4359e72c033aed3b45073880e8029458f538532db8a"
-
-[[package]]
-name = "esp-metadata-generated"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44d5a63d730b8c56e6b32773e35fcc4988d7d2e5c64d521652317d3ebddf2b52"
@@ -723,7 +690,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebf772a41bc642b57399632aa06ab55391de35b2b8fcbb1b270d282fbd0fe5ff"
 dependencies = [
  "document-features",
- "esp-metadata-generated 0.5.1",
+ "esp-metadata-generated",
  "esp-sync",
  "log",
  "portable-atomic",
@@ -747,7 +714,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e933ff78374b763b65998b64ad671b4890ed4ba13a80deff9f53afe95ede289d"
 dependencies = [
  "document-features",
- "esp-metadata-generated 0.5.1",
+ "esp-metadata-generated",
  "esp32c6",
 ]
 
@@ -760,8 +727,8 @@ dependencies = [
  "document-features",
  "embedded-storage",
  "esp-hal",
- "esp-hal-procmacros 0.23.0",
- "esp-metadata-generated 0.5.1",
+ "esp-hal-procmacros",
+ "esp-metadata-generated",
  "esp-rom-sys",
  "esp-sync",
  "esp32c6",
@@ -777,7 +744,7 @@ dependencies = [
  "embassy-sync 0.6.2",
  "embassy-sync 0.7.2",
  "embassy-sync 0.8.0",
- "esp-metadata-generated 0.5.1",
+ "esp-metadata-generated",
  "riscv",
  "xtensa-lx",
 ]
@@ -1404,28 +1371,13 @@ dependencies = [
 
 [[package]]
 name = "somni-expr"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ed9b7648d5e8b2df6c5e49940c54bcdd2b4dd71eafc6e8f1c714eb4581b0f53"
-dependencies = [
- "somni-parser 0.2.2",
-]
-
-[[package]]
-name = "somni-expr"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f024812d1302010ff9227b80650469e58a3ef129ec5fda36c7a0b6b14ce07371"
 dependencies = [
  "indexmap",
- "somni-parser 0.3.1",
+ "somni-parser",
 ]
-
-[[package]]
-name = "somni-parser"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0f368519fc6c85fc1afdb769fb5a51123f6158013e143656e25a3485a0d401c"
 
 [[package]]
 name = "somni-parser"
@@ -1439,8 +1391,8 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f39bb07107650fb128f05f033a97212e946a3c0625cc729c97ed586bf7f226a3"
 dependencies = [
- "somni-expr 0.3.2",
- "somni-parser 0.3.1",
+ "somni-expr",
+ "somni-parser",
 ]
 
 [[package]]
