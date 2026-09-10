@@ -15,7 +15,7 @@ workspace = true
 [dependencies]
 # Hardware comes in through traits: flash, entropy, time, the port, the button and LED.
 embedded-storage = "0.3"
-rand_core = "0.9"
+rand_core = "0.10"
 
 # Crypto: pure Rust, no_std, from RustCrypto. No hand-rolled primitives. The zeroize
 # features make the crates scrub their expanded keys and HMAC pads when dropped.
