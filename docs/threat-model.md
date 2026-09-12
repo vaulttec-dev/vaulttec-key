@@ -158,12 +158,15 @@ clear is weaker than it sounds, and the screen keeps a copy of its own:
 
 - **A clipboard manager keeps its own copy.** GPaste, Klipper, CopyQ and the Windows
   clipboard history record every selection as it is made, usually to disk. Emptying the
-  clipboard does not reach that store, so the password stays in the manager's history and
-  its search after the 30 s are up. The only fixes are outside the CLI: pause the manager
+  clipboard does not reach that store, so the password stays in the manager's history, and
+  in its search, after the 30 s are up. The only fixes are outside the CLI: pause the manager
   before a reveal, exclude `vkey` from it, or skip the clipboard and read the password off
   the screen. The clear is also unconditional — whatever is in the clipboard 30 s later is
-  emptied, including something copied since — and a session that ends inside those 30 s
-  never runs it at all.
+  emptied, including something copied since. The waiting shell is detached, so it outlives
+  `vkey` itself — but it is not in a session of its own (no `setsid`), so closing the
+  terminal window or logging out inside those 30 s SIGHUPs the process group and the clear
+  never runs; nor does it if the Wayland or X11 session the clipboard tool talks to is gone
+  by then.
 - **The terminal keeps the reveal on screen.** A revealed password is printed: to stdout by
   `vkey get`, into the transcript above the frame by the shell (`cli/src/shell.rs`). It
   then sits in the emulator's scrollback until the window closes, in the pane's buffer for
