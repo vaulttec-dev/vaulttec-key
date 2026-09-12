@@ -56,7 +56,9 @@ Read [docs/threat-model.md](docs/threat-model.md) **before** you depend on this.
   property of TOTP. WebAuthn resists it, and this hardware cannot: the C6's USB is a fixed
   Serial/JTAG port with no HID.
 - **Nothing for the code or password you just received** — it crosses the host: terminal, optionally
-  the clipboard (cleared after 30 s).
+  the clipboard. The clipboard is cleared after 30 s, but a clipboard manager has already kept its own
+  copy, and the reveal stays in the terminal's scrollback until the window closes. Details in the
+  threat model.
 - ESP32 is **not a secure element.** Against power glitching and side channels it does not hold; a
   public Secure Boot glitch bypass for ESP32-C3/C6 exists (Espressif AR2023-007). Download mode
   stays open on purpose: anyone holding the board can rewrite the flash.

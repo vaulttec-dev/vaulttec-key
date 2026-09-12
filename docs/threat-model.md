@@ -5,7 +5,7 @@
 > There is no sale today, and the document holds all the same: the owner must not rely
 > on guarantees the device does not give.
 
-Last reviewed 2026-09-10. Revisited on every hardware or firmware change. Reporting
+Last reviewed 2026-09-12. Revisited on every hardware or firmware change. Reporting
 policy: [`SECURITY.md`](../SECURITY.md). Board details: [`docs/hardware.md`](hardware.md).
 
 ## What the device is
@@ -143,7 +143,7 @@ it does not transfer while bound to the chip key.
 | Threat | Why not |
 |---|---|
 | Phishing | A TOTP code typed into a fake site works on the real one. That is a property of TOTP, not of the device; only WebAuthn/passkey stops phishing, and it is **not** here and never will be on this board |
-| The code, password or `.env` you just received | It passes through USB, the terminal and optionally the clipboard; host malware sees it at that moment |
+| The code, password or `.env` you just received | It passes through USB, the terminal and optionally the clipboard; host malware sees it at that moment, and it outlives the moment in the terminal's scrollback and in a clipboard manager's history (below) |
 | A host fully compromised at the moment of use | It waits for your press and takes the result; with no display the device cannot show what you are confirming |
 | A breach at the service | TOTP is a shared secret: the service stores it too |
 | A plaintext export on disk before `vkey import` | The CSV exists before and after the import |
@@ -151,10 +151,31 @@ it does not transfer while bound to the chip key.
 | A state-level attack | Supply chain, hardware modification: a small project controls neither |
 
 The device protects the **secret** that generates all future codes, not one code. A
-password is worse than a code: it lives for years. The CLI clears a clipboard password
-after 30 s, and a password's note goes to the screen only, never the clipboard. That is
-the price of having no display; the only thing that reduces it is that display requires a
-press and never happens on its own. Recovery codes belong in that note (as does a
+password is worse than a code: it lives for years. A password's note goes to the screen
+only, never the clipboard, and a copied password is cleared from the clipboard after 30 s
+(`copy_secret` in `cli/src/prompt.rs` detaches `sleep 30` plus the tool's own clear). That
+clear is weaker than it sounds, and the screen keeps a copy of its own:
+
+- **A clipboard manager keeps its own copy.** GPaste, Klipper, CopyQ and the Windows
+  clipboard history record every selection as it is made, usually to disk. Emptying the
+  clipboard does not reach that store, so the password stays in the manager's history, and
+  in its search, after the 30 s are up. The only fixes are outside the CLI: pause the manager
+  before a reveal, exclude `vkey` from it, or skip the clipboard and read the password off
+  the screen. The clear is also unconditional — whatever is in the clipboard 30 s later is
+  emptied, including something copied since. The waiting shell is detached, so it outlives
+  `vkey` itself — but it is not in a session of its own (no `setsid`), so closing the
+  terminal window or logging out inside those 30 s SIGHUPs the process group and the clear
+  never runs; nor does it if the Wayland or X11 session the clipboard tool talks to is gone
+  by then.
+- **The terminal keeps the reveal on screen.** A revealed password is printed: to stdout by
+  `vkey get`, into the transcript above the frame by the shell (`cli/src/shell.rs`). It
+  then sits in the emulator's scrollback until the window closes, in the pane's buffer for
+  as long as a `tmux` or `screen` session lives, and on disk whenever the terminal logs the
+  session. Close the window rather than scrolling back; nothing in the CLI can erase what
+  the emulator already owns.
+
+That is the price of having no display; the only thing that reduces it is that display
+requires a press and never happens on its own. Recovery codes belong in that note (as does a
 1Password Secret Key or a security-question answer), and on the key they are a **copy, not
 a backup**: the service issues them in case the 2FA device is lost, so if TOTP and the
 codes sit on the same key, losing it takes both. Their home is paper away from the key.
