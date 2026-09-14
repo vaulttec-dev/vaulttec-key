@@ -500,10 +500,13 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         out: &mut [u8; AUTH_SIGNATURE_LEN],
     ) -> Result<(), Fail> {
         self.load()?;
-        let i = self.state.find(name).ok_or(Fail::NotFound)?;
-        if self.state.slots[i].kind != Kind::Auth {
-            return Err(Fail::BadArg);
-        }
+        // Any other kind reads as absent: without the PIN, which names exist is nobody's
+        // to learn, and a different answer for "exists, but not auth" would tell.
+        let i = self
+            .state
+            .find(name)
+            .filter(|&i| self.state.slots[i].kind == Kind::Auth)
+            .ok_or(Fail::NotFound)?;
         let key = vault::auth_key(&mut self.key).ok_or(Fail::Incompatible)?;
         let e = Self::open_record(&key, &self.state.slots[i]).ok_or(Fail::Internal)?;
         if !ui::await_confirmation(&mut self.ui, &self.clock, AUTH_TOUCH_TIMEOUT_MS) {

@@ -1319,8 +1319,8 @@ fn an_auth_secret_answers_a_tap_without_the_pin() {
     );
     assert_eq!(
         respond(&mut dev, "github"),
-        Err(Fail::BadArg),
-        "a seed makes codes only"
+        Err(Fail::NotFound),
+        "a seed makes codes only, and a locked key does not say it exists"
     );
     assert_eq!(respond(&mut dev, "nobody"), Err(Fail::NotFound));
 

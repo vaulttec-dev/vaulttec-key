@@ -176,7 +176,9 @@ under the passphrase and a restore under the new chip, so the host's public key 
 | Given | A login needs this physical board and a finger on it; no secret on the host; a fresh challenge every time; no PIN attempt spent |
 | Laptop and key stolen together | The lock screen opens with a tap. A powered-off laptop is protected by disk encryption, not by this. Carry the key separately, do not leave it in the port |
 | Malware running as the user | Can start `sudo` and wait for a reflex tap. The LED is the same amber as a code; a tap you did not ask for is the thing to refuse |
-| A locked key | Answers `NotFound` or `BadArg` to any name without the PIN: whether `<user>@<host>` is enrolled is not secret |
+| A locked key | Answers `NotFound` to every name that is not an auth entry, so it names no service without the PIN; whether `<user>@<host>` is enrolled is not secret |
+| Someone at the unlocked laptop while you are away, key in the port | Gets root with one tap where `sudo` used to want the password |
+| A `.vkb` backup | Now also carries the login seed: with the passphrase and any chip-bound board it signs for your `sudo` too |
 | A user-writable binary | PAM runs `vkey` as root; `vkey auth` refuses unless its executable and every directory above it are root's alone, hence `/usr/local/bin/vkey` |
 | The public key file | Not secret. Replacing it needs root, and `vkey auth` refuses it unless it and every directory above it are root's alone |
 | The port busy (the `vkey` shell open) | The login fails and PAM falls back to the password |
