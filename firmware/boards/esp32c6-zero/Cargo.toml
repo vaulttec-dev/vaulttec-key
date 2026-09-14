@@ -20,7 +20,7 @@ vaultkey-core = { path = "../../core" }
 
 # Everything below is what this chip needs; the key itself knows none of it.
 esp-hal = { version = "1.2.0", features = ["esp32c6", "rt", "unstable"] }
-esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32c6"] }
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32c6"] }
 esp-println = { version = "0.18.0", default-features = false, features = ["esp32c6", "jtag-serial", "critical-section"] }
 esp-backtrace = { version = "0.20.0", features = ["esp32c6", "panic-handler", "println"] }
 esp-storage = { version = "0.10.0", features = ["esp32c6", "embedded-storage"] }
