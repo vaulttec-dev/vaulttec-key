@@ -104,15 +104,17 @@ vkey env add myapp .env               # or: wl-paste | vkey env add myapp
 vkey get GitHub:me                    # a code; vkey get mail [--copy] for a login and password
 vkey get myapp > .env                 # better without a file:  env $(vkey get myapp) npm start
 vkey list · rm · info · lock · pin set/change · totp selftest · wipe
-vkey import passwords.csv             # Google Password Manager or 1Password 8 export, one question per row
+vkey op [query]                       # sync from 1Password (passwords, TOTP, notes, developer .env)
+vkey import passwords.csv             # Google Password Manager or 1Password CSV export (skips unchanged)
 vkey backup vault.vkb                 # everything in one file, sealed on the key; two taps
-vkey restore vault.vkb                # everything back, onto this key or a new one; PIN and passphrase
+vkey restore [file]                   # restore from 1Password, CSV, or .vkb backup file
 vkey check --wipe-everything          # lifecycle test on a board; ERASES EVERYTHING
 ```
 
 A `.env` is stored as is and comes out whole after one tap; only `KEY=value` lines are accepted,
 checked by the CLI. A CSV export is plaintext on disk before and after `vkey import`, and the CLI
-does not delete it.
+does not delete it. `vkey op` syncs directly with the 1Password CLI (`op`) without plaintext files
+on disk, automatically skipping unchanged items.
 
 ## Gestures and capacity
 

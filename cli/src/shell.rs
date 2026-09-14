@@ -27,7 +27,7 @@ use crate::device::{
     password_blob, pin,
 };
 use crate::prompt::{ACCENT, DIM, PinPrompt, WARN_AT, copy_secret, copy_to_clipboard};
-use crate::{backup, import, prompt, setup, totp};
+use crate::{backup, import, op, prompt, setup, totp};
 
 /// Commands live behind `/`; a bare word is the name of an entry to use.
 const COMMANDS: &[(&str, &str)] = &[
@@ -56,7 +56,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "restore",
-        "every entry and .env out of a backup file onto this key; PIN and the passphrase",
+        "restore entries from 1Password API, a CSV export, or a backup file",
     ),
 ];
 /// Reached from the list with a, e, d and i, never offered as commands: an entry has
@@ -374,6 +374,33 @@ impl setup::ProvisionUi for Shell {
         self.unlocked = true;
         Ok(())
     }
+}
+
+impl prompt::SyncUi for Shell {
+    fn info(&mut self, line: &str) {
+        self.line(DIM, &format!("  {line}"));
+    }
+
+    fn unlock(&mut self, dev: &mut Device) -> Result<(), Error> {
+        prompt::unlock_loop(dev, self)?;
+        self.unlocked = true;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RestoreSource {
+    OnePassword,
+    Csv,
+    Backup,
+}
+
+/// A choice in the menu of saved Developer Environments.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EnvPick {
+    Item(usize),
+    All,
+    New,
 }
 
 impl Shell {
@@ -1612,14 +1639,205 @@ impl Shell {
         let Some(mut dev) = self.dev.take() else {
             return Err(Error::NoBoard);
         };
-        let done = import::run(&mut dev, &parsed.rows, &mut |s| {
-            self.line(DIM, &format!("  {s}"));
-        });
+        let done = import::run(&mut dev, &parsed.rows, false, self);
         self.dev = Some(dev);
         self.line(Color::Yellow, &format!("  {}", import::reminder(&path)));
         self.line(Color::Green, &format!("  {}", done?.line()));
         self.refresh();
         Ok(())
+    }
+
+    /// `/op [item]`: pull credentials or whole vault directly from 1Password.
+    fn cmd_op(&mut self, arg: &str) -> Result<(), Error> {
+        self.ensure_unlocked()?;
+        let query = arg.trim();
+        if query.eq_ignore_ascii_case("env")
+            || query.eq_ignore_ascii_case("environments")
+            || query.eq_ignore_ascii_case("op-env")
+            || query.eq_ignore_ascii_case("1password-env")
+        {
+            return self.cmd_op_env();
+        }
+
+        let Some(mut dev) = self.dev.take() else {
+            return Err(Error::NoBoard);
+        };
+        let done = if query.is_empty() {
+            self.line(Color::Blue, "  ● 1Password Developer Environments (.env)");
+
+            let saved = op::load_saved_envs();
+            let mut env_pairs = Vec::new();
+
+            if !saved.is_empty() {
+                let mut env_list: Vec<(String, String)> = saved.into_iter().collect();
+                env_list.sort_by(|a, b| a.0.cmp(&b.0));
+
+                let prompt_label = format!("include {} saved Environment(s)?", env_list.len());
+                let include_saved = self.choose(
+                    &prompt_label,
+                    &[
+                        (true, "update saved", "include all saved environments"),
+                        (
+                            false,
+                            "custom / add new",
+                            "add or enter environments manually",
+                        ),
+                    ],
+                );
+                if include_saved == Some(true) {
+                    env_pairs.extend(env_list);
+                }
+            }
+
+            if env_pairs.is_empty() {
+                self.line(
+                    DIM,
+                    "    (in 1Password: Developer -> View Environments -> View environment -> Manage environment -> Copy environment ID)",
+                );
+
+                while let Some(pair) =
+                    self.ask_env("add Environment (name or name:ID, Enter to proceed): ")
+                {
+                    env_pairs.push(pair);
+                }
+            }
+
+            let env_refs: Vec<(&str, &str)> = env_pairs
+                .iter()
+                .map(|(n, i)| (n.as_str(), i.as_str()))
+                .collect();
+
+            op::sync(&mut dev, None, None, &env_refs, false, self)
+        } else {
+            op::pull_item(&mut dev, query, false, self)
+        };
+        self.dev = Some(dev);
+        self.line(Color::Green, &format!("  {}", done?.line()));
+        self.refresh();
+        Ok(())
+    }
+
+    /// Pull only 1Password Developer Environments into .env slots.
+    fn cmd_op_env(&mut self) -> Result<(), Error> {
+        self.ensure_unlocked()?;
+        let Some(mut dev) = self.dev.take() else {
+            return Err(Error::NoBoard);
+        };
+        let mut sum = import::Summary::default();
+        self.line(Color::Blue, "  ● 1Password Developer Environments (.env)");
+
+        let saved = op::load_saved_envs();
+        if !saved.is_empty() {
+            let mut env_list: Vec<(String, String)> = saved.into_iter().collect();
+            env_list.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let mut options: Vec<(EnvPick, &str, String)> = Vec::new();
+            for (idx, (name, id)) in env_list.iter().enumerate() {
+                let id_short = if id.len() > 12 {
+                    format!("ID: {}... (update)", &id[..8])
+                } else {
+                    format!("ID: {id} (update)")
+                };
+                options.push((EnvPick::Item(idx), name.as_str(), id_short));
+            }
+            if env_list.len() > 1 {
+                options.push((
+                    EnvPick::All,
+                    "all",
+                    "update all saved environments".to_string(),
+                ));
+            }
+            options.push((
+                EnvPick::New,
+                "add new",
+                "add or enter a new environment".to_string(),
+            ));
+
+            let opt_refs: Vec<(EnvPick, &str, &str)> = options
+                .iter()
+                .map(|(p, n, d)| (*p, *n, d.as_str()))
+                .collect();
+
+            let chosen = self.choose("select Environment to update:", &opt_refs);
+            match chosen {
+                Some(EnvPick::Item(idx)) => {
+                    let (name, id) = &env_list[idx];
+                    if let Err(e) =
+                        op::process_environment(&mut dev, name, id, true, self, &mut sum)
+                    {
+                        self.line(Color::Red, &format!("  error: {e}"));
+                    }
+                    self.dev = Some(dev);
+                    self.line(Color::Green, &format!("  {}", sum.line()));
+                    self.refresh();
+                    return Ok(());
+                }
+                Some(EnvPick::All) => {
+                    for (name, id) in &env_list {
+                        if let Err(e) =
+                            op::process_environment(&mut dev, name, id, true, self, &mut sum)
+                        {
+                            self.line(Color::Red, &format!("  error: {e}"));
+                        }
+                    }
+                    self.dev = Some(dev);
+                    self.line(Color::Green, &format!("  {}", sum.line()));
+                    self.refresh();
+                    return Ok(());
+                }
+                Some(EnvPick::New) => {}
+                None => {
+                    self.dev = Some(dev);
+                    return Ok(());
+                }
+            }
+        }
+
+        self.line(
+            DIM,
+            "    (in 1Password: Developer -> View Environments -> View environment -> Manage environment -> Copy environment ID)",
+        );
+
+        while let Some((env_name, env_id)) =
+            self.ask_env("add Environment (name or name:ID, Enter to finish): ")
+        {
+            if let Err(e) =
+                op::process_environment(&mut dev, &env_name, &env_id, true, self, &mut sum)
+            {
+                self.line(Color::Red, &format!("  error: {e}"));
+            }
+        }
+
+        self.dev = Some(dev);
+        self.line(Color::Green, &format!("  {}", sum.line()));
+        self.refresh();
+        Ok(())
+    }
+
+    /// One Developer Environment as `(name, id)`: `name:id`, a saved name, or a name and
+    /// then its ID. None when the person finishes with Enter or Esc.
+    fn ask_env(&mut self, label: &str) -> Option<(String, String)> {
+        loop {
+            let input = self.ask(label, Field::Plain)?;
+            let input = input.trim();
+            if input.is_empty() {
+                return None;
+            }
+            if let Some(pair) = op::parse_env_spec(input) {
+                return Some(pair);
+            }
+            if let Some(id) = op::load_saved_envs().get(input) {
+                self.line(DIM, &format!("  using stored ID for '{input}'"));
+                return Some((input.to_string(), id.clone()));
+            }
+            let id_label = format!("ID for '{input}' (copy from 1Password): ");
+            let id = self.ask(&id_label, Field::Plain)?;
+            let id = id.trim();
+            if !id.is_empty() {
+                return Some((input.to_string(), id.to_string()));
+            }
+            self.line(DIM, "  skipped (empty ID)");
+        }
     }
 
     /// `arg` as a path, or the path asked for; None when the person gives up.
@@ -1663,8 +1881,59 @@ impl Shell {
         Ok(())
     }
 
-    /// `/restore [file]`: the passphrase once, the PIN if needed, no button.
+    /// `/restore [file]`: from 1Password API, a CSV export, or a backup file.
     fn cmd_restore(&mut self, arg: &str) -> Result<(), Error> {
+        let arg = arg.trim();
+        if arg.eq_ignore_ascii_case("op") || arg.eq_ignore_ascii_case("1password") {
+            return self.cmd_op("");
+        }
+        if arg.eq_ignore_ascii_case("env")
+            || arg.eq_ignore_ascii_case("environments")
+            || arg.eq_ignore_ascii_case("op-env")
+            || arg.eq_ignore_ascii_case("1password-env")
+        {
+            return self.cmd_op_env();
+        }
+        if Path::new(arg)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("csv"))
+        {
+            return self.cmd_import(arg);
+        }
+        if !arg.is_empty() {
+            return self.cmd_restore_backup(arg);
+        }
+
+        let source = self.choose(
+            "restore from: ",
+            &[
+                (
+                    RestoreSource::OnePassword,
+                    "1password",
+                    "1Password vault and developer environments (.env)",
+                ),
+                (
+                    RestoreSource::Csv,
+                    "csv",
+                    "Google Password Manager or 1Password CSV export",
+                ),
+                (
+                    RestoreSource::Backup,
+                    "backup",
+                    "a .vkb backup file written by 'vkey backup'",
+                ),
+            ],
+        );
+
+        match source {
+            Some(RestoreSource::OnePassword) => self.cmd_op(""),
+            Some(RestoreSource::Csv) => self.cmd_import(""),
+            Some(RestoreSource::Backup) => self.cmd_restore_backup(""),
+            None => Ok(()),
+        }
+    }
+
+    fn cmd_restore_backup(&mut self, arg: &str) -> Result<(), Error> {
         let Some(path) = self.path_arg(arg, "restore from: ") else {
             return Ok(());
         };
@@ -1749,6 +2018,7 @@ impl Shell {
             "import" => self.cmd_import(arg),
             "backup" => self.cmd_backup(arg),
             "restore" => self.cmd_restore(arg),
+            "op" => self.cmd_op(arg),
             other => unreachable!("resolve_command returned an unknown command: {other}"),
         };
         self.report(r)

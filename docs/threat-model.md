@@ -193,8 +193,9 @@ the disk sees it — trash, backups, cloud sync, filesystem snapshots. The CLI r
 zeroized memory and prints no password, but does not delete the file: that is irreversible,
 and until the device is verified the file is the only copy. The owner's rule: export to
 tmpfs (`/dev/shm`), import, delete — `shred -u` guarantees nothing on an SSD or a
-copy-on-write filesystem. For 1Password no export is needed at all: `op read ... | vkey
-pass add` passes the secret through a pipe.
+copy-on-write filesystem. For 1Password no plaintext export is needed at all: `vkey op`
+syncs directly with the 1Password CLI (`op`) in memory, keeping passwords, TOTP seeds
+and developer `.env` environments off disk.
 
 ## Known limitations
 

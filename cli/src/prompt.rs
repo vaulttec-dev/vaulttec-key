@@ -46,6 +46,24 @@ pub fn prompt_secret(label: &str) -> Result<Zeroizing<String>, Error> {
         .map_err(|_| Error::Value(format!("no {label} entered")))
 }
 
+/// Reads a plain line with echo and a prompt. Returns an empty string on EOF.
+pub fn prompt_line(label: &str) -> Result<String, Error> {
+    if !is_tty() {
+        let mut line = String::new();
+        io::stdin().lock().read_line(&mut line)?;
+        let len = line.trim_end_matches(['\r', '\n']).len();
+        line.truncate(len);
+        return Ok(line);
+    }
+    print!("{label}: ");
+    io::stdout().flush()?;
+    let mut line = String::new();
+    io::stdin().lock().read_line(&mut line)?;
+    let len = line.trim_end_matches(['\r', '\n']).len();
+    line.truncate(len);
+    Ok(line)
+}
+
 /// How long a generated password is. Sites cap passwords at 64 or so and choke on
 /// exotic symbols, so this is long and plain rather than short and strange.
 const GENERATED_LEN: usize = 24;
@@ -330,4 +348,23 @@ pub fn with_unlock<T>(
         unlock_interactive(dev)?;
     }
     f(dev)
+}
+
+/// Interface for progress reporting and re-authentication during bulk import/sync.
+pub trait SyncUi {
+    fn info(&mut self, line: &str);
+    fn unlock(&mut self, dev: &mut Device) -> Result<(), Error>;
+}
+
+/// Command-line UI implementation for `SyncUi`.
+pub struct CliUi;
+
+impl SyncUi for CliUi {
+    fn info(&mut self, line: &str) {
+        println!("{line}");
+    }
+
+    fn unlock(&mut self, dev: &mut Device) -> Result<(), Error> {
+        unlock_interactive(dev)
+    }
 }

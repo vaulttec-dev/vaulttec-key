@@ -6,14 +6,14 @@
 //! ever reaches the screen, and the file stays where it is: deleting it is the
 //! owner's call, once the device has been checked.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use csv_core::{ReadRecordResult, Reader};
 use zeroize::Zeroizing;
 
 use crate::device::{Device, Error, Kind, NAME_MAX, password_blob};
-use crate::prompt::choose;
+use crate::prompt::SyncUi;
 use crate::totp;
 
 /// One entry the export can put on the device. The name and the login are printed;
@@ -227,7 +227,7 @@ fn rows_of(raws: &[Raw], out: &mut Parsed) {
 }
 
 /// The title, or the site's host when there is none; cut to what a name may be.
-fn entry_name(title: &str, url: &str) -> Option<String> {
+pub(crate) fn entry_name(title: &str, url: &str) -> Option<String> {
     let title = title.trim();
     let name = if title.is_empty() {
         url::Url::parse(url.trim())
@@ -244,7 +244,7 @@ fn entry_name(title: &str, url: &str) -> Option<String> {
 }
 
 /// At most `NAME_MAX` bytes, never mid-character.
-fn truncate(mut s: String) -> String {
+pub(crate) fn truncate(mut s: String) -> String {
     while s.len() > NAME_MAX {
         s.pop();
     }
@@ -284,63 +284,70 @@ fn records(csv: &[u8], f: &mut dyn FnMut(&[&str]) -> Result<(), Error>) -> Resul
     }
 }
 
-/// What the person says about one row.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Next {
-    Add,
-    Skip,
-    Stop,
-}
-
-/// Walks the rows with the person, one question each. Stops on "stop", Esc, or a
-/// full device; anything else the device refuses is an error.
-pub fn run(dev: &mut Device, rows: &[Row], say: &mut dyn FnMut(&str)) -> Result<Summary, Error> {
+/// Stores rows from a CSV export onto the device. Existing entries are skipped automatically.
+pub fn run(
+    dev: &mut Device,
+    rows: &[Row],
+    replace: bool,
+    ui: &mut dyn SyncUi,
+) -> Result<Summary, Error> {
     let mut sum = Summary::default();
+    let existing: HashSet<String> = if replace {
+        HashSet::new()
+    } else {
+        dev.list()
+            .map(|entries| entries.into_iter().map(|e| e.name).collect())
+            .unwrap_or_default()
+    };
+
     for (i, row) in rows.iter().enumerate() {
-        let what = match row.kind {
-            Kind::Password => "password",
-            Kind::Totp(_) => "totp",
-            Kind::Env => "env", // no export has one; the match stays exhaustive
-        };
-        let label = if row.login.is_empty() {
-            format!("{}  ({what})", row.name)
+        let desc = if row.login.is_empty() {
+            row.name.clone()
         } else {
-            format!("{}  login {}  ({what})", row.name, row.login)
+            format!("{} ({})", row.name, row.login)
         };
-        let choice = choose(
-            &label,
-            &[
-                (Next::Add, "add", ""),
-                (Next::Skip, "skip", ""),
-                (Next::Stop, "stop", "leave the rest"),
-            ],
-        );
-        match choice {
-            Some(Next::Add) => match dev.add(&row.name, &row.secret, row.kind, false) {
-                Ok(()) => sum.added += 1,
-                Err(Error::Exists) => {
-                    let replace = choose(
-                        &format!("'{}' already exists", row.name),
-                        &[(false, "keep the old one", ""), (true, "replace", "")],
-                    );
-                    if replace == Some(true) {
-                        dev.add(&row.name, &row.secret, row.kind, true)?;
+
+        if !replace && existing.contains(&row.name) {
+            ui.info(&format!("  skipped '{desc}' (already exists)"));
+            sum.skipped += 1;
+            continue;
+        }
+
+        let mut retried = false;
+        loop {
+            match dev.add(&row.name, &row.secret, row.kind, replace) {
+                Ok(()) => {
+                    if replace && existing.contains(&row.name) {
                         sum.replaced += 1;
+                        ui.info(&format!("  updated '{desc}'"));
                     } else {
-                        sum.skipped += 1;
+                        sum.added += 1;
+                        ui.info(&format!("  stored '{desc}'"));
                     }
-                }
-                Err(Error::Full) => {
-                    say("the device is full");
-                    sum.left = rows.len() - i;
                     break;
                 }
+                Err(Error::Exists) if replace => {
+                    dev.add(&row.name, &row.secret, row.kind, true)?;
+                    sum.replaced += 1;
+                    ui.info(&format!("  updated '{desc}'"));
+                    break;
+                }
+                Err(Error::Exists) => {
+                    sum.skipped += 1;
+                    ui.info(&format!("  skipped '{desc}' (already exists)"));
+                    break;
+                }
+                Err(Error::Full) => {
+                    ui.info("the device is full");
+                    sum.left = rows.len() - i;
+                    return Ok(sum);
+                }
+                Err(Error::Locked) if !retried => {
+                    retried = true;
+                    ui.info("  device locked: re-authenticating PIN...");
+                    ui.unlock(dev)?;
+                }
                 Err(e) => return Err(e),
-            },
-            Some(Next::Skip) => sum.skipped += 1,
-            Some(Next::Stop) | None => {
-                sum.left = rows.len() - i;
-                break;
             }
         }
     }

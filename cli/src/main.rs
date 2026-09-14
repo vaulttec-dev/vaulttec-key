@@ -25,6 +25,7 @@ mod check;
 mod device;
 mod import;
 mod install;
+mod op;
 mod prompt;
 mod setup;
 mod shell;
@@ -111,10 +112,31 @@ enum Cmd {
         cmd: EnvCmd,
     },
     /// Passwords and TOTP codes from a Google Password Manager or 1Password 8 CSV
-    /// export; asks about every row, so it needs a terminal
+    /// export; existing entries are skipped automatically
     Import {
         /// The CSV file the manager exported
         file: PathBuf,
+        /// Replace existing entries without asking
+        #[arg(short, long)]
+        replace: bool,
+    },
+    /// Pull passwords, TOTP codes and .env files directly from 1Password via 'op'
+    #[command(alias = "1password")]
+    Op {
+        /// Specific item or document to pull; syncs all items if omitted
+        item: Option<String>,
+        /// Filter items by 1Password tag
+        #[arg(long)]
+        tag: Option<String>,
+        /// Filter items by 1Password vault
+        #[arg(long)]
+        vault: Option<String>,
+        /// 1Password Developer Environment to import (name:id or name=id)
+        #[arg(short = 'E', long = "environment")]
+        environments: Vec<String>,
+        /// Replace existing entries without asking
+        #[arg(short, long)]
+        replace: bool,
     },
     /// Every entry and .env into one file, sealed on the key under a passphrase it
     /// asks for; the button is tapped twice
@@ -122,11 +144,16 @@ enum Cmd {
         /// Where to write the backup
         file: PathBuf,
     },
-    /// Every entry and .env out of a backup file onto this key, replacing entries of
-    /// the same name; PIN and the passphrase, no button
+    /// Every entry and .env out of a backup file, CSV export, or 1Password API onto this key
     Restore {
-        /// A file `vkey backup` wrote
-        file: PathBuf,
+        /// A .vkb backup file, a CSV export, or 'op' (interactive choice when omitted)
+        file: Option<PathBuf>,
+        /// Restore directly from 1Password API via 'op'
+        #[arg(long, alias = "1password")]
+        op: bool,
+        /// 1Password Developer Environment to import (name:id or name=id)
+        #[arg(short = 'E', long = "environment")]
+        environments: Vec<String>,
     },
     /// Lifecycle test of a development board; ERASES everything
     #[command(long_about = "vkey check --wipe-everything\n\n\
@@ -251,20 +278,7 @@ fn run(cli: Cli) -> Result<u8, Error> {
 
         Cmd::Info => run_info(&mut dev, &version),
 
-        Cmd::List => {
-            let entries = with_unlock(&mut dev, Device::list)?;
-            if entries.is_empty() {
-                println!("(nothing stored)");
-            }
-            for e in entries {
-                let what = match e.kind {
-                    Kind::Totp(_) => format!("totp {}", describe(e.kind)),
-                    Kind::Password | Kind::Env => describe(e.kind),
-                };
-                println!("{:<34} {}", e.name, what.trim_end());
-            }
-            Ok(0)
-        }
+        Cmd::List => run_list(&mut dev),
 
         Cmd::Rm { name, yes } => {
             if !confirm(
@@ -315,10 +329,43 @@ fn run(cli: Cli) -> Result<u8, Error> {
         Cmd::Totp { cmd } => run_totp(&mut dev, &version, cmd),
         Cmd::Pass { cmd } => run_pass(&mut dev, cmd),
         Cmd::Env { cmd } => run_env(&mut dev, cmd),
-        Cmd::Import { file } => run_import(&mut dev, &file),
+        Cmd::Import { file, replace } => run_import(&mut dev, &file, replace),
+        Cmd::Op {
+            item,
+            tag,
+            vault,
+            environments,
+            replace,
+        } => run_op(
+            &mut dev,
+            item.as_deref(),
+            tag.as_deref(),
+            vault.as_deref(),
+            &environments,
+            replace,
+        ),
         Cmd::Backup { file } => run_backup(&mut dev, &version, &file),
-        Cmd::Restore { file } => run_restore(&mut dev, &file),
+        Cmd::Restore {
+            file,
+            op,
+            environments,
+        } => run_restore(&mut dev, file.as_deref(), op, &environments),
     }
+}
+
+fn run_list(dev: &mut Device) -> Result<u8, Error> {
+    let entries = with_unlock(dev, Device::list)?;
+    if entries.is_empty() {
+        println!("(nothing stored)");
+    }
+    for e in entries {
+        let what = match e.kind {
+            Kind::Totp(_) => format!("totp {}", describe(e.kind)),
+            Kind::Password | Kind::Env => describe(e.kind),
+        };
+        println!("{:<34} {}", e.name, what.trim_end());
+    }
+    Ok(0)
 }
 
 fn run_info(dev: &mut Device, version: &str) -> Result<u8, Error> {
@@ -362,8 +409,76 @@ fn run_backup(dev: &mut Device, version: &str, file: &Path) -> Result<u8, Error>
     Ok(0)
 }
 
-fn run_restore(dev: &mut Device, file: &Path) -> Result<u8, Error> {
-    let file = backup::source(file)?;
+#[derive(Clone, Copy)]
+enum RestoreSource {
+    OnePassword,
+    Csv,
+    Backup,
+}
+
+fn run_restore(
+    dev: &mut Device,
+    file: Option<&Path>,
+    op: bool,
+    environments: &[String],
+) -> Result<u8, Error> {
+    if op {
+        return run_op(dev, None, None, None, environments, false);
+    }
+    let file = match file {
+        Some(f) if f.to_str() == Some("op") || f.to_str() == Some("1password") => {
+            return run_op(dev, None, None, None, environments, false);
+        }
+        Some(f)
+            if f.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("csv")) =>
+        {
+            return run_import(dev, f, false);
+        }
+        Some(f) => f.to_path_buf(),
+        None if prompt::is_tty() => {
+            let choice = prompt::choose(
+                "restore from: ",
+                &[
+                    (
+                        RestoreSource::OnePassword,
+                        "1password",
+                        "1Password API via 'op' in memory",
+                    ),
+                    (
+                        RestoreSource::Csv,
+                        "csv",
+                        "Google Password Manager or 1Password CSV export",
+                    ),
+                    (
+                        RestoreSource::Backup,
+                        "backup",
+                        "a .vkb backup file written by 'vkey backup'",
+                    ),
+                ],
+            );
+            match choice {
+                Some(RestoreSource::OnePassword) => {
+                    return run_op(dev, None, None, None, environments, false);
+                }
+                Some(RestoreSource::Csv) => {
+                    let path_str = prompt_secret("path to CSV export")?;
+                    return run_import(dev, Path::new(path_str.as_str()), false);
+                }
+                Some(RestoreSource::Backup) => {
+                    let path_str = prompt_secret("path to .vkb backup file")?;
+                    PathBuf::from(path_str.as_str())
+                }
+                None => return Ok(0),
+            }
+        }
+        None => {
+            return Err(Error::Value(
+                "give a backup file, a CSV export, or --op".into(),
+            ));
+        }
+    };
+    let file = backup::source(&file)?;
     let pass = prompt_secret("backup passphrase")?;
     passphrase(&pass)?;
     let n = with_unlock(dev, |d| backup::import(d, &file, passphrase(&pass)?))?;
@@ -397,22 +512,95 @@ fn run_env(dev: &mut Device, cmd: EnvCmd) -> Result<u8, Error> {
     Ok(0)
 }
 
-fn run_import(dev: &mut Device, file: &Path) -> Result<u8, Error> {
-    if !prompt::is_tty() {
-        return Err(Error::Value(
-            "import needs a terminal: it asks about every row".into(),
-        ));
-    }
+fn run_import(dev: &mut Device, file: &Path, replace: bool) -> Result<u8, Error> {
     let parsed = import::read(file)?;
     println!("{}", parsed.summary());
     for s in &parsed.skipped {
         println!("  skipped: {s}");
     }
-    let done = with_unlock(dev, |d| {
-        import::run(d, &parsed.rows, &mut |s| println!("{s}"))
-    });
+    let mut ui = prompt::CliUi;
+    let done = with_unlock(dev, |d| import::run(d, &parsed.rows, replace, &mut ui));
     eprintln!("{}", import::reminder(file));
     println!("{}", done?.line());
+    Ok(0)
+}
+
+fn run_op(
+    dev: &mut Device,
+    item: Option<&str>,
+    tag: Option<&str>,
+    vault: Option<&str>,
+    environments: &[String],
+    replace: bool,
+) -> Result<u8, Error> {
+    let mut env_pairs = Vec::new();
+    let saved = op::load_saved_envs();
+
+    for spec in environments {
+        if let Some(pair) = op::parse_env_spec(spec) {
+            env_pairs.push(pair);
+        } else if let Some(id) = saved.get(spec) {
+            println!("  using stored ID for '{spec}' ({id})");
+            env_pairs.push((spec.clone(), id.clone()));
+        } else {
+            eprintln!(
+                "ignoring invalid environment specification '{spec}'; expected 'name:id' or a saved environment name"
+            );
+        }
+    }
+
+    if item.is_none() && env_pairs.is_empty() && prompt::is_tty() {
+        println!("  ● 1Password Developer Environments (.env)");
+        if !saved.is_empty() {
+            println!("    Saved environments:");
+            for (name, id) in &saved {
+                println!("      • {name} (ID: {id})");
+            }
+            if prompt::yes_no("update saved environments?") {
+                env_pairs.extend(saved);
+            }
+        }
+
+        if env_pairs.is_empty() {
+            println!(
+                "    (in 1Password: Developer -> View Environments -> View environment -> Manage environment -> Copy environment ID)"
+            );
+            loop {
+                let line =
+                    prompt::prompt_line("add Environment (name or name:ID, Enter to finish)")?;
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    break;
+                }
+                let (name, id) = if let Some(pair) = op::parse_env_spec(trimmed) {
+                    pair
+                } else if let Some(stored_id) = op::load_saved_envs().get(trimmed) {
+                    println!("  using stored ID for '{trimmed}' ({stored_id})");
+                    (trimmed.to_string(), stored_id.clone())
+                } else {
+                    let id_line =
+                        prompt::prompt_line(&format!("ID for '{trimmed}' (copy from 1Password)"))?;
+                    let id_trimmed = id_line.trim().to_string();
+                    if id_trimmed.is_empty() {
+                        continue;
+                    }
+                    (trimmed.to_string(), id_trimmed)
+                };
+                env_pairs.push((name, id));
+            }
+        }
+    }
+
+    let env_refs: Vec<(&str, &str)> = env_pairs
+        .iter()
+        .map(|(n, i)| (n.as_str(), i.as_str()))
+        .collect();
+    let mut ui = prompt::CliUi;
+    let summary = with_unlock(dev, |d| match item {
+        Some(name) => op::pull_item(d, name, replace, &mut ui),
+        None => op::sync(d, tag, vault, &env_refs, replace, &mut ui),
+    })?;
+    println!("{}", summary.line());
     Ok(0)
 }
 
