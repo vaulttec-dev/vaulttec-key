@@ -45,7 +45,8 @@ the device at all — there is no command for it.
 - Every code, password and `.env` needs a button gesture. Eight wrong PINs wipe everything.
 - A TOTP secret goes in once and never comes out in the clear — there is no command for it. The one
   way out is `vkey backup`, which reseals every item under a backup passphrase.
-- Everything, `list` included, needs the PIN; the key re-locks after two idle minutes. Secrets and
+- Everything, `list` included, needs the PIN — except a `vkey auth` login, a tap alone; the key
+  re-locks after two idle minutes. Secrets and
   PINs are never arguments or environment variables — hidden prompt or stdin.
 
 ## What it does not do
@@ -109,6 +110,7 @@ vkey import passwords.csv             # Google Password Manager or 1Password CSV
 vkey backup vault.vkb                 # everything in one file, sealed on the key; two taps
 vkey restore [file]                   # restore from 1Password, CSV, or .vkb backup file
 vkey check --wipe-everything          # lifecycle test on a board; ERASES EVERYTHING
+sudo vkey auth enable                 # sudo and the lock screen with a tap (below)
 ```
 
 A `.env` is stored as is and comes out whole after one tap; only `KEY=value` lines are accepted,
@@ -116,11 +118,30 @@ checked by the CLI. A CSV export is plaintext on disk before and after `vkey imp
 does not delete it. `vkey op` syncs directly with the 1Password CLI (`op`) without plaintext files
 on disk, automatically skipping unchanged items.
 
+## sudo and the lock screen with a tap
+
+With the key plugged in, `sudo` and the lock screen take a tap instead of your password;
+without it, or with no tap for ten seconds, they ask for the password as always. The key
+signs a fresh challenge with a secret that never leaves it; the host keeps only its public
+key. It needs no PIN, so a stolen laptop with the key still in it opens with a tap — read
+[the trade-off](docs/threat-model.md#vkey-auth--sudo-and-the-lock-screen-with-a-tap-no-pin)
+first.
+
+```bash
+sudo vkey auth enable     # PIN, then a tap: sudo and the lock screen are set up
+sudo vkey auth disable    # back to the password alone
+```
+
+`enable` copies `vkey` to `/usr/local/bin`, and adds one line to the PAM files of `sudo` and
+of the lock screens this host has — COSMIC, GNOME, KDE, sway, Hyprland — keeping each
+original as `*.before-vkey`. A file it does not recognise it leaves alone and prints the
+line to add by hand.
+
 ## Gestures and capacity
 
 | Gesture | LED | What it releases |
 |---|---|---|
-| Tap | amber | one TOTP code, one password, or one `.env` |
+| Tap | amber | one TOTP code, one password, one `.env`, or one `vkey auth` login |
 | Hold 5 s | red | factory wipe: every secret and the PIN |
 | Double tap | blue | the encrypted backup file |
 

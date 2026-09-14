@@ -1,12 +1,15 @@
 //! What the key does, independent of how bytes arrive: PIN lifecycle and entries.
 //! One owner of the flash, the keys, the button, the entropy source and the chip key.
 
+use ed25519_dalek::{Signer, SigningKey};
 use embedded_storage::nor_flash::NorFlash;
 use rand_core::{CryptoRng, RngCore};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::hal::{Clock, DeviceKey, Ui};
-use crate::oath::{self, ENV_MAX, Entry, Kind, NAME_MAX, Name, SECRET_MAX, len_u8};
+use crate::oath::{
+    self, AUTH_SECRET_LEN, ENV_MAX, Entry, Kind, NAME_MAX, Name, SECRET_MAX, len_u8,
+};
 use crate::store::{
     ENV_BUF_LEN, ENV_SLOTS, Header, MAX_ATTEMPTS, MAX_ENTRIES, Record, State, Store, StoredName,
 };
@@ -14,13 +17,19 @@ use crate::ui;
 use crate::vault::{
     self, BACKUP_AAD, Block, Cost, KEY_LEN, Keys, NONCE_LEN, Passphrase, Pin, SALT_LEN,
 };
-use crate::wire::{BackupHead, Fail, ITEM_MAX, PinStatus};
+use crate::wire::{
+    AUTH_CHALLENGE_LEN, AUTH_SIGNATURE_LEN, AUTH_SIGNED_PREFIX, BackupHead, Fail, ITEM_MAX,
+    PinStatus,
+};
 
 /// Unlocked and idle this long, the device forgets the key on its own. Two minutes:
 /// long enough to finish a login, short enough that a key left on the desk is a
 /// locked key.
 const AUTOLOCK_MS: u64 = 120_000;
 const TOUCH_TIMEOUT_MS: u64 = 30_000;
+/// A login waits for the tap this long and no longer: the password prompt behind it is
+/// the other way in, and nobody should wait half a minute to reach it.
+const AUTH_TOUCH_TIMEOUT_MS: u64 = 10_000;
 /// A wipe after five seconds of red: no reflex reaches it.
 const WIPE_HOLD_MS: u64 = 5_000;
 
@@ -310,9 +319,15 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         let new_dek = self.dek()?;
         // Re-sealed in RAM one entry at a time; flash is written only once every
         // entry made it, so a failure half-way leaves the old PIN and the old image.
-        // Each plaintext `Entry` zeroizes itself as soon as it is sealed again.
+        // Each plaintext `Entry` zeroizes itself as soon as it is sealed again. Auth
+        // secrets are under the chip key, not the PIN: they stay as they are.
         let mut resealed = true;
-        for slot in self.state.slots.iter_mut().filter(|r| !r.is_empty()) {
+        for slot in self
+            .state
+            .slots
+            .iter_mut()
+            .filter(|r| !r.is_empty() && r.kind != Kind::Auth)
+        {
             let Some(r) = Self::open_record(&old_dek, slot)
                 .and_then(|e| Self::seal_record(&new_dek, &mut self.rng, &e))
             else {
@@ -360,11 +375,24 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         Entry::new(r.name(), r.kind, &plain[..n])
     }
 
-    /// The stored entry called `name`, decrypted.
+    /// The key a record of `kind` is sealed under: the chip key alone for an auth
+    /// secret, the PIN's for everything else. The one place that decides.
+    fn record_key(&mut self, dek: &[u8; KEY_LEN], kind: Kind) -> Result<Dek, Fail> {
+        match kind {
+            Kind::Auth => vault::auth_key(&mut self.key).ok_or(Fail::Incompatible),
+            Kind::Totp(_) | Kind::Password | Kind::Env => Ok(Zeroizing::new(*dek)),
+        }
+    }
+
+    /// The stored entry called `name`, decrypted - never an auth secret, which only
+    /// `respond` opens.
     fn entry(&mut self, dek: &[u8; KEY_LEN], name: Name<'_>) -> Result<Entry, Fail> {
         self.load()?;
         let i = self.state.find(name).ok_or(Fail::NotFound)?;
         let r = &self.state.slots[i];
+        if r.kind == Kind::Auth {
+            return Err(Fail::BadArg);
+        }
         Self::open_record(dek, r).ok_or(Fail::Internal)
     }
 
@@ -389,7 +417,8 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
             Some(i) => i,
             None => self.state.free_slot().ok_or(Fail::Full)?,
         };
-        let sealed = Self::seal_record(&dek, &mut self.rng, e).ok_or(Fail::Internal)?;
+        let key = self.record_key(&dek, e.kind)?;
+        let sealed = Self::seal_record(&key, &mut self.rng, e).ok_or(Fail::Internal)?;
         self.state.slots[slot] = sealed;
         self.store.save(self.state).map_err(|_| Fail::Internal)?;
         self.touch();
@@ -459,6 +488,36 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         Ok(packed.len())
     }
 
+    /// The host's challenge signed with the auth secret called `name` as an Ed25519
+    /// seed, after a tap - the same gesture as a code. The one command that needs no
+    /// PIN: the secret is sealed under the chip key, it never comes out, and a login
+    /// is proven by the finger on this board. Leaves the PIN session as it was, and
+    /// spends no attempt.
+    pub fn respond(
+        &mut self,
+        name: Name<'_>,
+        challenge: &[u8; AUTH_CHALLENGE_LEN],
+        out: &mut [u8; AUTH_SIGNATURE_LEN],
+    ) -> Result<(), Fail> {
+        self.load()?;
+        let i = self.state.find(name).ok_or(Fail::NotFound)?;
+        if self.state.slots[i].kind != Kind::Auth {
+            return Err(Fail::BadArg);
+        }
+        let key = vault::auth_key(&mut self.key).ok_or(Fail::Incompatible)?;
+        let e = Self::open_record(&key, &self.state.slots[i]).ok_or(Fail::Internal)?;
+        if !ui::await_confirmation(&mut self.ui, &self.clock, AUTH_TOUCH_TIMEOUT_MS) {
+            return Err(Fail::Refused);
+        }
+        let seed: &[u8; AUTH_SECRET_LEN] = e.secret().try_into().map_err(|_| Fail::Internal)?;
+        let key = SigningKey::from_bytes(seed);
+        let mut msg = [0u8; AUTH_SIGNED_PREFIX.len() + AUTH_CHALLENGE_LEN];
+        msg[..AUTH_SIGNED_PREFIX.len()].copy_from_slice(AUTH_SIGNED_PREFIX);
+        msg[AUTH_SIGNED_PREFIX.len()..].copy_from_slice(challenge);
+        *out = key.sign(&msg).to_bytes();
+        Ok(())
+    }
+
     /// An entry or a blob, gone.
     pub fn delete(&mut self, name: Name<'_>) -> Result<(), Fail> {
         self.dek()?;
@@ -489,10 +548,11 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         if self.state.find(to).is_some() || self.env_exists(to)? {
             return Err(Fail::Exists);
         }
+        let key = self.record_key(&dek, self.state.slots[i].kind)?;
         let r = &self.state.slots[i];
-        let e = Self::open_record(&dek, r).ok_or(Fail::Internal)?;
+        let e = Self::open_record(&key, r).ok_or(Fail::Internal)?;
         let e = Entry::new(to, e.kind, e.secret()).ok_or(Fail::Internal)?;
-        let sealed = Self::seal_record(&dek, &mut self.rng, &e).ok_or(Fail::Internal)?;
+        let sealed = Self::seal_record(&key, &mut self.rng, &e).ok_or(Fail::Internal)?;
         self.state.slots[i] = sealed;
         self.store.save(self.state).map_err(|_| Fail::Internal)?;
         self.touch();
@@ -663,11 +723,12 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
                 return Ok(None);
             }
             let plain = if slot < MAX_ENTRIES {
-                let r = &self.state.slots[slot];
-                if r.is_empty() {
+                if self.state.slots[slot].is_empty() {
                     None
                 } else {
-                    let e = Self::open_record(&dek, r).ok_or(Fail::Internal)?;
+                    let record_key = self.record_key(&dek, self.state.slots[slot].kind)?;
+                    let r = &self.state.slots[slot];
+                    let e = Self::open_record(&record_key, r).ok_or(Fail::Internal)?;
                     let prefix = item_prefix(e.kind, e.name(), self.buf);
                     let at = NONCE_LEN + prefix;
                     self.buf[at..at + e.secret().len()].copy_from_slice(e.secret());
@@ -785,7 +846,9 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
             Some(i) => i,
             None => self.state.free_slot().ok_or(Fail::Full)?,
         };
-        self.state.slots[slot] = Self::seal_record(dek, &mut self.rng, &e).ok_or(Fail::Internal)?;
+        let record_key = self.record_key(dek, e.kind)?;
+        self.state.slots[slot] =
+            Self::seal_record(&record_key, &mut self.rng, &e).ok_or(Fail::Internal)?;
         Ok(true)
     }
 

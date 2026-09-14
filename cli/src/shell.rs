@@ -241,7 +241,7 @@ impl Tab {
     fn of(kind: Kind) -> Tab {
         match kind {
             Kind::Totp(_) => Tab::Totp,
-            Kind::Password => Tab::Password,
+            Kind::Password | Kind::Auth => Tab::Password,
             Kind::Env => Tab::Env,
         }
     }
@@ -963,6 +963,7 @@ impl Shell {
             Kind::Totp(p) => self.use_totp(&name, p),
             Kind::Password => self.use_password(&name),
             Kind::Env => self.use_env(&name),
+            Kind::Auth => Err(Error::Value(crate::auth::USED_BY_AUTH.into())),
         }
     }
 
@@ -1448,6 +1449,9 @@ impl Shell {
                     self.env_preview(&text);
                 }
             }
+            // Nothing to edit but the name: the secret was drawn at random and is
+            // never shown.
+            Kind::Auth => {}
         }
         let name = match new_name {
             Some(new) if new != name => {

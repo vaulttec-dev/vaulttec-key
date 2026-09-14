@@ -11,6 +11,7 @@
 //! vkey backup vault.vkb                   # everything into one file, sealed on the key; two taps
 //! vkey restore vault.vkb                  # everything back, onto this or another key
 //! vkey check --wipe-everything            # lifecycle test; ERASES the device
+//! sudo vkey auth enable                   # sudo and the lock screen with a tap
 //! vkey install                            # copy this binary to ~/.local/bin
 //! ```
 //!
@@ -19,6 +20,7 @@
 //! cycle. Secrets and PINs are never taken from the command line: they are asked for,
 //! or read from stdin when there is no terminal.
 
+mod auth;
 mod backup;
 mod boards;
 mod check;
@@ -165,8 +167,22 @@ enum Cmd {
         #[arg(long)]
         wipe_everything: bool,
     },
+    /// sudo and the lock screen with a tap: `sudo vkey auth enable`; bare, what PAM runs
+    Auth {
+        #[command(subcommand)]
+        cmd: Option<AuthCmd>,
+    },
     /// Copy this binary to ~/.local/bin/vkey
     Install,
+}
+
+#[derive(Subcommand, Clone, Copy)]
+enum AuthCmd {
+    /// A login secret on the key, its public key here, and the PAM lines for sudo and
+    /// the lock screen; PIN and a tap
+    Enable,
+    /// The PAM lines out, the public key and the login secret gone
+    Disable,
 }
 
 #[derive(Subcommand, Clone, Copy)]
@@ -258,6 +274,8 @@ fn run(cli: Cli) -> Result<u8, Error> {
         Some(Cmd::Setup { erase, board }) => {
             return cmd_setup(cli.port.as_deref(), board.as_deref(), erase);
         }
+        // What PAM runs: straight to the key, no probing, no shell on the way.
+        Some(Cmd::Auth { cmd: None }) => return auth::verify(cli.port.as_deref()),
         _ => {}
     }
 
@@ -274,7 +292,15 @@ fn run(cli: Cli) -> Result<u8, Error> {
     };
 
     match cmd {
-        Cmd::Install | Cmd::Setup { .. } => unreachable!("handled above"),
+        Cmd::Install | Cmd::Setup { .. } | Cmd::Auth { cmd: None } => {
+            unreachable!("handled above")
+        }
+        Cmd::Auth {
+            cmd: Some(AuthCmd::Enable),
+        } => auth::enable(&mut dev),
+        Cmd::Auth {
+            cmd: Some(AuthCmd::Disable),
+        } => auth::disable(&mut dev),
 
         Cmd::Info => run_info(&mut dev, &version),
 
@@ -361,7 +387,7 @@ fn run_list(dev: &mut Device) -> Result<u8, Error> {
     for e in entries {
         let what = match e.kind {
             Kind::Totp(_) => format!("totp {}", describe(e.kind)),
-            Kind::Password | Kind::Env => describe(e.kind),
+            Kind::Password | Kind::Env | Kind::Auth => describe(e.kind),
         };
         println!("{:<34} {}", e.name, what.trim_end());
     }
@@ -757,6 +783,7 @@ fn run_get(dev: &mut Device, version: &str, name: &str, copy: bool) -> Result<u8
             out.write_all(&blob)?;
             out.flush()?;
         }
+        Kind::Auth => return Err(Error::Value(auth::USED_BY_AUTH.into())),
     }
     Ok(0)
 }

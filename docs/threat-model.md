@@ -68,7 +68,7 @@ before the burn became `Incompatible` and was wiped.
 
 | Gesture | Action | LED |
 |---|---|---|
-| Tap | code, password (with note), `.env` | amber |
+| Tap | code, password (with note), `.env`, `vkey auth` login | amber |
 | Hold 5 s | wipe | red |
 | Double tap, 800 ms window | encrypted backup export | blue |
 
@@ -82,6 +82,7 @@ gesture, never an existing one.
 | `Totp` | The code only — the secret has no path to `respond` under any gesture | tap |
 | `Password` | Login without a gesture, under PIN (not a secret; the site asks for it first), then password and note | tap |
 | `Env` | The whole blob, up to `ENV_MAX` = 8000 bytes | tap |
+| `Auth` | Ed25519 signatures of a host's challenges, **without the PIN** — the seed has no path out | tap |
 
 A password comes out on the same tap as a code (2026-09-08): for a single owner a separate
 2 s hold cost more than it protected, and it is **not coming back**. The price: a hostile
@@ -137,6 +138,55 @@ passphrase only if the owner happens to double tap, which is never needed otherw
 out, a duplicate name replaces, and entry versus blob the newer one from the file wins.
 Rejected: a flash-image copy as backup — PIN-encrypted, 8 digits fall offline in days, and
 it does not transfer while bound to the chip key.
+
+### `vkey auth` — sudo and the lock screen with a tap, no PIN
+
+`vkey auth` (2026-09-14) lets `sudo` and the lock screen accept a tap on the key instead
+of the Linux password, through `pam_exec`; with no key, or no tap within ten seconds (the
+firmware's own timeout for a login, shorter than a code's 30 s), PAM asks for the password
+as before. The scheme is `pam_u2f`'s. `sudo vkey auth enable` draws a 32-byte Ed25519 seed
+on the host, stores it on the key as an `Auth` entry, keeps the public key in
+`/etc/vkey/auth/<user>` (root, 0644) and zeroizes the seed. A login sends a fresh random
+challenge; the key signs `"vaultkey/auth/v1" | challenge` after a tap; the signature is
+verified here. The host holds no secret and writes nothing at login, so `sudo` (checked as
+root) and a lock screen running as the user (COSMIC's `cosmic-greeter`, `swaylock`) read the
+same file. A recorded signature is worthless: the next challenge is a different one.
+
+`enable` also copies the binary to `/usr/local/bin/vkey` and adds one line to each PAM
+service this host has among `sudo`, `cosmic-greeter`, `gdm-password`, `kde`, `swaylock`,
+`hyprlock` — above the line that brings in the password check, a copy of the file kept once
+as `*.before-vkey`, the new file renamed over the old. A file with no recognisable anchor is
+left alone and the line printed for the owner to place. `disable` takes the lines out,
+deletes the public key and the entry. This replaces the first version (same day), which
+kept a rotating expectation on the host instead of a public key: two state files, one of
+them in the user's home, and a user who had to edit PAM by hand. Writing `/etc/pam.d` from
+the CLI is the price of a setup a person can do; the line is `sufficient`, so what it adds
+is a way in, and the password stays one.
+
+**The deliberate exception to "everything needs the PIN".** An `Auth` record is sealed
+under `DeviceKey::mac("vaultkey/auth-key/v1")` — the eFuse key alone — not under the DEK, so
+`Respond` works while the device is locked and spends no attempt: `sudo` can never be what
+wipes the vault. On a chip without a burned key it is refused (`Incompatible`), because
+there it would be sealed under nothing. Adding, listing, renaming and deleting still need
+the PIN; a PIN change does not touch the record; a wipe removes it; a backup reseals it
+under the passphrase and a restore under the new chip, so the host's public key stays valid.
+
+| | |
+|---|---|
+| Given | A login needs this physical board and a finger on it; no secret on the host; a fresh challenge every time; no PIN attempt spent |
+| Laptop and key stolen together | The lock screen opens with a tap. A powered-off laptop is protected by disk encryption, not by this. Carry the key separately, do not leave it in the port |
+| Malware running as the user | Can start `sudo` and wait for a reflex tap. The LED is the same amber as a code; a tap you did not ask for is the thing to refuse |
+| A locked key | Answers `NotFound` or `BadArg` to any name without the PIN: whether `<user>@<host>` is enrolled is not secret |
+| A user-writable binary | PAM runs `vkey` as root; `vkey auth` refuses unless its executable and every directory above it are root's alone, hence `/usr/local/bin/vkey` |
+| The public key file | Not secret. Replacing it needs root, and `vkey auth` refuses it unless it and every directory above it are root's alone |
+| The port busy (the `vkey` shell open) | The login fails and PAM falls back to the password |
+| A `vkey auth` killed mid-wait (Ctrl+C) | The key still signs the old challenge; the next login may read that signature, fail it once and fall back to the password. Nothing is left broken |
+| The login screen after boot | COSMIC's greeter shares the `cosmic-greeter` service, so a tap may log in there too; the keyring, unlocked only by the password, then stays locked |
+
+Rejected: presence of the USB device as proof (any ESP32 shows `303a:1001`); PIN plus tap
+(a second password to type buys nothing over the one it replaces); HMAC challenge-response
+with a rotating expectation (the first version: state to write at every login and two copies
+of it); a PAM `cdylib` (`pam_exec` needs no C and no `unsafe`).
 
 ## What it does not protect against
 

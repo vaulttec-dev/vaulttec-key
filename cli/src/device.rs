@@ -12,10 +12,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serialport::{SerialPort, SerialPortType};
 pub use vaultkey_core::oath::{
-    Algo, Digits, ENV_MAX, Entry, Kind, NAME_MAX, Name, Params, SECRET_MAX,
+    AUTH_SECRET_LEN, Algo, Digits, ENV_MAX, Entry, Kind, NAME_MAX, Name, Params, SECRET_MAX,
 };
 pub use vaultkey_core::store::MAX_ATTEMPTS;
 pub use vaultkey_core::vault::{PASS_MIN, PIN_LEN, Passphrase, Pin};
+pub use vaultkey_core::wire::{AUTH_CHALLENGE_LEN, AUTH_SIGNATURE_LEN, AUTH_SIGNED_PREFIX};
 use vaultkey_core::wire::{BAD_LEN, Cmd, FLAG_REPLACE, Fail, MAGIC, OK, frame_head, scan_magic};
 pub use vaultkey_core::wire::{BackupHead, PinStatus};
 use zeroize::Zeroizing;
@@ -170,8 +171,11 @@ pub struct Stored {
 /// A kind for a list: what differs from the common case, so the common case reads as
 /// nothing - a TOTP with the usual parameters describes as an empty string.
 pub fn describe(kind: Kind) -> String {
-    let Kind::Totp(p) = kind else {
-        return if kind == Kind::Env { "env" } else { "password" }.into();
+    let p = match kind {
+        Kind::Totp(p) => p,
+        Kind::Password => return "password".into(),
+        Kind::Env => return "env".into(),
+        Kind::Auth => return "auth".into(),
     };
     let mut bits = Vec::new();
     if p.digits != Digits::Six {
@@ -519,6 +523,20 @@ impl Device {
         let name = Name::new(name.as_bytes()).ok_or(Error::BadArg)?;
         Entry::new(name, Kind::Password, &packed)
             .ok_or_else(|| Error::Value("the device sent a malformed password entry".into()))
+    }
+
+    /// `challenge` signed with the auth secret `name`, after a tap; no PIN needed.
+    pub fn respond(
+        &mut self,
+        name: &str,
+        challenge: &[u8; AUTH_CHALLENGE_LEN],
+    ) -> Result<[u8; AUTH_SIGNATURE_LEN], Error> {
+        let mut p = name_bytes(name)?;
+        p.extend_from_slice(challenge);
+        let body = self.request(Cmd::Respond, &p)?;
+        body.as_slice()
+            .try_into()
+            .map_err(|_| Error::Device(BAD_LEN))
     }
 
     pub fn delete(&mut self, name: &str) -> Result<(), Error> {

@@ -9,6 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::num::NonZeroU8;
 use std::rc::Rc;
 
+use ed25519_dalek::{Signer, SigningKey};
 use embedded_storage::nor_flash::{
     ErrorType, NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash,
 };
@@ -17,11 +18,15 @@ use rand_core::{CryptoRng, RngCore};
 use sha2::Sha256;
 use vaultkey_core::device::{self, Device};
 use vaultkey_core::hal::{Clock, DeviceKey, Ui};
-use vaultkey_core::oath::{self, Algo, Digits, Entry, Kind, Name, Params, SECRET_MAX};
+use vaultkey_core::oath::{
+    self, AUTH_SECRET_LEN, Algo, Digits, Entry, Kind, Name, Params, SECRET_MAX,
+};
 use vaultkey_core::store::{self, Layout, MAX_ATTEMPTS, MAX_ENTRIES, Store};
 use vaultkey_core::ui::State;
 use vaultkey_core::vault::{self, Block, Cost, KDF_BLOCKS, Passphrase, Pin};
-use vaultkey_core::wire::{BackupHead, Cmd, Fail, OK};
+use vaultkey_core::wire::{
+    AUTH_CHALLENGE_LEN, AUTH_SIGNATURE_LEN, AUTH_SIGNED_PREFIX, BackupHead, Cmd, Fail, OK,
+};
 
 // --- the hardware, faked -------------------------------------------------------------
 
@@ -592,14 +597,31 @@ fn only_valid_values_exist() {
         Kind::from_wire([3, 1, 0, 0]).is_none(),
         "an env blob has no parameters"
     );
-    assert!(Kind::from_wire([4, 0, 0, 0]).is_none(), "unknown kind");
-    for raw in [[1, 1, 6, 30], [1, 2, 8, 60], [2, 0, 0, 0], [3, 0, 0, 0]] {
+    assert_eq!(Kind::from_wire([4, 0, 0, 0]), Some(Kind::Auth));
+    assert!(
+        Kind::from_wire([4, 0, 0, 1]).is_none(),
+        "an auth secret has no parameters"
+    );
+    assert!(Kind::from_wire([5, 0, 0, 0]).is_none(), "unknown kind");
+    for raw in [
+        [1, 1, 6, 30],
+        [1, 2, 8, 60],
+        [2, 0, 0, 0],
+        [3, 0, 0, 0],
+        [4, 0, 0, 0],
+    ] {
         assert_eq!(Kind::from_wire(raw).expect("valid").wire(), raw);
     }
     assert!(
         Entry::new(name("proj"), Kind::Env, b"A=1").is_none(),
         "an env blob is never a table entry"
     );
+    assert!(Entry::new(name("me@host"), Kind::Auth, &[1; AUTH_SECRET_LEN]).is_some());
+    assert!(
+        Entry::new(name("me@host"), Kind::Auth, &[1; AUTH_SECRET_LEN - 1]).is_none(),
+        "an auth secret is exactly one HMAC key long"
+    );
+    assert!(Entry::new(name("me@host"), Kind::Auth, &[1; AUTH_SECRET_LEN + 1]).is_none());
 
     assert!(Cost::from_wire(128, 48).is_some());
     assert!(Cost::from_wire(4, 48).is_none(), "below Argon2's minimum");
@@ -746,6 +768,7 @@ fn wire_codes_round_trip() {
         Cmd::Rename,
         Cmd::EnvPut,
         Cmd::EnvGet,
+        Cmd::Respond,
         Cmd::PinStatus,
         Cmd::PinSet,
         Cmd::PinUnlock,
@@ -760,7 +783,7 @@ fn wire_codes_round_trip() {
     ] {
         assert_eq!(Cmd::from_wire(c.wire()), Some(c));
     }
-    assert_eq!(Cmd::from_wire(0x19), None);
+    assert_eq!(Cmd::from_wire(0x1A), None);
     assert_eq!(Cmd::from_wire(0x26), None);
     assert_eq!(Cmd::from_wire(0x35), None);
     let head = BackupHead {
@@ -1235,6 +1258,209 @@ fn a_kind_rewritten_in_flash_reveals_nothing() {
         code(&mut dev, "github", 0),
         Err(Fail::Internal),
         "the forged record opens for nobody"
+    );
+}
+
+// --- auth ------------------------------------------------------------------------------
+
+const AUTH_SECRET: [u8; AUTH_SECRET_LEN] = [7; AUTH_SECRET_LEN];
+
+/// A chip-bound key with `finger` on its button.
+fn chip(flash: &MemFlash, finger: Finger, key: [u8; 32]) -> Key<ChipKey> {
+    let clock = Ticker::default();
+    flash.key_with(Button::new(&clock, finger), clock, ChipKey(key))
+}
+
+/// A chip-bound vault holding an auth secret and a seed, left locked.
+fn enrolled() -> MemFlash {
+    let flash = MemFlash::blank();
+    let mut dev = chip(&flash, Finger::Away, [9; 32]);
+    dev.pin_set(pin("12345678")).expect("set");
+    let auth = Entry::new(name("me@host"), Kind::Auth, &AUTH_SECRET).expect("a valid secret");
+    dev.add(&auth, false).expect("add");
+    dev.add(&entry("github", b"secret"), false).expect("add");
+    flash
+}
+
+const CHALLENGE: [u8; AUTH_CHALLENGE_LEN] = [1; AUTH_CHALLENGE_LEN];
+
+fn respond<K: DeviceKey>(dev: &mut Key<K>, n: &str) -> Result<Vec<u8>, Fail> {
+    let mut out = [0u8; AUTH_SIGNATURE_LEN];
+    dev.respond(name(n), &CHALLENGE, &mut out)?;
+    Ok(out.to_vec())
+}
+
+/// What the host accepts: a signature of the prefixed challenge that verifies under the
+/// public key of the seed. Ed25519 is deterministic, so it is also exactly this one.
+fn expected_response() -> Vec<u8> {
+    let mut msg = AUTH_SIGNED_PREFIX.to_vec();
+    msg.extend_from_slice(&CHALLENGE);
+    let key = SigningKey::from_bytes(&AUTH_SECRET);
+    let sig = key.sign(&msg);
+    key.verifying_key()
+        .verify_strict(&msg, &sig)
+        .expect("a signature verifies under its own key");
+    sig.to_bytes().to_vec()
+}
+
+#[test]
+fn an_auth_secret_answers_a_tap_without_the_pin() {
+    let flash = enrolled();
+    let mut dev = chip(&flash, Finger::Tap, [9; 32]);
+    assert_eq!(
+        respond(&mut dev, "me@host"),
+        Ok(expected_response()),
+        "locked, and still answering"
+    );
+    let st = dev.pin_status();
+    assert!(
+        !st.unlocked && st.retries_left == MAX_ATTEMPTS,
+        "no session opened, no attempt spent"
+    );
+    assert_eq!(
+        respond(&mut dev, "github"),
+        Err(Fail::BadArg),
+        "a seed makes codes only"
+    );
+    assert_eq!(respond(&mut dev, "nobody"), Err(Fail::NotFound));
+
+    dev.pin_unlock(pin("12345678")).expect("unlock");
+    assert_eq!(code(&mut dev, "me@host", 0), Err(Fail::BadArg));
+    let mut out = [0u8; SECRET_MAX];
+    assert_eq!(
+        dev.reveal(name("me@host"), &mut out),
+        Err(Fail::BadArg),
+        "the secret itself never comes out"
+    );
+    assert_eq!(dev.login(name("me@host"), &mut out), Err(Fail::BadArg));
+    assert_eq!(
+        kinds(&mut dev).expect("unlocked"),
+        [
+            ("me@host".to_owned(), Kind::Auth),
+            ("github".to_owned(), PLAIN)
+        ]
+    );
+
+    dev.pin_change(pin("12345678"), pin("87654321"))
+        .expect("change");
+    assert_eq!(
+        respond(&mut dev, "me@host"),
+        Ok(expected_response()),
+        "a PIN change leaves the chip-sealed secret alone"
+    );
+    assert_eq!(code(&mut dev, "github", 0).map(|c| c.len()), Ok(6));
+    dev.rename(name("me@host"), name("me@other"))
+        .expect("rename");
+    assert_eq!(respond(&mut dev, "me@other"), Ok(expected_response()));
+    dev.delete(name("me@other")).expect("delete");
+    assert_eq!(respond(&mut dev, "me@other"), Err(Fail::NotFound));
+}
+
+#[test]
+fn only_a_fresh_tap_answers_a_login() {
+    let flash = enrolled();
+    for finger in [Finger::Away, Finger::Taped] {
+        assert_eq!(
+            respond(&mut chip(&flash, finger, [9; 32]), "me@host"),
+            Err(Fail::Refused)
+        );
+    }
+    let mut dev = chip(&flash, Finger::Hold(6_000), [9; 32]);
+    dev.wipe().expect("a hold wipes");
+    assert_eq!(
+        respond(&mut dev, "me@host"),
+        Err(Fail::NotFound),
+        "and a wipe takes it too"
+    );
+}
+
+#[test]
+fn an_auth_secret_needs_the_pin_to_add_and_a_chip_key_to_exist() {
+    let flash = enrolled();
+    let mut dev = chip(&flash, Finger::Tap, [9; 32]);
+    let auth = Entry::new(name("me@box"), Kind::Auth, &AUTH_SECRET).expect("a valid secret");
+    assert_eq!(dev.add(&auth, false), Err(Fail::Locked));
+
+    let plain = MemFlash::blank();
+    let mut dev = plain.key();
+    dev.pin_set(pin("12345678")).expect("set");
+    assert_eq!(
+        dev.add(&auth, false),
+        Err(Fail::Incompatible),
+        "without a chip key it would be sealed under nothing"
+    );
+
+    let mut other = chip(&flash, Finger::Tap, [8; 32]);
+    assert_eq!(
+        respond(&mut other, "me@host"),
+        Err(Fail::Internal),
+        "the flash under another chip opens nothing"
+    );
+}
+
+#[test]
+fn a_kind_rewritten_between_auth_and_password_opens_for_nobody() {
+    const IMAGE: u32 = 83_076; // asserted in store.rs
+    const RECORD0_KIND: u32 = 8 + 120 + 33; // magic+seq | header | name+name_len
+    let forge = |flash: &MemFlash, kind: Kind| {
+        let newest = if flash.word(LAYOUT.state_a + 4) > flash.word(LAYOUT.state_b + 4) {
+            LAYOUT.state_a
+        } else {
+            LAYOUT.state_b
+        };
+        flash.patch(newest + RECORD0_KIND, &kind.wire());
+        let crc = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC)
+            .checksum(&flash.bytes(newest, IMAGE - 4))
+            .to_le_bytes();
+        flash.patch(newest + IMAGE - 4, &crc);
+    };
+
+    let flash = enrolled();
+    forge(&flash, Kind::Password);
+    let mut dev = chip(&flash, Finger::Tap, [9; 32]);
+    dev.pin_unlock(pin("12345678")).expect("unlock");
+    let mut out = [0u8; SECRET_MAX];
+    assert_eq!(dev.reveal(name("me@host"), &mut out), Err(Fail::Internal));
+
+    let flash = MemFlash::blank();
+    {
+        let mut dev = chip(&flash, Finger::Away, [9; 32]);
+        dev.pin_set(pin("12345678")).expect("set");
+        dev.add(&password("mail", b"hunter2"), false).expect("add");
+    }
+    forge(&flash, Kind::Auth);
+    assert_eq!(
+        respond(&mut chip(&flash, Finger::Tap, [9; 32]), "mail"),
+        Err(Fail::Internal),
+        "a password turned auth is under the wrong key and the wrong tag"
+    );
+}
+
+#[test]
+fn an_auth_secret_moves_to_another_chip_in_a_backup() {
+    let flash = enrolled();
+    let mut dev = chip(&flash, Finger::DoubleTap { gap: 300 }, [9; 32]);
+    dev.pin_unlock(pin("12345678")).expect("unlock");
+    let (head, items) = export(&mut dev, "correct horse battery").expect("export");
+    assert!(
+        items
+            .iter()
+            .all(|i| !i.windows(AUTH_SECRET_LEN).any(|w| w == AUTH_SECRET)),
+        "sealed on the way out"
+    );
+
+    let other = MemFlash::blank();
+    let mut dev = chip(&other, Finger::Tap, [3; 32]);
+    dev.pin_set(pin("87654321")).expect("set");
+    assert_eq!(
+        import(&mut dev, "correct horse battery", head, &items),
+        Ok(())
+    );
+    dev.lock();
+    assert_eq!(
+        respond(&mut dev, "me@host"),
+        Ok(expected_response()),
+        "resealed under the new chip, the host's state still matches"
     );
 }
 

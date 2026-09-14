@@ -4,6 +4,7 @@
 //!   kek      = `DeviceKey::mac`(pre)                 - chip-bound when the board has a key
 //!   dek      = HMAC(kek, "vaultkey/dek/v1")          - what actually encrypts
 //!   verifier = HMAC(kek, "vaultkey/verify/v1")       - stored, proves the PIN
+//!   auth     = `DeviceKey::mac`("vaultkey/auth-key/v1") - auth secrets only, no PIN
 //!
 //! Only the dek stays resident while unlocked; the kek exists just long enough to
 //! check the verifier and derive it. Sealed blobs are AES-256-GCM with the entry name
@@ -201,6 +202,22 @@ pub fn derive<K: DeviceKey>(
     }
     hmac(&k.kek, b"vaultkey/dek/v1", &mut k.dek);
     Some(k)
+}
+
+/// What the chip key is asked to MAC for the auth key: 32 bytes, as `DeviceKey::mac`
+/// takes, and never an Argon2 output by any chance worth naming.
+const AUTH_LABEL: &[u8; 32] = b"vaultkey/auth-key/v1\0\0\0\0\0\0\0\0\0\0\0\0";
+
+/// The key auth secrets are sealed under: the chip key alone, no PIN, so a login
+/// answers a tap on a locked device and a flash dump without the chip opens nothing.
+/// None on a chip without a key - there it would be no key at all - or when the chip
+/// cannot use it.
+pub fn auth_key<K: DeviceKey>(key: &mut K) -> Option<Zeroizing<[u8; KEY_LEN]>> {
+    if !key.bound() {
+        return None;
+    }
+    let mut out = Zeroizing::new([0u8; KEY_LEN]);
+    key.mac(AUTH_LABEL, &mut out).then_some(out)
 }
 
 #[must_use]

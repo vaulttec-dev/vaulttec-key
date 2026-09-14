@@ -106,7 +106,7 @@ This is a security device. The rules below are not recommendations.
   yields free attempts. In flash this is one word write without an erase.
 - **A claim in the protocol must hold in the code.** Advertising a guarantee only half the
   paths enforce is worse than not advertising it.
-- **Irreversible actions get their own gesture.** Code and password — a tap (amber); wipe —
+- **Irreversible actions get their own gesture.** Code, password and a `vkey auth` login — a tap (amber); wipe —
   hold 5 s (red); backup — double tap (blue). A tap never wipes and never exports; a hold
   never exports; a double tap never wipes. Password on a tap is the maintainer's decision of
   2026-09-08 — do not reintroduce a separate hold. A new command with consequences gets a
@@ -138,7 +138,8 @@ the protocol and logs — hence the `VTC2` magic word in frames. Pins and pitfal
 
 - Crates: `esp-hal` (features `esp32c6`, `rt`, `unstable`), `esp-storage`,
   `esp-hal-smartled`, `esp-println` (`jtag-serial`), `esp-backtrace`; RustCrypto:
-  `aes-gcm`, `hmac`, `sha1`, `sha2`, `pbkdf2`, `subtle`, `zeroize`; `crc`. Not
+  `aes-gcm`, `argon2`, `hmac`, `sha1`, `sha2`, `subtle`, `zeroize`; `ed25519-dalek` (built on
+  RustCrypto's `signature` and `sha2`) for `vkey auth`; `crc`. Not
   `esp-idf-hal`, not own crypto, not `esp-radio`. Toolchain: stable rustup with target
   `riscv32imac-unknown-none-elf`; no espup, no compiler fork. Read exact API signatures in
   `~/.cargo/registry/src/*/esp-hal-*/src/` rather than recalling them.
@@ -164,6 +165,17 @@ the protocol and logs — hence the `VTC2` magic word in frames. Pins and pitfal
   header sealed under the DEK — a PIN change reseals 60 bytes in the same atomic write and
   leaves blobs untouched. Entry and blob names share one namespace. Everything, `list`
   included, requires the PIN; auto-lock is 2 minutes.
+- The one exception is `Auth` (2026-09-14, maintainer's decision): a 32-byte Ed25519 seed
+  for `vkey auth` (`sudo` and the lock screen via `pam_exec`), sealed under
+  `DeviceKey::mac("vaultkey/auth-key/v1")` — the eFuse key alone, never the DEK — so
+  `Respond` signs `AUTH_SIGNED_PREFIX | challenge` after a tap while locked, spending no
+  attempt. Refused on an unbound chip. Which key a record is under is decided in one place,
+  `Device::record_key`; a PIN change skips `Auth` records. A login waits 10 s for the tap
+  (`AUTH_TOUCH_TIMEOUT_MS`), then PAM asks for the password. The host keeps only the public
+  key, `/etc/vkey/auth/<user>`, and writes nothing at login. `sudo vkey auth enable` is the
+  one place the CLI writes system files: `/usr/local/bin/vkey`, the public key, and one
+  `sufficient` line in the PAM services of `SERVICES` (`cli/src/auth.rs`), each original
+  kept as `*.before-vkey`; `disable` undoes it.
 - The only way a TOTP secret leaves the device is the backup (`ExportBegin`/`ExportNext`,
   after a double tap; 2026-09-09): the device reseals every entry and blob under a key
   derived from a passphrase (Argon2id, `Passphrase` 12–128 bytes, without the chip key, so

@@ -674,7 +674,7 @@ fn keep_unlocked(dev: &mut Device, target: Option<&(String, Kind)>, last: &mut I
             Kind::Env => {
                 let _ = dev.env_get(name);
             }
-            Kind::Totp(_) => {}
+            Kind::Totp(_) | Kind::Auth => {}
         }
     }
     *last = Instant::now();

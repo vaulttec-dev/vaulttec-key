@@ -23,6 +23,9 @@ pub const SECRET_MAX: usize = 256;
 /// The most an env blob (a project's `.env`) may hold. It lives outside the record
 /// table, in its own flash region, and comes back whole after a tap.
 pub const ENV_MAX: usize = 8000;
+/// An auth secret is an Ed25519 seed, exactly this long: the host draws it, keeps the
+/// public key and forgets the seed.
+pub const AUTH_SECRET_LEN: usize = 32;
 
 /// The HMAC hash, numbered as the wire and the flash spell it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -129,13 +132,16 @@ impl Params {
 /// What an entry is, which decides what may ever leave the device: a TOTP seed only
 /// ever yields codes; a password comes back as itself, through the reveal gesture;
 /// an env blob comes back whole the same way, but is never an [`Entry`] - it is too
-/// big for the table and lives in its own region.
+/// big for the table and lives in its own region. An auth secret only ever yields
+/// signatures of a host's challenges, and is the one kind sealed under the chip key
+/// alone, so it answers a tap while the device is locked.
 /// Four bytes on the wire and in flash: kind, then the TOTP parameters or zeros.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Totp(Params),
     Password,
     Env,
+    Auth,
 }
 
 impl Kind {
@@ -143,6 +149,7 @@ impl Kind {
     const TOTP: u8 = 1;
     const PASSWORD: u8 = 2;
     const ENV: u8 = 3;
+    const AUTH: u8 = 4;
 
     #[must_use]
     pub const fn from_wire(b: [u8; Self::WIRE_LEN]) -> Option<Self> {
@@ -153,6 +160,7 @@ impl Kind {
             },
             [Self::PASSWORD, 0, 0, 0] => Some(Kind::Password),
             [Self::ENV, 0, 0, 0] => Some(Kind::Env),
+            [Self::AUTH, 0, 0, 0] => Some(Kind::Auth),
             _ => None,
         }
     }
@@ -166,6 +174,7 @@ impl Kind {
             }
             Kind::Password => [Self::PASSWORD, 0, 0, 0],
             Kind::Env => [Self::ENV, 0, 0, 0],
+            Kind::Auth => [Self::AUTH, 0, 0, 0],
         }
     }
 }
@@ -239,14 +248,18 @@ impl Drop for Entry {
 impl Entry {
     /// None if the secret is empty or longer than `SECRET_MAX`, or - for a password -
     /// not `login_len | login | password_len | password | note` with a printable login
-    /// and password (the password not empty) and a note of text. An env blob is never
-    /// an entry: a wire `Add` of kind env must not smuggle one into the table.
+    /// and password (the password not empty) and a note of text; for an auth secret,
+    /// not exactly `AUTH_SECRET_LEN` bytes. An env blob is never an entry: a wire `Add`
+    /// of kind env must not smuggle one into the table.
     #[must_use]
     pub fn new(name: Name<'_>, kind: Kind, secret: &[u8]) -> Option<Entry> {
         if secret.is_empty() || secret.len() > SECRET_MAX || kind == Kind::Env {
             return None;
         }
         if kind == Kind::Password && !password_packed(secret) {
+            return None;
+        }
+        if kind == Kind::Auth && secret.len() != AUTH_SECRET_LEN {
             return None;
         }
         let name = name.as_bytes();

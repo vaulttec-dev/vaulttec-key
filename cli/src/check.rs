@@ -13,13 +13,15 @@
 
 use std::num::NonZeroU8;
 
+use ed25519_dalek::SigningKey;
 use zeroize::Zeroizing;
 
 use crate::device::{
-    Device, EnvBlob, Error, Kind, MAX_ATTEMPTS, Params, passphrase, password_blob, pin,
+    AUTH_CHALLENGE_LEN, AUTH_SECRET_LEN, Device, EnvBlob, Error, Kind, MAX_ATTEMPTS, Params,
+    passphrase, password_blob, pin,
 };
 use crate::totp::{TEST_SECRET, decode_base32, selftest};
-use crate::{backup, boards};
+use crate::{auth, backup, boards};
 
 const PIN: &str = "12345678";
 const NEW_PIN: &str = "87654321";
@@ -97,6 +99,8 @@ pub fn run(d: &mut Device) -> Result<u8, Error> {
     lock_unlock(d, &mut rep)?;
     println!("\n=== rekey ===");
     rekey(d, &mut rep, &first_code, &env_blob)?;
+    println!("\n=== auth: a login answered while locked ===");
+    auth(d, &mut rep)?;
     println!("\n=== live code against an independent HMAC ===");
     let ok = selftest(d, &rep.button, |line| println!("{line}"))?;
     rep.check("selftest", ok, "");
@@ -409,6 +413,51 @@ fn rekey(d: &mut Device, rep: &mut Report, first_code: &str, env_blob: &[u8]) ->
     });
     d.pin_unlock(pin(NEW_PIN)?)?;
     rep.check("new PIN works", d.pin_status()?.unlocked, "");
+    Ok(())
+}
+
+/// An auth secret signs a challenge after a tap with the device locked, and the
+/// signature verifies under the seed's public key on this side; a chip without its
+/// eFuse key refuses to hold one at all.
+fn auth(d: &mut Device, rep: &mut Report) -> Result<(), Error> {
+    const SECRET: [u8; AUTH_SECRET_LEN] = [0x5A; AUTH_SECRET_LEN];
+    let bound = d.pin_status()?.chip_bound;
+    let added = d.add("a", &SECRET, Kind::Auth, false);
+    if !bound {
+        rep.expect(
+            "no auth secret without a chip key",
+            &added,
+            &Error::Incompatible,
+        );
+        return Ok(());
+    }
+    added?;
+    rep.expect(
+        "no code from an auth secret",
+        &d.code("a", Some(59)),
+        &Error::BadArg,
+    );
+    let challenge = [0x33; AUTH_CHALLENGE_LEN];
+    d.lock()?;
+    rep.tap();
+    let signature = d.respond("a", &challenge)?;
+    rep.check(
+        "the signature verifies under the public key",
+        auth::verifies(
+            &SigningKey::from_bytes(&SECRET).verifying_key(),
+            &challenge,
+            &signature,
+        ),
+        "",
+    );
+    let st = d.pin_status()?;
+    rep.check(
+        "still locked, no attempt spent",
+        !st.unlocked && st.retries_left == MAX_ATTEMPTS,
+        &format!("{st:?}"),
+    );
+    d.pin_unlock(pin(NEW_PIN)?)?;
+    d.delete("a")?;
     Ok(())
 }
 

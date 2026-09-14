@@ -26,5 +26,9 @@ hmac = { version = "0.13", default-features = false, features = ["zeroize"] }
 sha1 = { version = "0.11", default-features = false, features = ["zeroize"] }
 sha2 = { version = "0.11", default-features = false, features = ["zeroize"] }
 subtle = { version = "2.6", default-features = false }
+# `vkey auth`: a login is an Ed25519 signature, so the host keeps a public key and no
+# secret. Built on RustCrypto's `signature` and `sha2`; no precomputed tables, which
+# would cost flash for a speed a tap does not need.
+ed25519-dalek = { version = "2.2", default-features = false, features = ["zeroize"] }
 zeroize = { version = "1.9", default-features = false }
 crc = "3.4"

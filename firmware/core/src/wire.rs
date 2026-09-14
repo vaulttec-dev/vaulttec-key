@@ -12,7 +12,9 @@
 //! and gets the login of a password entry back; `Reveal` the entry's whole secret as
 //! it was added, after a tap; `Rename` carries two names, `old | new`; `EnvPut` is
 //! `name | flags | blob`, the whole `.env` in one frame; `EnvGet` sends a name and
-//! gets the blob back after a tap; `PinChange` is `old_len u8 | old | new`;
+//! gets the blob back after a tap; `Respond` sends `name | challenge(32)` and gets
+//! the Ed25519 signature of `AUTH_SIGNED_PREFIX | challenge` back after a tap;
+//! `PinChange` is `old_len u8 | old | new`;
 //! `PinStatus` answers `has_pin | unlocked | attempts_left | chip_bound`. A password
 //! entry's secret is `login_len u8 | login | password_len u8 | password | note`.
 //!
@@ -84,6 +86,9 @@ pub enum Cmd {
     EnvPut = 0x17,
     /// A whole env blob out; the button must be tapped.
     EnvGet = 0x18,
+    /// A challenge signed with an auth secret; the button must be tapped, the PIN is
+    /// not needed.
+    Respond = 0x19,
     PinStatus = 0x20,
     PinSet = 0x21,
     PinUnlock = 0x22,
@@ -118,6 +123,7 @@ impl Cmd {
             0x16 => Self::Rename,
             0x17 => Self::EnvPut,
             0x18 => Self::EnvGet,
+            0x19 => Self::Respond,
             0x20 => Self::PinStatus,
             0x21 => Self::PinSet,
             0x22 => Self::PinUnlock,
@@ -138,6 +144,14 @@ impl Cmd {
         self as u8
     }
 }
+
+/// The host's challenge in a `Respond`.
+pub const AUTH_CHALLENGE_LEN: usize = 32;
+/// The answer: an Ed25519 signature.
+pub const AUTH_SIGNATURE_LEN: usize = 64;
+/// What a `Respond` signs in front of the challenge, so a login signature is never
+/// valid as anything else.
+pub const AUTH_SIGNED_PREFIX: &[u8; 16] = b"vaultkey/auth/v1";
 
 /// `Add` and `EnvPut` flags.
 pub const FLAG_REPLACE: u8 = 0x01;
