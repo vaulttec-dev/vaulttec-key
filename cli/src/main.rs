@@ -6,7 +6,7 @@
 //! vkey totp add github                    # the rest are one-shot commands for scripts
 //! vkey pass add mail --login me           # a password
 //! vkey env add myapp .env                 # a project's .env, whole
-//! vkey import passwords.csv               # a password manager export, one question per row
+//! vkey import passwords.csv               # a password manager export, mirrored onto the key
 //! vkey get github                         # a code, a login and a password, or a .env
 //! vkey backup vault.vkb                   # everything into one file, sealed on the key; two taps
 //! vkey restore vault.vkb                  # everything back, onto this or another key
@@ -31,6 +31,7 @@ mod op;
 mod prompt;
 mod setup;
 mod shell;
+mod sources;
 mod totp;
 
 use std::io::{Read, Write};
@@ -114,7 +115,8 @@ enum Cmd {
         cmd: EnvCmd,
     },
     /// Passwords and TOTP codes from a Google Password Manager or 1Password 8 CSV
-    /// export; existing entries are skipped automatically
+    /// export; existing entries are skipped, and entries an earlier import of the same
+    /// file left behind but it no longer offers are deleted
     Import {
         /// The CSV file the manager exported
         file: PathBuf,
@@ -122,7 +124,9 @@ enum Cmd {
         #[arg(short, long)]
         replace: bool,
     },
-    /// Pull passwords, TOTP codes and .env files directly from 1Password via 'op'
+    /// Pull passwords, TOTP codes and .env files directly from 1Password via 'op'.
+    /// A whole-vault run also deletes what 1Password no longer has; narrowing it with
+    /// an item, --tag or --vault makes it a selection, which only adds
     #[command(alias = "1password")]
     Op {
         /// Specific item or document to pull; syncs all items if omitted
@@ -315,6 +319,7 @@ fn run(cli: Cli) -> Result<u8, Error> {
                 return Ok(0);
             }
             with_unlock(&mut dev, |d| d.delete(&name))?;
+            sources::forget(&name);
             println!("removed '{name}'");
             Ok(0)
         }
@@ -335,6 +340,7 @@ fn run(cli: Cli) -> Result<u8, Error> {
                 boards::button(Some(&version))
             );
             dev.wipe()?;
+            sources::forget_all();
             println!("wiped: no PIN, no credentials - run  vkey pin set  or /pin");
             Ok(0)
         }
@@ -545,7 +551,7 @@ fn run_import(dev: &mut Device, file: &Path, replace: bool) -> Result<u8, Error>
         println!("  skipped: {s}");
     }
     let mut ui = prompt::CliUi;
-    let done = with_unlock(dev, |d| import::run(d, &parsed.rows, replace, &mut ui));
+    let done = with_unlock(dev, |d| import::run(d, &parsed, file, replace, &mut ui));
     eprintln!("{}", import::reminder(file));
     println!("{}", done?.line());
     Ok(0)

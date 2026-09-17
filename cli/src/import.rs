@@ -6,7 +6,7 @@
 //! ever reaches the screen, and the file stays where it is: deleting it is the
 //! owner's call, once the device has been checked.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use csv_core::{ReadRecordResult, Reader};
@@ -14,6 +14,7 @@ use zeroize::Zeroizing;
 
 use crate::device::{Device, Error, Kind, NAME_MAX, password_blob};
 use crate::prompt::SyncUi;
+use crate::sources::{self, FILE, Manifest, Outcome, Phase, SyncRun};
 use crate::totp;
 
 /// One entry the export can put on the device. The name and the login are printed;
@@ -30,6 +31,10 @@ pub struct Parsed {
     pub rows: Vec<Row>,
     /// What cannot go on the device, and why. Never a password.
     pub skipped: Vec<String>,
+    /// Names the export still holds but this parse could not turn into an entry - a
+    /// row whose password was cleared, a secret that would not resolve. The export
+    /// offers them, so a mirror must not treat them as withdrawn and delete them.
+    pub dropped: Vec<String>,
 }
 
 impl Parsed {
@@ -59,6 +64,8 @@ pub struct Summary {
     pub added: usize,
     pub replaced: usize,
     pub skipped: usize,
+    /// Entries this source had brought and no longer offers.
+    pub deleted: usize,
     /// Rows after a "stop", or after the device filled up.
     pub left: usize,
 }
@@ -67,8 +74,8 @@ impl Summary {
     #[must_use]
     pub fn line(&self) -> String {
         format!(
-            "added {} · replaced {} · skipped {} · not reached {}",
-            self.added, self.replaced, self.skipped, self.left
+            "added {} · replaced {} · skipped {} · deleted {} · not reached {}",
+            self.added, self.replaced, self.skipped, self.deleted, self.left
         )
     }
 }
@@ -168,6 +175,7 @@ pub fn parse(csv: &[u8]) -> Result<Parsed, Error> {
         source: format.source,
         rows: Vec::new(),
         skipped: Vec::new(),
+        dropped: Vec::new(),
     };
     if archived > 0 {
         parsed.skipped.push(format!("{archived} archived items"));
@@ -198,6 +206,7 @@ fn rows_of(raws: &[Raw], out: &mut Parsed) {
         };
         if raw.password.is_empty() && raw.otp.is_none() {
             out.skipped.push(format!("{name}: no password"));
+            out.dropped.push(name);
             continue;
         }
         if !raw.password.is_empty() {
@@ -208,7 +217,10 @@ fn rows_of(raws: &[Raw], out: &mut Parsed) {
                     kind: Kind::Password,
                     secret,
                 }),
-                Err(e) => out.skipped.push(format!("{name}: {e}")),
+                Err(e) => {
+                    out.skipped.push(format!("{name}: {e}"));
+                    out.dropped.push(name.clone());
+                }
             }
         }
         if let Some(otp) = &raw.otp {
@@ -220,7 +232,10 @@ fn rows_of(raws: &[Raw], out: &mut Parsed) {
                     kind: Kind::Totp(r.params),
                     secret: r.secret,
                 }),
-                Err(e) => out.skipped.push(format!("{otp_name}: {e}")),
+                Err(e) => {
+                    out.skipped.push(format!("{otp_name}: {e}"));
+                    out.dropped.push(otp_name);
+                }
             }
         }
     }
@@ -284,21 +299,41 @@ fn records(csv: &[u8], f: &mut dyn FnMut(&[&str]) -> Result<(), Error>) -> Resul
     }
 }
 
-/// Stores rows from a CSV export onto the device. Existing entries are skipped automatically.
+/// Stores rows from a CSV export onto the device, and deletes what this export used
+/// to bring and no longer does. Existing entries are skipped unless `replace`.
+///
+/// The file is the mirror: only what an earlier import of *this same file* left behind
+/// is ever deleted, and never an entry added by hand or one that came from 1Password.
 pub fn run(
     dev: &mut Device,
-    rows: &[Row],
+    parsed: &Parsed,
+    file: &Path,
     replace: bool,
     ui: &mut dyn SyncUi,
 ) -> Result<Summary, Error> {
-    let mut sum = Summary::default();
-    let existing: HashSet<String> = if replace {
-        HashSet::new()
-    } else {
-        dev.list()
-            .map(|entries| entries.into_iter().map(|e| e.name).collect())
-            .unwrap_or_default()
-    };
+    let rows = &parsed.rows;
+    let mut run = SyncRun::default();
+    let mut map = Manifest::load();
+    let entries = dev.list().unwrap_or_default();
+    let existing: BTreeSet<String> = entries.iter().map(|e| e.name.clone()).collect();
+    let ping_target = sources::survivor(&entries);
+
+    // An export from somewhere else is a different mirror: it adds, but it must not
+    // delete what the last one brought. The path is all this host can tell them by, so
+    // it is resolved first - two `passwords.csv` in different folders are not one file.
+    let source = std::fs::canonicalize(file)
+        .unwrap_or_else(|_| file.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    let blocked = (!map.mirrors(FILE, &source))
+        .then(|| "this key has not been mirrored from this file before".to_string())
+        .or_else(|| {
+            rows.is_empty()
+                .then(|| "the export held no rows at all".to_string())
+        });
+
+    let mut offered = BTreeSet::new();
+    let mut full = false;
 
     for (i, row) in rows.iter().enumerate() {
         let desc = if row.login.is_empty() {
@@ -309,7 +344,9 @@ pub fn run(
 
         if !replace && existing.contains(&row.name) {
             ui.info(&format!("  skipped '{desc}' (already exists)"));
-            sum.skipped += 1;
+            run.summary.skipped += 1;
+            run.saw(&row.name, Outcome::Offered);
+            sources::absorb(&mut run, FILE, &mut map, &mut offered)?;
             continue;
         }
 
@@ -318,29 +355,34 @@ pub fn run(
             match dev.add(&row.name, &row.secret, row.kind, replace) {
                 Ok(()) => {
                     if replace && existing.contains(&row.name) {
-                        sum.replaced += 1;
+                        run.summary.replaced += 1;
                         ui.info(&format!("  updated '{desc}'"));
                     } else {
-                        sum.added += 1;
+                        run.summary.added += 1;
                         ui.info(&format!("  stored '{desc}'"));
                     }
+                    run.saw(&row.name, Outcome::Wrote);
                     break;
                 }
                 Err(Error::Exists) if replace => {
                     dev.add(&row.name, &row.secret, row.kind, true)?;
-                    sum.replaced += 1;
+                    run.summary.replaced += 1;
+                    run.saw(&row.name, Outcome::Wrote);
                     ui.info(&format!("  updated '{desc}'"));
                     break;
                 }
                 Err(Error::Exists) => {
-                    sum.skipped += 1;
+                    run.summary.skipped += 1;
+                    run.saw(&row.name, Outcome::Offered);
                     ui.info(&format!("  skipped '{desc}' (already exists)"));
                     break;
                 }
                 Err(Error::Full) => {
                     ui.info("the device is full");
-                    sum.left = rows.len() - i;
-                    return Ok(sum);
+                    run.summary.left = rows.len() - i;
+                    run.saw(&row.name, Outcome::Offered);
+                    full = true;
+                    break;
                 }
                 Err(Error::Locked) if !retried => {
                     retried = true;
@@ -350,8 +392,34 @@ pub fn run(
                 Err(e) => return Err(e),
             }
         }
+        sources::absorb(&mut run, FILE, &mut map, &mut offered)?;
+        if full {
+            // The export still offers the rows this run never reached; name them, or
+            // the next pass would read them as withdrawn and delete them.
+            offered.extend(rows[i..].iter().map(|r| r.name.clone()));
+            break;
+        }
     }
-    Ok(sum)
+
+    // Deletions come after every write, so a run that stops early leaves the key
+    // holding more than it should rather than less. A full device still gets here:
+    // deleting is what makes room for the next run.
+    // A row the parser threw away is still a row the export holds.
+    offered.extend(parsed.dropped.iter().cloned());
+
+    let phase = Phase {
+        bucket: FILE,
+        offered,
+        blocked,
+    };
+
+    sources::finish(dev, &mut map, &[phase], ping_target.as_ref(), ui, &mut run)?;
+
+    // Remember which export this key now mirrors, so the next import of it may delete.
+    map.set_source(FILE, &source);
+    map.save()?;
+
+    Ok(run.summary)
 }
 
 #[cfg(test)]
@@ -372,6 +440,16 @@ mod tests {
 
     fn names(p: &Parsed) -> Vec<&str> {
         p.rows.iter().map(|r| r.name.as_str()).collect()
+    }
+
+    #[test]
+    fn a_row_the_parser_threw_away_is_still_offered() {
+        // The password was cleared in the manager but the row is still in the export.
+        // Nothing can be stored for it - and nothing may be deleted for it either.
+        let csv = b"name,url,username,password,note\nBank,https://bank.example,me,,\n";
+        let parsed = parse(csv).expect("parses");
+        assert!(parsed.rows.is_empty());
+        assert_eq!(parsed.dropped, vec!["Bank".to_string()]);
     }
 
     #[test]

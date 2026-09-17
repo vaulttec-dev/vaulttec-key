@@ -3,17 +3,22 @@
 //! Pulls passwords, TOTP credentials and `.env` documents directly from
 //! 1Password in memory (`Zeroizing`), without writing cleartext files to disk.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
+use crate::auth::replace_file;
 use crate::device::{Device, EnvBlob, Error, Kind, password_blob};
 use crate::import::{Summary, entry_name, truncate};
 use crate::prompt::SyncUi;
+use crate::sources::{
+    Manifest, OP_DOC, OP_ENV, OP_ITEM, Outcome, Phase, SyncRun, absorb, claim_written, config_path,
+    finish, keep_unlocked, survivor,
+};
 use crate::totp;
 
 /// Verifies that the `op` command-line tool is installed in `PATH` and has an active account.
@@ -259,10 +264,7 @@ pub fn parse_env_spec(spec: &str) -> Option<(String, String)> {
 
 /// Path to local config file storing 1Password Environment name-to-ID mappings.
 fn env_storage_path() -> Option<PathBuf> {
-    let mut p = dirs::config_dir()?;
-    p.push("vaultkey");
-    p.push("op_environments.json");
-    Some(p)
+    config_path("op_environments.json")
 }
 
 /// Loads saved environment (name -> ID) mappings from disk.
@@ -276,7 +278,9 @@ pub fn load_saved_envs() -> HashMap<String, String> {
     serde_json::from_slice(&data).unwrap_or_default()
 }
 
-/// Saves or updates a saved environment (name -> ID) mapping on disk.
+/// Saves or updates a saved environment (name -> ID) mapping on disk. Written the way
+/// the source map is: whole, and readable only by its owner - these are entry names,
+/// and a locked key names nothing.
 pub fn save_saved_env(name: &str, id: &str) {
     let Some(path) = env_storage_path() else {
         return;
@@ -286,8 +290,8 @@ pub fn save_saved_env(name: &str, id: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(json) = serde_json::to_string_pretty(&map) {
-        let _ = std::fs::write(&path, json);
+    if let Ok(json) = serde_json::to_vec_pretty(&map) {
+        let _ = replace_file(&path, &json, 0o600);
     }
 }
 
@@ -310,7 +314,8 @@ pub(crate) fn is_critical_op_error(msg: &str) -> bool {
         || msg.contains("failed to run 'op'")
 }
 
-/// Stores or updates an entry on the device, prompting if it already exists and `replace` is false.
+/// Stores or updates an entry on the device, skipping it when it already exists and
+/// `replace` is false.
 fn put_entry(
     dev: &mut Device,
     name: &str,
@@ -318,28 +323,32 @@ fn put_entry(
     kind: Kind,
     replace: bool,
     ui: &mut dyn SyncUi,
-    sum: &mut Summary,
+    run: &mut SyncRun,
 ) -> Result<(), Error> {
     let mut retried = false;
     loop {
         match dev.add(name, secret, kind, false) {
             Ok(()) => {
-                sum.added += 1;
+                run.summary.added += 1;
+                run.saw(name, Outcome::Wrote);
                 ui.info(&format!("  stored '{name}'"));
                 return Ok(());
             }
             Err(Error::Exists) if replace => {
                 dev.add(name, secret, kind, true)?;
-                sum.replaced += 1;
+                run.summary.replaced += 1;
+                run.saw(name, Outcome::Wrote);
                 ui.info(&format!("  updated '{name}'"));
                 return Ok(());
             }
             Err(Error::Exists) => {
-                sum.skipped += 1;
+                run.summary.skipped += 1;
+                run.saw(name, Outcome::Offered);
                 ui.info(&format!("  skipped '{name}' (already exists)"));
                 return Ok(());
             }
             Err(Error::Full) => {
+                run.saw(name, Outcome::Offered);
                 ui.info("the device is full");
                 return Err(Error::Full);
             }
@@ -360,28 +369,32 @@ fn put_env(
     blob: &EnvBlob,
     replace: bool,
     ui: &mut dyn SyncUi,
-    sum: &mut Summary,
+    run: &mut SyncRun,
 ) -> Result<(), Error> {
     let mut retried = false;
     loop {
         match dev.env_put(name, blob, false) {
             Ok(()) => {
-                sum.added += 1;
+                run.summary.added += 1;
+                run.saw(name, Outcome::Wrote);
                 ui.info(&format!("  stored env '{name}'"));
                 return Ok(());
             }
             Err(Error::Exists) if replace => {
                 dev.env_put(name, blob, true)?;
-                sum.replaced += 1;
+                run.summary.replaced += 1;
+                run.saw(name, Outcome::Wrote);
                 ui.info(&format!("  updated env '{name}'"));
                 return Ok(());
             }
             Err(Error::Exists) => {
-                sum.skipped += 1;
+                run.summary.skipped += 1;
+                run.saw(name, Outcome::Offered);
                 ui.info(&format!("  skipped env '{name}' (already exists)"));
                 return Ok(());
             }
             Err(Error::Full) => {
+                run.saw(name, Outcome::Offered);
                 ui.info("the device is full");
                 return Err(Error::Full);
             }
@@ -402,7 +415,7 @@ pub(crate) fn process_item(
     qualify_dup: bool,
     replace: bool,
     ui: &mut dyn SyncUi,
-    sum: &mut Summary,
+    run: &mut SyncRun,
 ) -> Result<(), Error> {
     let primary_url = item
         .urls
@@ -414,7 +427,7 @@ pub(crate) fn process_item(
         .unwrap_or_else(|| truncate(item.title.trim().to_string()));
 
     if base_name.is_empty() {
-        sum.skipped += 1;
+        run.summary.skipped += 1;
         return Ok(());
     }
 
@@ -431,10 +444,11 @@ pub(crate) fn process_item(
 
         match password_blob(&name, &login, &pw, &note) {
             Ok(blob) => {
-                put_entry(dev, &name, &blob, Kind::Password, replace, ui, sum)?;
+                put_entry(dev, &name, &blob, Kind::Password, replace, ui, run)?;
                 touched = true;
             }
             Err(e) => {
+                run.saw(&name, Outcome::Offered);
                 ui.info(&format!("  skipped password for '{name}': {e}"));
             }
         }
@@ -457,11 +471,12 @@ pub(crate) fn process_item(
                     Kind::Totp(resolved.params),
                     replace,
                     ui,
-                    sum,
+                    run,
                 )?;
                 touched = true;
             }
             Err(e) => {
+                run.saw(&otp_name, Outcome::Offered);
                 ui.info(&format!("  skipped TOTP for '{otp_name}': {e}"));
             }
         }
@@ -472,17 +487,18 @@ pub(crate) fn process_item(
         let env_name = env_entry_name(&base_name);
         match EnvBlob::new(env_bytes) {
             Ok(blob) => {
-                put_env(dev, &env_name, &blob, replace, ui, sum)?;
+                put_env(dev, &env_name, &blob, replace, ui, run)?;
                 touched = true;
             }
             Err(e) => {
+                run.saw(&env_name, Outcome::Offered);
                 ui.info(&format!("  skipped env '{env_name}': {e}"));
             }
         }
     }
 
     if !touched {
-        sum.skipped += 1;
+        run.summary.skipped += 1;
     }
 
     Ok(())
@@ -495,13 +511,15 @@ pub(crate) fn process_document(
     title: &str,
     replace: bool,
     ui: &mut dyn SyncUi,
-    sum: &mut Summary,
+    run: &mut SyncRun,
 ) -> Result<(), Error> {
+    let name = env_entry_name(title);
     let content = match op_exec(&["document", "get", doc_id]) {
         Ok(b) => b,
         Err(e) => {
             ui.info(&format!("  failed to get document '{title}': {e}"));
-            sum.skipped += 1;
+            run.summary.skipped += 1;
+            run.saw(&name, Outcome::Offered);
             return Ok(());
         }
     };
@@ -510,13 +528,13 @@ pub(crate) fn process_document(
         Ok(b) => b,
         Err(e) => {
             ui.info(&format!("  document '{title}' is not a valid .env: {e}"));
-            sum.skipped += 1;
+            run.summary.skipped += 1;
+            run.saw(&name, Outcome::Offered);
             return Ok(());
         }
     };
 
-    let name = env_entry_name(title);
-    put_env(dev, &name, &blob, replace, ui, sum)
+    put_env(dev, &name, &blob, replace, ui, run)
 }
 
 /// Imports a 1Password Developer Environment by its ID.
@@ -526,7 +544,7 @@ pub fn process_environment(
     env_id: &str,
     replace: bool,
     ui: &mut dyn SyncUi,
-    sum: &mut Summary,
+    run: &mut SyncRun,
 ) -> Result<(), Error> {
     let name = env_entry_name(env_name);
     ui.info(&format!("syncing environment '{name}' ({env_id})..."));
@@ -546,7 +564,8 @@ pub fn process_environment(
             } else {
                 ui.info(&format!("  failed to read environment '{name}': {e}"));
             }
-            sum.skipped += 1;
+            run.summary.skipped += 1;
+            run.saw(&name, Outcome::Offered);
             return Ok(());
         }
     };
@@ -555,7 +574,8 @@ pub fn process_environment(
         Ok(s) => s,
         Err(e) => {
             ui.info(&format!("  environment '{name}' is not UTF-8: {e}"));
-            sum.skipped += 1;
+            run.summary.skipped += 1;
+            run.saw(&name, Outcome::Offered);
             return Ok(());
         }
     };
@@ -574,28 +594,86 @@ pub fn process_environment(
         Ok(b) => b,
         Err(e) => {
             ui.info(&format!("  environment '{name}' is not a valid .env: {e}"));
-            sum.skipped += 1;
+            run.summary.skipped += 1;
+            run.saw(&name, Outcome::Offered);
             return Ok(());
         }
     };
 
     save_saved_env(&name, env_id);
-    put_env(dev, &name, &blob, replace, ui, sum)
+    put_env(dev, &name, &blob, replace, ui, run)
 }
 
-/// Pulls a single item, document, or environment by title or ID.
+/// Which 1Password account `op` is signed in to. A run that finds a different account
+/// than the map remembers deletes nothing: the listing is honest, it is simply
+/// somebody else's vault, and every name from the old one would look abandoned.
+fn op_account() -> Option<String> {
+    #[derive(Deserialize)]
+    struct Who {
+        #[serde(default)]
+        account_uuid: String,
+        #[serde(default)]
+        url: String,
+    }
+    let raw = op_exec(&["whoami", "--format", "json"]).ok()?;
+    let who: Who = serde_json::from_slice(&raw).ok()?;
+    let id = if who.account_uuid.is_empty() {
+        who.url
+    } else {
+        who.account_uuid
+    };
+    (!id.is_empty()).then_some(id)
+}
+
+/// The names an item of this title can have put on the key, without reading the item:
+/// the entry itself, the `.env` it may carry in a note, and whatever the map already
+/// says this item left behind - its TOTP, or the `name:login` of a duplicate title,
+/// which cannot be derived without the login. Needed whenever an item is listed but
+/// not read: unread is not the same as withdrawn.
+fn item_names(map: &Manifest, base_name: &str) -> Vec<String> {
+    let mut names = map.family(OP_ITEM, base_name);
+    names.push(base_name.to_string());
+    names.push(env_entry_name(base_name));
+    names
+}
+
+/// Why this bucket must not delete anything this run, if it must not. A narrowed
+/// listing is a selection rather than a mirror of the vault, and an account that is
+/// unknown or is not the one this bucket came from is somebody else's vault: every
+/// name the old one left would look abandoned.
+fn why_not_prune(
+    map: &Manifest,
+    bucket: &str,
+    account: Option<&str>,
+    selection: bool,
+) -> Option<String> {
+    if selection {
+        return Some("--tag or --vault makes this a selection, not a mirror".into());
+    }
+    match account {
+        None => Some("the 1Password account could not be identified".into()),
+        Some(id) if !map.mirrors(bucket, id) => {
+            Some("this bucket has not been mirrored from this 1Password account before".into())
+        }
+        Some(_) => None,
+    }
+}
+
+/// Pulls a single item, document, or environment by title or ID. It claims what it
+/// writes but never deletes: one item is not a mirror of the vault.
 pub fn pull_item(
     dev: &mut Device,
     item_query: &str,
     replace: bool,
     ui: &mut dyn SyncUi,
 ) -> Result<Summary, Error> {
-    let mut sum = Summary::default();
+    let mut run = SyncRun::default();
 
     // Check if query is specified as name:id or name=id for an environment
     if let Some((name, id)) = parse_env_spec(item_query) {
-        process_environment(dev, &name, &id, replace, ui, &mut sum)?;
-        return Ok(sum);
+        process_environment(dev, &name, &id, replace, ui, &mut run)?;
+        claim_written(&mut run, OP_ENV)?;
+        return Ok(run.summary);
     }
 
     // First, try as an item
@@ -603,8 +681,9 @@ pub fn pull_item(
         Ok(raw_json) => {
             let item: OpItemDetail = serde_json::from_slice(&raw_json)
                 .map_err(|e| Error::Value(format!("failed to parse 1Password item JSON: {e}")))?;
-            process_item(dev, &item, false, replace, ui, &mut sum)?;
-            return Ok(sum);
+            process_item(dev, &item, false, replace, ui, &mut run)?;
+            claim_written(&mut run, OP_ITEM)?;
+            return Ok(run.summary);
         }
         Err(e) => {
             let msg = e.to_string();
@@ -623,8 +702,9 @@ pub fn pull_item(
                 ))
             })?;
             let name = env_entry_name(item_query);
-            put_env(dev, &name, &blob, replace, ui, &mut sum)?;
-            return Ok(sum);
+            put_env(dev, &name, &blob, replace, ui, &mut run)?;
+            claim_written(&mut run, OP_DOC)?;
+            return Ok(run.summary);
         }
         Err(e) => {
             let msg = e.to_string();
@@ -657,30 +737,218 @@ pub fn pull_item(
             "content of environment '{item_query}' is not a valid .env: {e}"
         ))
     })?;
-    put_env(dev, &name, &blob, replace, ui, &mut sum)?;
-    Ok(sum)
+    put_env(dev, &name, &blob, replace, ui, &mut run)?;
+    claim_written(&mut run, OP_ENV)?;
+    Ok(run.summary)
 }
 
-/// Pings the device at most every 30 s during a long sync to reset its auto-lock.
-fn keep_unlocked(dev: &mut Device, target: Option<&(String, Kind)>, last: &mut Instant) {
-    if last.elapsed() < Duration::from_secs(30) {
-        return;
-    }
-    if let Some((name, kind)) = target {
-        match kind {
-            Kind::Password => {
-                let _ = dev.login(name);
-            }
-            Kind::Env => {
-                let _ = dev.env_get(name);
-            }
-            Kind::Totp(_) | Kind::Auth => {}
+/// What every phase of a sync shares: the key, the map being filled, the counters, and
+/// the ping that holds the auto-lock off while a long phase runs.
+struct Mirror<'a> {
+    dev: &'a mut Device,
+    map: &'a mut Manifest,
+    run: &'a mut SyncRun,
+    ui: &'a mut dyn SyncUi,
+    ping: Option<(String, Kind)>,
+    last_ping: Instant,
+    /// What the key already held when the run started.
+    existing: BTreeSet<String>,
+    replace: bool,
+    /// Set once the key has no room left. The phases go on naming what the source
+    /// offers - otherwise the rest would read as withdrawn - but write nothing more.
+    full: bool,
+}
+
+impl Mirror<'_> {
+    /// Passwords, TOTP secrets and the `.env` an item may carry in a note.
+    fn items(&mut self, items: &[OpListEntry], blocked: Option<String>) -> Result<Phase, Error> {
+        // Two items of the same title are told apart by their login, so their names
+        // are not the title alone.
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for entry in items {
+            *counts.entry(entry.title.as_str()).or_default() += 1;
         }
+
+        let mut offered = BTreeSet::new();
+        let mut unread: Option<String> = None;
+        for entry in items {
+            if !is_supported_category(&entry.category) {
+                self.run.summary.skipped += 1;
+                continue;
+            }
+
+            let is_dup = counts.get(entry.title.as_str()).copied().unwrap_or(0) > 1;
+            let base_name = truncate(entry.title.trim().to_string());
+
+            // An untitled item is named after its URL, which the listing does not
+            // carry: this run cannot say which entry is its, so it must not delete.
+            if base_name.is_empty() {
+                unread =
+                    Some("an item with no title could not be matched to its entry".to_string());
+                self.run.summary.skipped += 1;
+                continue;
+            }
+
+            if self.full {
+                offered.extend(item_names(self.map, &base_name));
+                self.run.summary.left += 1;
+                continue;
+            }
+
+            // Fast path: an unchanged item is not read at all, which is why what it
+            // would have produced has to be named here instead.
+            if !self.replace && !is_dup && self.existing.contains(&base_name) {
+                self.ui.info(&format!("syncing item '{}'...", entry.title));
+                self.ui
+                    .info(&format!("  skipped '{base_name}' (already exists)"));
+                self.run.summary.skipped += 1;
+                offered.extend(item_names(self.map, &base_name));
+                continue;
+            }
+
+            keep_unlocked(self.dev, self.ping.as_ref(), &mut self.last_ping);
+            self.ui.info(&format!("syncing item '{}'...", entry.title));
+
+            // Unread is not withdrawn: keep what the item brought, and do not delete
+            // from this bucket at all - a listing read only in part is not a mirror.
+            let detail = match read_item(&entry.id) {
+                Ok(d) => d,
+                Err(e) => {
+                    self.ui
+                        .info(&format!("  failed to read item '{}': {e}", entry.title));
+                    self.run.summary.skipped += 1;
+                    offered.extend(item_names(self.map, &base_name));
+                    unread = Some(format!("item '{}' could not be read", entry.title));
+                    continue;
+                }
+            };
+
+            match process_item(self.dev, &detail, is_dup, self.replace, self.ui, self.run) {
+                Ok(()) => {}
+                Err(Error::Full) => {
+                    self.full = true;
+                    offered.extend(item_names(self.map, &base_name));
+                }
+                Err(e) => return Err(e),
+            }
+            absorb(self.run, OP_ITEM, self.map, &mut offered)?;
+        }
+
+        Ok(Phase {
+            bucket: OP_ITEM,
+            blocked: blocked.or(unread),
+            offered,
+        })
     }
-    *last = Instant::now();
+
+    /// `.env` files kept as 1Password documents.
+    fn documents(
+        &mut self,
+        documents: Option<&[OpListEntry]>,
+        blocked: Option<String>,
+    ) -> Result<Phase, Error> {
+        let mut offered = BTreeSet::new();
+        for doc in documents.unwrap_or_default() {
+            let name = env_entry_name(&doc.title);
+            if self.full {
+                offered.insert(name);
+                self.run.summary.left += 1;
+                continue;
+            }
+            if !self.replace && self.existing.contains(&name) {
+                self.ui
+                    .info(&format!("syncing document '{}'...", doc.title));
+                self.ui
+                    .info(&format!("  skipped env '{name}' (already exists)"));
+                self.run.summary.skipped += 1;
+                offered.insert(name);
+                continue;
+            }
+
+            keep_unlocked(self.dev, self.ping.as_ref(), &mut self.last_ping);
+            self.ui
+                .info(&format!("syncing document '{}'...", doc.title));
+            match process_document(
+                self.dev,
+                &doc.id,
+                &doc.title,
+                self.replace,
+                self.ui,
+                self.run,
+            ) {
+                Ok(()) => {}
+                Err(Error::Full) => {
+                    self.full = true;
+                    offered.insert(name);
+                }
+                Err(e) => return Err(e),
+            }
+            absorb(self.run, OP_DOC, self.map, &mut offered)?;
+        }
+
+        Ok(Phase {
+            bucket: OP_DOC,
+            blocked,
+            offered,
+        })
+    }
+
+    /// 1Password Developer Environments, named by this host's saved map.
+    fn environments(
+        &mut self,
+        environments: &[(&str, &str)],
+        blocked: Option<String>,
+    ) -> Result<Phase, Error> {
+        let mut offered = BTreeSet::new();
+        for &(name, id) in environments {
+            let env_name = env_entry_name(name);
+            if self.full {
+                offered.insert(env_name);
+                self.run.summary.left += 1;
+                continue;
+            }
+            if !self.replace && self.existing.contains(&env_name) {
+                self.ui
+                    .info(&format!("syncing environment '{name}' ({id})..."));
+                self.ui
+                    .info(&format!("  skipped env '{env_name}' (already exists)"));
+                self.run.summary.skipped += 1;
+                offered.insert(env_name);
+                continue;
+            }
+
+            keep_unlocked(self.dev, self.ping.as_ref(), &mut self.last_ping);
+            match process_environment(self.dev, name, id, self.replace, self.ui, self.run) {
+                Ok(()) => {}
+                Err(Error::Full) => {
+                    self.full = true;
+                    offered.insert(env_name);
+                }
+                Err(e) => return Err(e),
+            }
+            absorb(self.run, OP_ENV, self.map, &mut offered)?;
+        }
+
+        Ok(Phase {
+            bucket: OP_ENV,
+            blocked,
+            offered,
+        })
+    }
 }
 
-/// Synchronizes all items (passwords, TOTP, .env) and optional environments from 1Password to the key.
+/// One item in full, by its id.
+fn read_item(id: &str) -> Result<OpItemDetail, Error> {
+    let raw = op_exec(&["item", "get", id, "--format", "json"])?;
+    serde_json::from_slice(&raw).map_err(|e| Error::Value(format!("invalid JSON: {e}")))
+}
+
+/// Synchronizes all items (passwords, TOTP, .env) and optional environments from
+/// 1Password to the key, and deletes what 1Password no longer has.
+///
+/// Deleting is the narrow path: only a run that mirrors the whole source deletes, and
+/// only names this host's map says that source owns. An entry under a name no source
+/// offers is in no bucket, so nothing here can reach it.
 pub fn sync(
     dev: &mut Device,
     tag: Option<&str>,
@@ -689,116 +957,107 @@ pub fn sync(
     replace: bool,
     ui: &mut dyn SyncUi,
 ) -> Result<Summary, Error> {
-    let mut sum = Summary::default();
+    let mut run = SyncRun::default();
+    let mut map = Manifest::load();
 
-    let existing_entries = dev.list().unwrap_or_default();
-    let existing: HashSet<String> = if replace {
-        HashSet::new()
-    } else {
-        existing_entries.iter().map(|e| e.name.clone()).collect()
-    };
-    let ping_target: Option<(String, Kind)> = existing_entries
-        .into_iter()
-        .find(|e| matches!(e.kind, Kind::Password | Kind::Env))
-        .map(|e| (e.name, e.kind));
-    let mut last_ping = Instant::now();
+    // Whether each bucket may delete at all, settled before anything is written: the
+    // map changes as the run goes, and this question is about where the run started.
+    let selection = tag.is_some() || vault.is_some();
+    let account = (!selection).then(op_account).flatten();
+    let account_id = account.as_deref();
+    let item_blocked = why_not_prune(&map, OP_ITEM, account_id, selection);
+    let doc_blocked = why_not_prune(&map, OP_DOC, account_id, selection);
+    let env_blocked = why_not_prune(&map, OP_ENV, account_id, selection);
 
-    // 1. Fetch item list
     ui.info("fetching items from 1Password...");
     let items_out = op_list("item", tag, vault)?;
     let items: Vec<OpListEntry> = serde_json::from_slice(&items_out)
         .map_err(|e| Error::Value(format!("failed to parse 1Password item list: {e}")))?;
 
-    // 2. Fetch document list
-    let documents: Vec<OpListEntry> = match op_list("document", tag, vault) {
-        Ok(out) => serde_json::from_slice(&out).unwrap_or_default(),
-        Err(_) => Vec::new(),
-    };
+    // A listing that failed is not an empty listing: told apart, because treating a
+    // failure as "1Password has no documents" would delete every blob that came from
+    // one.
+    let documents: Option<Vec<OpListEntry>> = op_list("document", tag, vault)
+        .ok()
+        .and_then(|out| serde_json::from_slice(&out).ok());
 
     ui.info(&format!(
         "found {} items and {} documents in 1Password",
         items.len(),
-        documents.len()
+        documents.as_ref().map_or(0, Vec::len)
     ));
 
-    // Count title occurrences to qualify duplicates
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for entry in &items {
-        *counts.entry(entry.title.clone()).or_default() += 1;
+    // There is no listing to ask 1Password for environments, so the whole of this
+    // host's saved map is what counts as the mirror; anything less is a selection.
+    let saved = load_saved_envs();
+    let asked: BTreeSet<String> = environments
+        .iter()
+        .map(|(name, _)| env_entry_name(name))
+        .collect();
+    let every_env = !saved.is_empty() && saved.keys().all(|n| asked.contains(n));
+
+    let entries = dev.list().unwrap_or_default();
+    let mut mirror = Mirror {
+        existing: entries.iter().map(|e| e.name.clone()).collect(),
+        ping: survivor(&entries),
+        last_ping: Instant::now(),
+        dev,
+        map: &mut map,
+        run: &mut run,
+        ui,
+        replace,
+        full: false,
+    };
+
+    let phases = [
+        mirror.items(
+            &items,
+            item_blocked.or_else(|| {
+                items
+                    .is_empty()
+                    .then(|| "1Password listed no items at all".to_string())
+            }),
+        )?,
+        mirror.documents(
+            documents.as_deref(),
+            doc_blocked.or_else(|| match &documents {
+                None => Some("the document listing failed".to_string()),
+                Some(d) if d.is_empty() => Some("1Password listed no documents at all".to_string()),
+                Some(_) => None,
+            }),
+        )?,
+        mirror.environments(
+            environments,
+            env_blocked.or_else(|| {
+                (!every_env)
+                    .then(|| "this run asked for some environments, not all of them".to_string())
+            }),
+        )?,
+    ];
+
+    // Everything the phases still hold, taken before the key and the screen are needed
+    // again: `mirror` borrows both.
+    let (full, ping) = (mirror.full, mirror.ping.take());
+
+    if full {
+        ui.info("the device is full: nothing more was written");
     }
 
-    // 3. Process items
-    for entry in &items {
-        if !is_supported_category(&entry.category) {
-            sum.skipped += 1;
-            continue;
+    // What each source now owns, and what it dropped, gone from the key. Last, so a run
+    // that stops early leaves the key holding more than it should rather than less -
+    // but a full device still gets here, since deleting is what makes room.
+    finish(dev, &mut map, &phases, ping.as_ref(), ui, &mut run)?;
+
+    // Remember what each bucket now mirrors, so the next run may delete from it. Only
+    // a whole-vault run has an account at all, so a selection records nothing.
+    if let Some(id) = &account {
+        for phase in &phases {
+            map.set_source(phase.bucket, id);
         }
-
-        let is_dup = counts.get(&entry.title).copied().unwrap_or(0) > 1;
-        let base_name = truncate(entry.title.trim().to_string());
-
-        // Fast path: if not replacing and not a duplicate title, skip immediately without slow 'op item get'
-        if !replace && !is_dup && !base_name.is_empty() && existing.contains(&base_name) {
-            ui.info(&format!("syncing item '{}'...", entry.title));
-            ui.info(&format!("  skipped '{base_name}' (already exists)"));
-            sum.skipped += 1;
-            continue;
-        }
-
-        keep_unlocked(dev, ping_target.as_ref(), &mut last_ping);
-
-        ui.info(&format!("syncing item '{}'...", entry.title));
-        let detail_raw = match op_exec(&["item", "get", &entry.id, "--format", "json"]) {
-            Ok(d) => d,
-            Err(e) => {
-                ui.info(&format!("  failed to read item '{}': {e}", entry.title));
-                sum.skipped += 1;
-                continue;
-            }
-        };
-
-        let detail: OpItemDetail = match serde_json::from_slice(&detail_raw) {
-            Ok(d) => d,
-            Err(e) => {
-                ui.info(&format!("  invalid JSON for '{}': {e}", entry.title));
-                sum.skipped += 1;
-                continue;
-            }
-        };
-
-        process_item(dev, &detail, is_dup, replace, ui, &mut sum)?;
+        map.save()?;
     }
 
-    // 4. Process documents
-    for doc in &documents {
-        let name = env_entry_name(&doc.title);
-        if !replace && existing.contains(&name) {
-            ui.info(&format!("syncing document '{}'...", doc.title));
-            ui.info(&format!("  skipped env '{name}' (already exists)"));
-            sum.skipped += 1;
-            continue;
-        }
-
-        keep_unlocked(dev, ping_target.as_ref(), &mut last_ping);
-        ui.info(&format!("syncing document '{}'...", doc.title));
-        process_document(dev, &doc.id, &doc.title, replace, ui, &mut sum)?;
-    }
-
-    // 5. Process developer environments
-    for &(name, id) in environments {
-        let env_name = env_entry_name(name);
-        if !replace && existing.contains(&env_name) {
-            ui.info(&format!("syncing environment '{name}' ({id})..."));
-            ui.info(&format!("  skipped env '{env_name}' (already exists)"));
-            sum.skipped += 1;
-            continue;
-        }
-
-        keep_unlocked(dev, ping_target.as_ref(), &mut last_ping);
-        process_environment(dev, name, id, replace, ui, &mut sum)?;
-    }
-
-    Ok(sum)
+    Ok(run.summary)
 }
 
 #[cfg(test)]
@@ -882,6 +1141,31 @@ mod tests {
         ));
         assert!(is_critical_op_error("You are not currently signed in"));
         assert!(!is_critical_op_error("item 'xyz' not found"));
+    }
+
+    #[test]
+    fn an_unread_item_still_names_its_totp_and_its_env() {
+        // The fast path skips an unchanged item without reading it, so these are the
+        // names it would have produced. Miss one and the next sync deletes it.
+        let mut map = Manifest::default();
+        map.claim("GitHub", OP_ITEM);
+        map.claim("GitHub:otp", OP_ITEM);
+        // A duplicate title qualified by login: unguessable, only the map knows it.
+        map.claim("AWS:alice", OP_ITEM);
+        map.claim("AWS:bob", OP_ITEM);
+        map.claim("elsewhere", OP_DOC);
+
+        let github = item_names(&map, "GitHub");
+        assert!(github.contains(&"GitHub".to_string()));
+        assert!(github.contains(&"GitHub:otp".to_string()));
+
+        let aws = item_names(&map, "AWS");
+        assert!(aws.contains(&"AWS:alice".to_string()));
+        assert!(aws.contains(&"AWS:bob".to_string()));
+        assert!(!aws.contains(&"elsewhere".to_string()));
+
+        // A note's .env is named after the title with the suffix taken off.
+        assert!(item_names(&map, "myapp.env").contains(&"myapp".to_string()));
     }
 
     #[test]

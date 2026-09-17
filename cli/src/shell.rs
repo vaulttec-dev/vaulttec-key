@@ -27,7 +27,7 @@ use crate::device::{
     password_blob, pin,
 };
 use crate::prompt::{ACCENT, DIM, PinPrompt, WARN_AT, copy_secret, copy_to_clipboard};
-use crate::{backup, import, op, prompt, setup, totp};
+use crate::{backup, import, op, prompt, setup, sources, totp};
 
 /// Commands live behind `/`; a bare word is the name of an entry to use.
 const COMMANDS: &[(&str, &str)] = &[
@@ -1361,6 +1361,7 @@ impl Shell {
             return Ok(());
         }
         self.dev()?.delete(&name)?;
+        sources::forget(&name);
         self.line(Color::Green, &format!("  removed '{name}'"));
         self.refresh();
         Ok(())
@@ -1456,6 +1457,7 @@ impl Shell {
         let name = match new_name {
             Some(new) if new != name => {
                 self.dev()?.rename(&name, &new)?;
+                sources::renamed(&name, &new);
                 new
             }
             _ => name,
@@ -1537,6 +1539,7 @@ impl Shell {
         }
         self.hold_hint(" - the light turns red");
         self.dev()?.wipe()?;
+        sources::forget_all();
         self.line(
             Color::Green,
             "  wiped - no PIN, no credentials; /pin sets a new one",
@@ -1643,7 +1646,7 @@ impl Shell {
         let Some(mut dev) = self.dev.take() else {
             return Err(Error::NoBoard);
         };
-        let done = import::run(&mut dev, &parsed.rows, false, self);
+        let done = import::run(&mut dev, &parsed, &path, false, self);
         self.dev = Some(dev);
         self.line(Color::Yellow, &format!("  {}", import::reminder(&path)));
         self.line(Color::Green, &format!("  {}", done?.line()));
@@ -1727,7 +1730,7 @@ impl Shell {
         let Some(mut dev) = self.dev.take() else {
             return Err(Error::NoBoard);
         };
-        let mut sum = import::Summary::default();
+        let mut run = sources::SyncRun::default();
         self.line(Color::Blue, "  ● 1Password Developer Environments (.env)");
 
         let saved = op::load_saved_envs();
@@ -1767,25 +1770,27 @@ impl Shell {
                 Some(EnvPick::Item(idx)) => {
                     let (name, id) = &env_list[idx];
                     if let Err(e) =
-                        op::process_environment(&mut dev, name, id, true, self, &mut sum)
+                        op::process_environment(&mut dev, name, id, true, self, &mut run)
                     {
                         self.line(Color::Red, &format!("  error: {e}"));
                     }
                     self.dev = Some(dev);
-                    self.line(Color::Green, &format!("  {}", sum.line()));
+                    sources::claim_written(&mut run, sources::OP_ENV)?;
+                    self.line(Color::Green, &format!("  {}", run.summary.line()));
                     self.refresh();
                     return Ok(());
                 }
                 Some(EnvPick::All) => {
                     for (name, id) in &env_list {
                         if let Err(e) =
-                            op::process_environment(&mut dev, name, id, true, self, &mut sum)
+                            op::process_environment(&mut dev, name, id, true, self, &mut run)
                         {
                             self.line(Color::Red, &format!("  error: {e}"));
                         }
                     }
                     self.dev = Some(dev);
-                    self.line(Color::Green, &format!("  {}", sum.line()));
+                    sources::claim_written(&mut run, sources::OP_ENV)?;
+                    self.line(Color::Green, &format!("  {}", run.summary.line()));
                     self.refresh();
                     return Ok(());
                 }
@@ -1806,14 +1811,15 @@ impl Shell {
             self.ask_env("add Environment (name or name:ID, Enter to finish): ")
         {
             if let Err(e) =
-                op::process_environment(&mut dev, &env_name, &env_id, true, self, &mut sum)
+                op::process_environment(&mut dev, &env_name, &env_id, true, self, &mut run)
             {
                 self.line(Color::Red, &format!("  error: {e}"));
             }
         }
 
         self.dev = Some(dev);
-        self.line(Color::Green, &format!("  {}", sum.line()));
+        sources::claim_written(&mut run, sources::OP_ENV)?;
+        self.line(Color::Green, &format!("  {}", run.summary.line()));
         self.refresh();
         Ok(())
     }

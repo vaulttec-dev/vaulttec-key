@@ -105,7 +105,7 @@ vkey env add myapp .env               # or: wl-paste | vkey env add myapp
 vkey get GitHub:me                    # a code; vkey get mail [--copy] for a login and password
 vkey get myapp > .env                 # better without a file:  env $(vkey get myapp) npm start
 vkey list · rm · info · lock · pin set/change · totp selftest · wipe
-vkey op [query]                       # sync from 1Password (passwords, TOTP, notes, developer .env)
+vkey op [query]                       # mirror 1Password (passwords, TOTP, notes, developer .env)
 vkey import passwords.csv             # Google Password Manager or 1Password CSV export (skips unchanged)
 vkey backup vault.vkb                 # everything in one file, sealed on the key; two taps
 vkey restore [file]                   # restore from 1Password, CSV, or .vkb backup file
@@ -117,6 +117,12 @@ A `.env` is stored as is and comes out whole after one tap; only `KEY=value` lin
 checked by the CLI. A CSV export is plaintext on disk before and after `vkey import`, and the CLI
 does not delete it. `vkey op` syncs directly with the 1Password CLI (`op`) without plaintext files
 on disk, automatically skipping unchanged items.
+
+A sync mirrors its source both ways: an entry the source no longer offers is deleted from the key,
+and the deletion is printed. It reaches only what that same source owns — which source each
+entry came from is remembered in `~/.config/vaultkey/sources.json` — so a 1Password sync never
+touches what a CSV brought, and an entry under a name no source offers is left alone. Narrowing the run with `--tag`,
+`--vault` or a single item makes it a selection rather than a mirror, and a selection only adds.
 
 ## sudo and the lock screen with a tap
 

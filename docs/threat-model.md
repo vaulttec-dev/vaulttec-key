@@ -249,6 +249,34 @@ copy-on-write filesystem. For 1Password no plaintext export is needed at all: `v
 syncs directly with the 1Password CLI (`op`) in memory, keeping passwords, TOTP seeds
 and developer `.env` environments off disk.
 
+A sync also deletes: an entry that 1Password or the export no longer offers is removed
+from the key, without asking. Two things make that narrow enough to do unprompted. The
+key gains no new power — `Delete` has always been PIN-only and gestureless, which is
+what `vkey rm` already uses; a sync only automates it. And it can only reach what a
+source owns, because which source each name came from is remembered on this host, in
+`~/.config/vaultkey/sources.json` at mode 0600: a name from the CSV is not touched by a
+1Password run, and a name no source has is touched by none of them. A source takes a
+name when it writes it, and also when it offers a name the key already holds under no
+owner — without that second rule a key filled before any of this existed could never be
+mirrored, since a sync only ever writes what is not there yet. The consequence is the
+one real limit on the rule above: an entry added by hand under a name the source also
+offers becomes that source's, and can later be deleted by it. Only the name is shared,
+and the content cannot be compared without a tap; to keep such an entry, give it a name
+the source does not use. Every deletion is printed, and every refusal to delete is printed with its reason.
+A run only deletes when it mirrors a whole source — never with `--tag` or `--vault`,
+never for a single item, never on a listing that failed or came back empty, and never
+from a 1Password account or an export file the map has not seen before. A lost or
+unreadable map deletes nothing.
+
+The cost is that the file names entries in the clear, while a locked key deliberately
+names none (see below). It holds no secret, only names, and 0600 keeps it to its owner.
+
+Rejected: the source as a byte in the entry's flash slot. The one spare byte there sits
+outside the AEAD tag, so anything with flash access could flip it and aim a deletion at
+an entry added by hand — the same reasoning that pulled the kind byte *into* the tag.
+Putting it inside the tag instead would invalidate every stored entry, which is a wipe.
+A source is in any case a property of the sync that wrote a secret, not of the secret.
+
 ## Known limitations
 
 Listed openly so nobody has to discover them.

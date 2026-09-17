@@ -131,6 +131,7 @@ fn clean_start(d: &mut Device, rep: &mut Report) -> Result<(), Error> {
                     rep.button
                 );
                 d.wipe()?;
+                crate::sources::forget_all();
                 break;
             }
         }

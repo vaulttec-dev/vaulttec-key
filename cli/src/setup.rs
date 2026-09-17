@@ -242,6 +242,7 @@ pub fn provision(dev: &mut Device, button: &str, ui: &mut dyn ProvisionUi) -> Re
                 "  hold {button} on the board down for five seconds to wipe it"
             ));
             dev.wipe()?;
+            crate::sources::forget_all();
         }
     }
     let st = dev.pin_status()?;

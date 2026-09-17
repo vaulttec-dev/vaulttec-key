@@ -270,7 +270,8 @@ fn install_self() -> Result<(), Error> {
 
 /// `path` replaced whole: written beside it and renamed over it, so a crash leaves the
 /// old file or the new one - for a PAM file, never half of `sudo`'s configuration.
-fn replace_file(path: &Path, contents: &[u8], mode: u32) -> Result<(), Error> {
+/// The source map in `sources.rs` is written the same way, for the same reason.
+pub(crate) fn replace_file(path: &Path, contents: &[u8], mode: u32) -> Result<(), Error> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".vkey-new");
     let mut f = OpenOptions::new()
