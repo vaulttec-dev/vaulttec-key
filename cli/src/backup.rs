@@ -97,10 +97,19 @@ use vaultkey_core::oath::{Name, Params};
 use vaultkey_core::vault::{
     self, BACKUP_AAD, Block, CryptoRng, KDF_BLOCKS, NONCE_LEN, RngCore, TAG_LEN,
 };
+use zeroize::Zeroizing;
 
 use crate::item::{Item, OwnedField};
 
-struct BackupRng;
+struct BackupRng {
+    failed: bool,
+}
+
+impl BackupRng {
+    fn new() -> Self {
+        Self { failed: false }
+    }
+}
 
 impl RngCore for BackupRng {
     fn next_u32(&mut self) -> u32 {
@@ -116,7 +125,9 @@ impl RngCore for BackupRng {
     }
 
     fn fill_bytes(&mut self, dest: &mut [u8]) {
-        getrandom::getrandom(dest).expect("OS entropy is available");
+        if getrandom::getrandom(dest).is_err() {
+            self.failed = true;
+        }
     }
 }
 
@@ -126,13 +137,15 @@ fn convert_legacy_item(
     key: &[u8; vault::KEY_LEN],
     item_idx: u32,
     sealed: &[u8],
-) -> Option<Vec<u8>> {
+) -> Result<Option<Vec<u8>>, Error> {
     let mut aad = [0u8; BACKUP_AAD.len() + 4];
     aad[..BACKUP_AAD.len()].copy_from_slice(BACKUP_AAD);
     aad[BACKUP_AAD.len()..].copy_from_slice(&item_idx.to_le_bytes());
 
-    let mut buf = sealed.to_vec();
-    let n = vault::open_in_place(key, &aad, &mut buf)?;
+    let mut buf = Zeroizing::new(sealed.to_vec());
+    let Some(n) = vault::open_in_place(key, &aad, &mut buf) else {
+        return Ok(None);
+    };
     let plain = &buf[NONCE_LEN..NONCE_LEN + n];
 
     // Already v2?
@@ -141,29 +154,47 @@ fn convert_legacy_item(
         && CoreItem::parse(body).is_some()
         && Category::from_wire(category).is_some()
     {
-        return Some(sealed.to_vec());
+        return Ok(Some(sealed.to_vec()));
     }
 
     // Legacy format: Kind::WIRE_LEN (4) | name_len u8 | name | secret
-    let (kind_bytes, rest) = plain.split_first_chunk::<4>()?;
-    let (name, secret) = Name::take(rest)?;
+    let Some((kind_bytes, rest)) = plain.split_first_chunk::<4>() else {
+        return Ok(None);
+    };
+    let Some((name, secret)) = Name::take(rest) else {
+        return Ok(None);
+    };
     let item = match *kind_bytes {
         [1, algo, digits, period] => {
-            let params = Params::from_wire([algo, digits, period])?;
-            let sf = crate::totp::seed_field(params, secret).ok()?;
+            let Some(params) = Params::from_wire([algo, digits, period]) else {
+                return Ok(None);
+            };
+            let Ok(sf) = crate::totp::seed_field(params, secret) else {
+                return Ok(None);
+            };
             Item::new(Category::Login).with(sf)
         }
         [2, 0, 0, 0] => {
-            let (&login_len, rest) = secret.split_first()?;
-            let (login, rest) = rest.split_at_checked(usize::from(login_len))?;
-            let (&pw_len, note) = rest.split_first()?;
-            let (password, note) = note.split_at_checked(usize::from(pw_len))?;
-            crate::device::login_item(
-                std::str::from_utf8(login).ok()?,
-                std::str::from_utf8(password).ok()?,
-                std::str::from_utf8(note).ok()?,
-            )
-            .ok()?
+            let Some((&login_len, rest)) = secret.split_first() else {
+                return Ok(None);
+            };
+            let Some((login, rest)) = rest.split_at_checked(usize::from(login_len)) else {
+                return Ok(None);
+            };
+            let Some((&pw_len, note)) = rest.split_first() else {
+                return Ok(None);
+            };
+            let Some((password, note)) = note.split_at_checked(usize::from(pw_len)) else {
+                return Ok(None);
+            };
+            let Ok(login_item) = crate::device::login_item(
+                std::str::from_utf8(login).unwrap_or(""),
+                std::str::from_utf8(password).unwrap_or(""),
+                std::str::from_utf8(note).unwrap_or(""),
+            ) else {
+                return Ok(None);
+            };
+            login_item
         }
         [3, 0, 0, 0] => Item::new(Category::Env).with(OwnedField::new(
             Class::Secret,
@@ -177,13 +208,17 @@ fn convert_legacy_item(
             "seed",
             secret,
         )),
-        _ => return None,
+        _ => return Ok(None),
     };
 
-    let packed = item.pack().ok()?;
+    let Ok(packed) = item.pack() else {
+        return Ok(None);
+    };
     let name_bytes = name.as_bytes();
-    let name_len = u8::try_from(name_bytes.len()).ok()?;
-    let mut new_plain = Vec::with_capacity(2 + name_bytes.len() + packed.len());
+    let Ok(name_len) = u8::try_from(name_bytes.len()) else {
+        return Ok(None);
+    };
+    let mut new_plain = Zeroizing::new(Vec::with_capacity(2 + name_bytes.len() + packed.len()));
     new_plain.push(item.category.wire());
     new_plain.push(name_len);
     new_plain.extend_from_slice(name_bytes);
@@ -192,9 +227,15 @@ fn convert_legacy_item(
     let total = new_plain.len();
     let mut out_buf = vec![0u8; NONCE_LEN + total + TAG_LEN];
     out_buf[NONCE_LEN..NONCE_LEN + total].copy_from_slice(&new_plain);
-    let sealed_len = vault::seal_in_place(key, &mut BackupRng, &aad, &mut out_buf, total)?;
+    let mut rng = BackupRng::new();
+    let Some(sealed_len) = vault::seal_in_place(key, &mut rng, &aad, &mut out_buf, total) else {
+        return Ok(None);
+    };
+    if rng.failed {
+        return Err(Error::Value("no randomness from OS".into()));
+    }
     out_buf.truncate(sealed_len);
-    Some(out_buf)
+    Ok(Some(out_buf))
 }
 
 /// Every item in `path` onto the device; how many there were. The items go back sealed,
@@ -203,16 +244,16 @@ fn convert_legacy_item(
 pub fn import(dev: &mut Device, path: &Path, pass: Passphrase<'_>) -> Result<Restored, Error> {
     let (head, items) = read(&source(path)?)?;
     let mut mem = vec![Block::new(); KDF_BLOCKS];
-    let key = vault::backup_key(pass, &head.salt, head.cost, &mut mem);
-    let converted: Vec<Vec<u8>> = match key {
-        Some(k) => items
-            .iter()
-            .enumerate()
-            .map(|(i, item)| {
+    let converted = match vault::backup_key(pass, &head.salt, head.cost, &mut mem) {
+        Some(k) => {
+            let mut res = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
                 let idx = u32::try_from(i).unwrap_or(0);
-                convert_legacy_item(&k, idx, item).unwrap_or_else(|| item.clone())
-            })
-            .collect(),
+                let conv = convert_legacy_item(&k, idx, item)?.unwrap_or_else(|| item.clone());
+                res.push(conv);
+            }
+            res
+        }
         None => items,
     };
 

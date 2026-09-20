@@ -282,8 +282,11 @@ pub(crate) fn item_of(detail: &OpItemDetail) -> Result<(Item, Vec<String>), Erro
     // looks for, and what a project wants back as a file.
     if item.category == Category::SecureNote
         && let Some(note) = item
-            .first(Class::Open)
+            .fields
+            .iter()
+            .find(|f| f.label == "notesPlain")
             .or_else(|| item.first(Class::Secret))
+            .or_else(|| item.first(Class::Open))
         && EnvBlob::new(note.value.clone()).is_ok()
         && (looks_like_env(&detail.title) || item.fields.len() == 1)
     {
@@ -1185,7 +1188,8 @@ fn item_json(name: &str, category: &str, item: &Item) -> Result<Zeroizing<String
         } else {
             f.try_text()?
         };
-        let kind = if f.class == Class::Secret && f.kind == FieldKind::String {
+        let is_notes = f.label == "notesPlain";
+        let kind = if f.class == Class::Secret && f.kind == FieldKind::String && !is_notes {
             FieldKind::Concealed
         } else {
             f.kind
@@ -1193,6 +1197,9 @@ fn item_json(name: &str, category: &str, item: &Item) -> Result<Zeroizing<String
         let mut field = serde_json::Map::new();
         field.insert("id".into(), f.label.clone().into());
         field.insert("label".into(), f.label.clone().into());
+        if is_notes {
+            field.insert("purpose".into(), "NOTES".into());
+        }
         field.insert("type".into(), field_kind_name(kind).into());
         field.insert("value".into(), value.as_str().into());
         if !f.section.is_empty() {

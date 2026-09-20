@@ -230,7 +230,7 @@ impl<P: Port, C: Clock> Proto<P, C> {
                     return self.reject(Malformed::Len);
                 };
                 let mut code = Zeroizing::new([0u8; 9]);
-                let mut out = [0u8; 8];
+                let mut out = Zeroizing::new([0u8; 8]);
                 match dev.code(name, u64::from_le_bytes(time), &mut out) {
                     Ok((n, period)) => {
                         code[..n].copy_from_slice(&out[..n]);

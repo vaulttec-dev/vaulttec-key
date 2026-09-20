@@ -244,7 +244,11 @@ fn entries(d: &mut Device, rep: &mut Report) -> Result<String, Error> {
     d.rename("t2", "t")?;
     rep.tap();
     let c1 = d.code("t", Some(59))?;
-    rep.check("code while unlocked proves 60s period", c1 == "287082", &c1);
+    rep.check(
+        "code while unlocked proves 60s period",
+        c1 == "282760" && c1.period == 60,
+        &c1,
+    );
     Ok(c1.text)
 }
 

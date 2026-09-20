@@ -43,8 +43,8 @@ the device under routine use — only an explicit export under a double tap read
   try, which is four years for eight digits and a fortnight for six. JTAG is disabled; Secure Boot
   v2 (RSA-3072) is on; Flash Encryption is deliberately not used.
 - Every code, password and `.env` needs a button gesture. Eight wrong PINs wipe everything.
-- A TOTP secret leaves the key in the clear only under an explicit double tap (`vkey export` or
-  `vkey get --seed`). Routine use returns only codes. `vkey backup` reseals every item under a
+- A TOTP secret leaves the key in the clear only under an explicit double tap (`vkey export <name>`).
+  Routine use returns only codes. `vkey backup` reseals every item under a
   backup passphrase without revealing secrets.
 - Everything, `list` included, needs the PIN — except a `vkey auth` login, a tap alone; the key
   re-locks after two idle minutes. Secrets and

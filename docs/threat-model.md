@@ -14,8 +14,8 @@ A USB key on an ESP32-C6 running its own firmware (`firmware/core` plus a board
 directory). It stores TOTP secrets, passwords and project `.env` files under
 AES-256-GCM, keyed from an 8-digit PIN that is never stored. Every code, password and
 `.env` requires a physical button press; eight wrong PINs in a row wipe every secret.
-A TOTP seed leaves the key in the clear only under an explicit double tap (`vkey export` or
-`vkey get --seed`). Routine code generation never reveals seeds. Passwords and `.env` files
+A TOTP seed leaves the key in the clear only under an explicit double tap (`vkey export`).
+Routine code generation never reveals seeds. Passwords and `.env` files
 do pass through the computer. The only other path a secret takes out is the encrypted backup below.
 
 **This is not a secure element and not a certified device.** It is a general-purpose
@@ -56,7 +56,7 @@ An unlock is checked against the verifier; nothing derived from the PIN is store
 | Not `scrypt`, not `balloon-hash` | `scrypt` needs `alloc`; `balloon-hash` doubles the crypto crates |
 | PIN exactly 8 digits (0.9; was 6–8) | The counter can be erased through download mode, so the real cost of a guess is one firmware unlock, ~1.3 s. That is a fortnight for six digits, five months for seven and four years for eight — the only lever is length, because a slower KDF makes every honest unlock slower too. A PIN of the wrong length is refused before the wire and costs no attempt |
 | Chip key as a trait, `hal::DeviceKey` | The board supplies `esp_hal::hmac` when `KEY_PURPOSE_0 = HMAC_UP` (`ChipKey::detect`), else `Unbound`; the header records the binding, so firmware answering differently returns `Incompatible` instead of burning attempts |
-| Category in the AAD with the name | The category sits in flash as plaintext; without it one rewritten byte plus CRC would turn a TOTP item into a login item the reveal gesture hands out |
+| Category in the AAD with the name | The category sits in flash as plaintext; putting it in the AAD ensures that rewriting the category byte causes AEAD decryption to fail, so the item opens for nobody |
 
 The eFuse burn of 2026-09-08 put 32 bytes from `/dev/urandom` into `BLOCK_KEY0`, purpose
 `HMAC_UP`, read and write disabled, and set `DIS_USB_JTAG` and `DIS_PAD_JTAG` = 1. No copy
@@ -374,7 +374,7 @@ Listed openly so nobody has to discover them.
 | Button press per code | **Yes** | No | Yes (touch) |
 | PIN with wipe | **Yes**, 8 digits, Argon2id | Phone passcode | OATH password |
 | Passwords and their notes (recovery codes) | **Yes**, shown only after a press | Separate app | No (OATH) |
-| Project `.env` files | **Yes**, whole, after a press; each up to 8128 bytes, as many as the vault holds | 1Password Environments, in the cloud | No |
+| Project `.env` files | **Yes**, whole, after a press; each up to 8056 bytes, as many as the vault holds | 1Password Environments, in the cloud | No |
 | Resistance to physical attacks | Partial: flash dump useless without the chip, foreign firmware will not run (Secure Boot v2); with the chip — PIN brute force through the real firmware with the counter erased, power glitching | No | Secure element, not absolute |
 | Backup | One file under a backup passphrase, restorable to any vkey | Yes, in the cloud | None |
 | Phishing resistance | No | No | No (OATH) |

@@ -1253,7 +1253,7 @@ impl Shell {
                 (
                     Make::Env,
                     "env file",
-                    "a project's .env, pasted whole, after a tap; up to 8128 bytes",
+                    "a project's .env, pasted whole, after a tap; up to 8056 bytes",
                 ),
             ],
         ) else {

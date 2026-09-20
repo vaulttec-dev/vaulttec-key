@@ -243,7 +243,7 @@ enum TotpCmd {
 #[derive(Subcommand)]
 enum EnvCmd {
     /// Store a .env file - or stdin, when no file is given - under a project name;
-    /// up to 8128 bytes, as is
+    /// up to 8056 bytes, as is
     Add {
         /// Project name
         name: String,
@@ -867,7 +867,7 @@ fn run_get(dev: &mut Device, version: &str, name: &str, copy: bool) -> Result<u8
         } else {
             println!(
                 "{code}   ({remaining}s left){}",
-                if copy && copy_to_clipboard(&code, None) {
+                if copy_to_clipboard(&code, None) {
                     "  copied"
                 } else {
                     ""
