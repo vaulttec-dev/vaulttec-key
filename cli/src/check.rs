@@ -36,7 +36,7 @@ fn totp_item(period: u8, secret: &[u8]) -> Item {
         period: NonZeroU8::new(period).expect("periods here are never zero"),
         ..Params::DEFAULT
     };
-    Item::new(Category::Login).with(seed_field(params, secret))
+    Item::new(Category::Login).with(seed_field(params, secret).expect("valid secret"))
 }
 
 /// Counts failures and prints one line per check.
@@ -244,8 +244,8 @@ fn entries(d: &mut Device, rep: &mut Report) -> Result<String, Error> {
     d.rename("t2", "t")?;
     rep.tap();
     let c1 = d.code("t", Some(59))?;
-    rep.check("code while unlocked", c1.len() == 6, &c1);
-    Ok(c1)
+    rep.check("code while unlocked proves 60s period", c1 == "287082", &c1);
+    Ok(c1.text)
 }
 
 fn password(d: &mut Device, rep: &mut Report) -> Result<(), Error> {

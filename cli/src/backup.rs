@@ -92,18 +92,137 @@ pub fn source(path: &Path) -> Result<PathBuf, Error> {
     Ok(file)
 }
 
+use vaultkey_core::item::{Category, Class, FieldKind, Item as CoreItem};
+use vaultkey_core::oath::{Name, Params};
+use vaultkey_core::vault::{
+    self, BACKUP_AAD, Block, CryptoRng, KDF_BLOCKS, NONCE_LEN, RngCore, TAG_LEN,
+};
+
+use crate::item::{Item, OwnedField};
+
+struct BackupRng;
+
+impl RngCore for BackupRng {
+    fn next_u32(&mut self) -> u32 {
+        let mut b = [0u8; 4];
+        self.fill_bytes(&mut b);
+        u32::from_le_bytes(b)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut b = [0u8; 8];
+        self.fill_bytes(&mut b);
+        u64::from_le_bytes(b)
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        getrandom::getrandom(dest).expect("OS entropy is available");
+    }
+}
+
+impl CryptoRng for BackupRng {}
+
+fn convert_legacy_item(
+    key: &[u8; vault::KEY_LEN],
+    item_idx: u32,
+    sealed: &[u8],
+) -> Option<Vec<u8>> {
+    let mut aad = [0u8; BACKUP_AAD.len() + 4];
+    aad[..BACKUP_AAD.len()].copy_from_slice(BACKUP_AAD);
+    aad[BACKUP_AAD.len()..].copy_from_slice(&item_idx.to_le_bytes());
+
+    let mut buf = sealed.to_vec();
+    let n = vault::open_in_place(key, &aad, &mut buf)?;
+    let plain = &buf[NONCE_LEN..NONCE_LEN + n];
+
+    // Already v2?
+    if let Some((&category, rest)) = plain.split_first()
+        && let Some((_, body)) = Name::take(rest)
+        && CoreItem::parse(body).is_some()
+        && Category::from_wire(category).is_some()
+    {
+        return Some(sealed.to_vec());
+    }
+
+    // Legacy format: Kind::WIRE_LEN (4) | name_len u8 | name | secret
+    let (kind_bytes, rest) = plain.split_first_chunk::<4>()?;
+    let (name, secret) = Name::take(rest)?;
+    let item = match *kind_bytes {
+        [1, algo, digits, period] => {
+            let params = Params::from_wire([algo, digits, period])?;
+            let sf = crate::totp::seed_field(params, secret).ok()?;
+            Item::new(Category::Login).with(sf)
+        }
+        [2, 0, 0, 0] => {
+            let (&login_len, rest) = secret.split_first()?;
+            let (login, rest) = rest.split_at_checked(usize::from(login_len))?;
+            let (&pw_len, note) = rest.split_first()?;
+            let (password, note) = note.split_at_checked(usize::from(pw_len))?;
+            crate::device::login_item(
+                std::str::from_utf8(login).ok()?,
+                std::str::from_utf8(password).ok()?,
+                std::str::from_utf8(note).ok()?,
+            )
+            .ok()?
+        }
+        [3, 0, 0, 0] => Item::new(Category::Env).with(OwnedField::new(
+            Class::Secret,
+            FieldKind::String,
+            ".env",
+            secret,
+        )),
+        [4, 0, 0, 0] => Item::new(Category::Auth).with(OwnedField::new(
+            Class::Secret,
+            FieldKind::Concealed,
+            "seed",
+            secret,
+        )),
+        _ => return None,
+    };
+
+    let packed = item.pack().ok()?;
+    let name_bytes = name.as_bytes();
+    let name_len = u8::try_from(name_bytes.len()).ok()?;
+    let mut new_plain = Vec::with_capacity(2 + name_bytes.len() + packed.len());
+    new_plain.push(item.category.wire());
+    new_plain.push(name_len);
+    new_plain.extend_from_slice(name_bytes);
+    new_plain.extend_from_slice(&packed);
+
+    let total = new_plain.len();
+    let mut out_buf = vec![0u8; NONCE_LEN + total + TAG_LEN];
+    out_buf[NONCE_LEN..NONCE_LEN + total].copy_from_slice(&new_plain);
+    let sealed_len = vault::seal_in_place(key, &mut BackupRng, &aad, &mut out_buf, total)?;
+    out_buf.truncate(sealed_len);
+    Some(out_buf)
+}
+
 /// Every item in `path` onto the device; how many there were. The items go back sealed,
 /// and the device opens them - except for a backup written before items existed, which
 /// this side converts first, because the device no longer speaks the old shape.
 pub fn import(dev: &mut Device, path: &Path, pass: Passphrase<'_>) -> Result<Restored, Error> {
     let (head, items) = read(&source(path)?)?;
+    let mut mem = vec![Block::new(); KDF_BLOCKS];
+    let key = vault::backup_key(pass, &head.salt, head.cost, &mut mem);
+    let converted: Vec<Vec<u8>> = match key {
+        Some(k) => items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let idx = u32::try_from(i).unwrap_or(0);
+                convert_legacy_item(&k, idx, item).unwrap_or_else(|| item.clone())
+            })
+            .collect(),
+        None => items,
+    };
+
     dev.import_begin(pass, head)?;
-    for item in &items {
+    for item in &converted {
         dev.import_item(item)?;
     }
     dev.import_end()?;
     Ok(Restored {
-        count: items.len(),
+        count: converted.len(),
         skipped: Vec::new(),
     })
 }

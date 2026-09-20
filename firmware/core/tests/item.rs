@@ -250,3 +250,37 @@ fn an_empty_item_is_a_valid_item() {
     assert_eq!(item.fields().count(), 0);
     assert!(item.first(Class::Secret).is_none());
 }
+
+#[test]
+fn an_item_with_corrupt_second_field_is_refused() {
+    let mut bytes = buf();
+    let mut w = Writer::new(&mut bytes, Category::Login).expect("room");
+    let f1 = field(Class::Open, b"username", b"alice");
+    let f2 = field(Class::Secret, b"password", b"hunter2");
+    assert!(w.push(&f1));
+    assert!(w.push(&f2));
+    let n = w.finish();
+    assert!(Item::parse(&bytes[..n]).is_some());
+
+    let second_field_start = 2 + f1.packed_len();
+    for cut in second_field_start..n {
+        assert!(
+            Item::parse(&bytes[..cut]).is_none(),
+            "cut at {cut} inside second field must not parse"
+        );
+    }
+
+    let mut bad_class = bytes[..n].to_vec();
+    bad_class[second_field_start] = 99;
+    assert!(
+        Item::parse(&bad_class).is_none(),
+        "invalid class in second field must not parse"
+    );
+
+    let mut bad_kind = bytes[..n].to_vec();
+    bad_kind[second_field_start + 1] = 99;
+    assert!(
+        Item::parse(&bad_kind).is_none(),
+        "invalid kind in second field must not parse"
+    );
+}

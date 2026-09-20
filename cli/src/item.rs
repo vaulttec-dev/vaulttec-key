@@ -46,6 +46,14 @@ impl OwnedField {
     pub fn text(&self) -> Zeroizing<String> {
         Zeroizing::new(String::from_utf8_lossy(&self.value).into_owned())
     }
+
+    /// The value as valid UTF-8 text, or an error if the value is binary or invalid UTF-8.
+    pub fn try_text(&self) -> Result<Zeroizing<String>, Error> {
+        let s = std::str::from_utf8(&self.value).map_err(|_| {
+            Error::Value(format!("field '{}' contains non-UTF-8 bytes", self.label))
+        })?;
+        Ok(Zeroizing::new(s.to_string()))
+    }
 }
 
 /// An item: what it is, and what it holds.

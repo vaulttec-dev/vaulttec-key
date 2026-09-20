@@ -25,18 +25,26 @@ impl Resolved {
     /// from. Nothing else in the item, unless the caller adds it.
     #[must_use]
     pub fn item(&self) -> Item {
-        Item::new(Category::Login).with(seed_field(self.params, &self.secret))
+        Item::new(Category::Login)
+            .with(seed_field(self.params, &self.secret).expect("secret is verified non-empty"))
     }
 }
 
 /// A seed field: `algo | digits | period | secret`. The parameters travel with the
 /// secret because the device has no other place to keep them, and they are not a
 /// secret themselves - a code's shape is public.
-#[must_use]
-pub fn seed_field(params: Params, secret: &[u8]) -> OwnedField {
+pub fn seed_field(params: Params, secret: &[u8]) -> Result<OwnedField, Error> {
+    if secret.is_empty() {
+        return Err(Error::Value("OTP secret cannot be empty".into()));
+    }
     let mut value = Zeroizing::new(params.wire().to_vec());
     value.extend_from_slice(secret);
-    OwnedField::new(Class::Seed, FieldKind::Otp, OTP_LABEL, &value)
+    Ok(OwnedField::new(
+        Class::Seed,
+        FieldKind::Otp,
+        OTP_LABEL,
+        &value,
+    ))
 }
 
 /// The parameters and the secret back out of a seed field's value.
@@ -81,6 +89,9 @@ pub fn decode_base32(s: &str) -> Result<Zeroizing<Vec<u8>>, Error> {
             .map(|c| c.to_ascii_uppercase())
             .collect(),
     );
+    if clean.is_empty() {
+        return Err(Error::Value("secret cannot be empty".into()));
+    }
     data_encoding::BASE32_NOPAD
         .decode(clean.as_bytes())
         .map(Zeroizing::new)
@@ -221,7 +232,7 @@ pub fn selftest(
 ) -> Result<bool, Error> {
     let name = "_selftest";
     let secret = decode_base32(TEST_SECRET)?;
-    let item = Item::new(Category::Login).with(seed_field(Params::DEFAULT, &secret));
+    let item = Item::new(Category::Login).with(seed_field(Params::DEFAULT, &secret)?);
     dev.put(name, &item, true)?;
     report(&format!("  press {button} when the light turns amber"));
     let now = crate::device::now();

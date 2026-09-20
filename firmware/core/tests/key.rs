@@ -445,7 +445,7 @@ fn value<K: DeviceKey>(dev: &mut Key<K>, n: &str, reach: Reach, label: &str) -> 
 
 fn code<K: DeviceKey>(dev: &mut Key<K>, n: &str, t: u64) -> Result<String, Fail> {
     let mut out = [0u8; 8];
-    let len = dev.code(name(n), t, &mut out)?;
+    let (len, _) = dev.code(name(n), t, &mut out)?;
     Ok(String::from_utf8_lossy(&out[..len]).into_owned())
 }
 
@@ -567,6 +567,22 @@ fn the_chip_key_changes_every_derived_key() {
         .expect("derives with one");
     assert_ne!(a.dek, b.dek, "the same PIN and salt, a different data key");
     assert_ne!(a.kek, b.kek, "and a different verifier key");
+    assert!(
+        mem.iter().all(|b| b.as_ref().iter().all(|w| *w == 0)),
+        "the working memory is scrubbed"
+    );
+    let mut short = vec![Block::new(); 8];
+    assert!(
+        vault::derive(
+            pin("12345678"),
+            &salt,
+            Cost::CURRENT,
+            &mut plain,
+            &mut short
+        )
+        .is_none(),
+        "too little memory is an error, not a cheaper derivation"
+    );
 }
 
 // --- what may exist at all -----------------------------------------------------------
@@ -1029,7 +1045,7 @@ fn a_seed_leaves_only_under_the_export_gesture() {
 }
 
 #[test]
-fn a_class_rewritten_in_flash_hands_over_nothing() {
+fn a_category_rewritten_in_flash_hands_over_nothing() {
     let flash = MemFlash::blank();
     let mut dev = tapping(&flash);
     dev.pin_set(pin("12345678")).expect("sets the PIN");
@@ -1042,8 +1058,7 @@ fn a_class_rewritten_in_flash_hands_over_nothing() {
     )
     .expect("stores");
 
-    // The class lives inside the sealed item, so there is no plaintext class byte to
-    // rewrite. The category is plaintext - and under the tag. An attacker with the
+    // The category is plaintext in the index - and under the AEAD tag. An attacker with the
     // flash tools rewrites it and repairs the CRC, because a CRC catches damage, not
     // an attack; what must stop them is the tag.
     let name_at = flash.find(b"rfc").expect("the name is in the image");
@@ -1063,6 +1078,44 @@ fn a_class_rewritten_in_flash_hands_over_nothing() {
         code(&mut dev, "rfc", 59),
         Err(Fail::Internal),
         "and no code comes out of it either"
+    );
+}
+
+#[test]
+fn a_class_rewritten_in_flash_hands_over_nothing() {
+    let flash = MemFlash::blank();
+    let mut dev = tapping(&flash);
+    dev.pin_set(pin("12345678")).expect("sets the PIN");
+    put(
+        &mut dev,
+        "rfc",
+        Category::Login,
+        &totp_item(b"12345678901234567890"),
+        false,
+    )
+    .expect("stores");
+
+    // The class lives inside the sealed item body. An attacker tampering with the
+    // ciphertext byte where the class resides and repairing the CRC cannot forge
+    // access: the AEAD authentication fails.
+    let name_at = flash.find(b"rfc").expect("the name is in the image");
+    let class_at = name_at + 4 + u32::try_from(vault::NONCE_LEN).expect("12 fits u32");
+    flash.patch(class_at, &[Class::Open.wire()]);
+    flash.repair_crc(LAYOUT.state_a);
+    flash.repair_crc(LAYOUT.state_b);
+
+    let mut dev = tapping(&flash);
+    dev.pin_unlock(pin("12345678"))
+        .expect("the image checks out: CRC repaired");
+    assert_eq!(
+        get(&mut dev, "rfc", Reach::Open),
+        Err(Fail::Internal),
+        "tampered class in ciphertext fails AEAD verification"
+    );
+    assert_eq!(
+        code(&mut dev, "rfc", 59),
+        Err(Fail::Internal),
+        "and no code comes out of a tampered item"
     );
 }
 

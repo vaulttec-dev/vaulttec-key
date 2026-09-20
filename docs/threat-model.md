@@ -14,8 +14,9 @@ A USB key on an ESP32-C6 running its own firmware (`firmware/core` plus a board
 directory). It stores TOTP secrets, passwords and project `.env` files under
 AES-256-GCM, keyed from an 8-digit PIN that is never stored. Every code, password and
 `.env` requires a physical button press; eight wrong PINs in a row wipe every secret.
-The protocol has no "read the TOTP secret" command; passwords and `.env` files do pass
-through the computer. The only other path a secret takes out is the encrypted backup below.
+A TOTP seed leaves the key in the clear only under an explicit double tap (`vkey export` or
+`vkey get --seed`). Routine code generation never reveals seeds. Passwords and `.env` files
+do pass through the computer. The only other path a secret takes out is the encrypted backup below.
 
 **This is not a secure element and not a certified device.** It is a general-purpose
 microcontroller. JTAG is disabled by eFuse, the data key passes through an eFuse HMAC
@@ -35,16 +36,14 @@ flowchart TD
   DK --> KEK["KEK"]
   KEK --> DEK["DEK = HMAC(KEK, 'vaultkey/dek/v1')"]
   KEK --> VER["verifier = HMAC(KEK, 'vaultkey/verify/v1')"]
-  DEK --> ENV["env key, random; sealed under DEK<br/>in the image header"]
-  DEK --> ENTRIES["entries, AES-256-GCM<br/>AAD = name + kind"]
-  ENV --> BLOBS[".env blobs, AES-256-GCM"]
+  DEK --> ITEMS["items, AES-256-GCM<br/>AAD = name + category"]
   PASS["backup passphrase<br/>12-128 bytes"] --> BA["Argon2id, fresh salt<br/>NO chip key"]
   BA --> BK["backup key -> .vkb items"]
 
   classDef ram fill:#eef,stroke:#557;
   classDef nvm fill:#efe,stroke:#575;
-  class PIN,PRE,KEK,DEK,VER,ENV,BK,PASS ram
-  class SALT,ENTRIES,BLOBS nvm
+  class PIN,PRE,KEK,DEK,VER,BK,PASS ram
+  class SALT,ITEMS nvm
 ```
 
 Blue exists only in RAM while unlocked and is zeroized on lock; green lives in flash.
@@ -57,7 +56,7 @@ An unlock is checked against the verifier; nothing derived from the PIN is store
 | Not `scrypt`, not `balloon-hash` | `scrypt` needs `alloc`; `balloon-hash` doubles the crypto crates |
 | PIN exactly 8 digits (0.9; was 6–8) | The counter can be erased through download mode, so the real cost of a guess is one firmware unlock, ~1.3 s. That is a fortnight for six digits, five months for seven and four years for eight — the only lever is length, because a slower KDF makes every honest unlock slower too. A PIN of the wrong length is refused before the wire and costs no attempt |
 | Chip key as a trait, `hal::DeviceKey` | The board supplies `esp_hal::hmac` when `KEY_PURPOSE_0 = HMAC_UP` (`ChipKey::detect`), else `Unbound`; the header records the binding, so firmware answering differently returns `Incompatible` instead of burning attempts |
-| Kind in the AAD with the name | The kind sits in flash as plaintext; without it one rewritten byte plus CRC would turn a TOTP secret into a "password" the reveal gesture hands out |
+| Category in the AAD with the name | The category sits in flash as plaintext; without it one rewritten byte plus CRC would turn a TOTP item into a login item the reveal gesture hands out |
 
 The eFuse burn of 2026-09-08 put 32 bytes from `/dev/urandom` into `BLOCK_KEY0`, purpose
 `HMAC_UP`, read and write disabled, and set `DIS_USB_JTAG` and `DIS_PAD_JTAG` = 1. No copy
@@ -70,7 +69,7 @@ before the burn became `Incompatible` and was wiped.
 |---|---|---|
 | Tap | code, the secret fields of an item, a `.env`, a `vkey auth` login | amber |
 | Hold 5 s | wipe | red |
-| Double tap, 800 ms window | encrypted backup, **and an export to 1Password** | blue |
+| Double tap, 800 ms window | encrypted backup, **and an export or seed readout** | blue |
 
 A tap never wipes and never exports; a hold never exports; a double tap never wipes. One
 gesture would defend badly: a hostile host asks for a wipe exactly when the owner expects

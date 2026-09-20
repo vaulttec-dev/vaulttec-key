@@ -91,12 +91,12 @@ into the image, which gives two copies of ~217 KB.
 
 ## The protocol
 
-An item can be several kilobytes, so the commands that carry one are streamed, exactly
-as `ExportBegin`/`ExportNext` already are:
+An item fits within the 8256-byte frame buffer (`ITEM_MAX` = 8192 bytes), so `ItemPut` and
+`ItemGet` operate in a single frame:
 
 ```
-ItemGet    name          -> field count, then ItemNext per field, classes obeyed
-ItemPut    name          -> ItemField per field, then ItemEnd; written as one image
+ItemGet    name, reach          -> [category, present] ++ packed item bytes
+ItemPut    name, category, flags, packed item bytes -> OK
 ```
 
 `List` keeps returning name and category only - it is the shell's tick, and it must stay

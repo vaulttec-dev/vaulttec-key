@@ -203,8 +203,7 @@ pub(crate) fn item_of(detail: &OpItemDetail) -> Result<(Item, Vec<String>), Erro
 
     for f in &detail.fields {
         let Some(raw) = &f.value else { continue };
-        let val = raw.trim();
-        if val.is_empty() {
+        if raw.trim().is_empty() {
             continue;
         }
         let label = if f.label.is_empty() { &f.id } else { &f.label };
@@ -217,20 +216,32 @@ pub(crate) fn item_of(detail: &OpItemDetail) -> Result<(Item, Vec<String>), Erro
             continue;
         }
 
-        let is_otp = f.field_type.eq_ignore_ascii_case("OTP") || val.starts_with("otpauth://");
+        let is_otp =
+            f.field_type.eq_ignore_ascii_case("OTP") || raw.trim().starts_with("otpauth://");
         let field = if is_otp {
-            match totp::resolve(val, Some(&detail.title), None, None, false) {
-                Ok(r) => totp::seed_field(r.params, &r.secret),
+            match totp::resolve(raw.trim(), Some(&detail.title), None, None, false) {
+                Ok(r) => match totp::seed_field(r.params, &r.secret) {
+                    Ok(sf) => sf,
+                    Err(e) => {
+                        notes.push(format!("'{label}': {e}"));
+                        continue;
+                    }
+                },
                 Err(e) => {
                     notes.push(format!("'{label}': {e}"));
                     continue;
                 }
             }
         } else {
-            let kind = field_kind_of(&f.field_type);
-            // `purpose` is 1Password's own word for what a field is for, and a NOTES
-            // field is text that may be long; everything else follows its type.
-            let class = if f.purpose.as_deref() == Some("PASSWORD") {
+            let mut kind = field_kind_of(&f.field_type);
+            if f.purpose.as_deref() == Some("PASSWORD")
+                && (f.field_type.is_empty() || kind == FieldKind::String)
+            {
+                kind = FieldKind::Concealed;
+            }
+            // `purpose` is 1Password's own word for what a field is for, and both
+            // PASSWORD and NOTES fields hold secrets that must not leak without a tap.
+            let class = if matches!(f.purpose.as_deref(), Some("PASSWORD" | "NOTES")) {
                 Class::Secret
             } else {
                 class_of(kind)
@@ -240,15 +251,7 @@ pub(crate) fn item_of(detail: &OpItemDetail) -> Result<(Item, Vec<String>), Erro
                 kind,
                 section: section.to_string(),
                 label: label.clone(),
-                value: Zeroizing::new(
-                    if f.purpose.as_deref() == Some("NOTES") {
-                        raw.trim_end_matches('\r')
-                    } else {
-                        val
-                    }
-                    .as_bytes()
-                    .to_vec(),
-                ),
+                value: Zeroizing::new(raw.trim_end_matches('\r').as_bytes().to_vec()),
             }
         };
         item.fields.push(field);
@@ -1164,10 +1167,14 @@ fn item_json(name: &str, category: &str, item: &Item) -> Result<Zeroizing<String
     let mut fields = Vec::new();
     let mut urls = Vec::new();
     for f in &item.fields {
-        // A URL is a field here and a list there.
-        if f.kind == FieldKind::Url {
+        // A top-level URL is a field here and a list there. Custom URL fields with a section
+        // or a custom label remain in fields.
+        if f.kind == FieldKind::Url
+            && f.section.is_empty()
+            && (f.label == "website" || f.label == "url")
+        {
             urls.push(serde_json::json!({
-                "href": f.text().as_str(),
+                "href": f.try_text()?.as_str(),
                 "primary": f.label == "website",
             }));
             continue;
@@ -1176,12 +1183,17 @@ fn item_json(name: &str, category: &str, item: &Item) -> Result<Zeroizing<String
         let value = if f.class == Class::Seed {
             totp::seed_uri(name, &f.value)?
         } else {
-            f.text()
+            f.try_text()?
+        };
+        let kind = if f.class == Class::Secret && f.kind == FieldKind::String {
+            FieldKind::Concealed
+        } else {
+            f.kind
         };
         let mut field = serde_json::Map::new();
         field.insert("id".into(), f.label.clone().into());
         field.insert("label".into(), f.label.clone().into());
-        field.insert("type".into(), field_kind_name(f.kind).into());
+        field.insert("type".into(), field_kind_name(kind).into());
         field.insert("value".into(), value.as_str().into());
         if !f.section.is_empty() {
             field.insert(

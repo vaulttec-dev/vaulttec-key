@@ -31,7 +31,7 @@ tap the BOOT button on the board...
 ```
 
 Nothing came back without a press, and the TOTP secret behind that code has no way out of
-the device at all — there is no command for it.
+the device under routine use — only an explicit export under a double tap reads it back.
 
 ## What it is
 
@@ -43,8 +43,9 @@ the device at all — there is no command for it.
   try, which is four years for eight digits and a fortnight for six. JTAG is disabled; Secure Boot
   v2 (RSA-3072) is on; Flash Encryption is deliberately not used.
 - Every code, password and `.env` needs a button gesture. Eight wrong PINs wipe everything.
-- A TOTP secret goes in once and never comes out in the clear — there is no command for it. The one
-  way out is `vkey backup`, which reseals every item under a backup passphrase.
+- A TOTP secret leaves the key in the clear only under an explicit double tap (`vkey export` or
+  `vkey get --seed`). Routine use returns only codes. `vkey backup` reseals every item under a
+  backup passphrase without revealing secrets.
 - Everything, `list` included, needs the PIN — except a `vkey auth` login, a tap alone; the key
   re-locks after two idle minutes. Secrets and
   PINs are never arguments or environment variables — hidden prompt or stdin.
@@ -149,7 +150,7 @@ line to add by hand.
 |---|---|---|
 | Tap | amber | one TOTP code, the secret fields of one item, one `.env`, or one `vkey auth` login |
 | Hold 5 s | red | factory wipe: every secret and the PIN |
-| Double tap | blue | the encrypted backup file, or an export back into 1Password |
+| Double tap | blue | the encrypted backup file, or an export / seed readout |
 
 A tap never wipes and never exports, so a hostile host cannot swap a code request for a
 wipe or an export: the gesture the owner makes for one satisfies neither of the others.
@@ -161,7 +162,7 @@ in `docs/threat-model.md`.
 |---|---|
 | Items (every category together) | 256 |
 | Fields per item | 32 |
-| One field | 8128 bytes — a `.env`, an SSH key, a note |
+| One field | 8056 bytes — a `.env`, an SSH key, a note |
 | One item | 8192 bytes, packed |
 | The vault | ~210 KB, two copies; a write costs what the vault holds, not what it might |
 | Item name | 32 bytes; names are one namespace |

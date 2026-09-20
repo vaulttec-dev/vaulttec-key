@@ -229,9 +229,14 @@ impl<P: Port, C: Clock> Proto<P, C> {
                 let Ok(time) = <[u8; 8]>::try_from(rest) else {
                     return self.reject(Malformed::Len);
                 };
-                let mut code = Zeroizing::new([0u8; 8]);
-                match dev.code(name, u64::from_le_bytes(time), &mut code) {
-                    Ok(n) => self.respond(OK, &code[..n]),
+                let mut code = Zeroizing::new([0u8; 9]);
+                let mut out = [0u8; 8];
+                match dev.code(name, u64::from_le_bytes(time), &mut out) {
+                    Ok((n, period)) => {
+                        code[..n].copy_from_slice(&out[..n]);
+                        code[n] = period;
+                        self.respond(OK, &code[..=n]);
+                    }
                     Err(f) => self.fail(f),
                 }
             }
@@ -254,7 +259,10 @@ impl<P: Port, C: Clock> Proto<P, C> {
                 let Some((name, rest)) = take_name(p) else {
                     return self.reject(Malformed::Len);
                 };
-                let Some(reach) = rest.first().copied().and_then(reach_of) else {
+                let Some(&reach_byte) = rest.first() else {
+                    return self.reject(Malformed::Len);
+                };
+                let Some(reach) = reach_of(reach_byte) else {
                     return self.reject(Malformed::Arg);
                 };
                 // Answered straight out of the device's buffer: the only copy of those

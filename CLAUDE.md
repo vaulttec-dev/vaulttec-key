@@ -155,7 +155,7 @@ the protocol and logs — hence the `VTC2` magic word in frames. Pins and pitfal
 - **A field's class decides what may leave the device**, not the item's category
   (2026-09-19, maintainer's decision; `docs/items-v2.md`). An item is a name, a category
   and up to 32 fields; a field is `class | kind | section | label | value`, the value up
-  to `VALUE_MAX` = 8128 bytes and the packed item up to `ITEM_MAX` = 8192. `Open` needs
+  to `VALUE_MAX` = 8056 bytes and the packed item up to `ITEM_MAX` = 8192. `Open` needs
   the PIN alone, `Secret` a tap, `Seed` a tap for the code it computes and the double tap
   for the seed itself. The host names a reach per request and gets only those fields; an
   unknown reach byte is refused, never rounded down. The single `match` on class lives in

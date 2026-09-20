@@ -7,6 +7,7 @@
 
 use std::fmt;
 use std::io::{Read, Write};
+use std::ops::Deref;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -64,6 +65,56 @@ impl Shape {
     #[must_use]
     pub const fn has_secret(self) -> bool {
         self.0 & HAS_SECRET != 0
+    }
+}
+
+/// A TOTP code and the period it stays valid for, as returned by the key.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Code {
+    pub text: String,
+    pub period: u8,
+}
+
+impl Deref for Code {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl fmt::Display for Code {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.text)
+    }
+}
+
+impl PartialEq<str> for Code {
+    fn eq(&self, other: &str) -> bool {
+        self.text == other
+    }
+}
+
+impl PartialEq<&str> for Code {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
+}
+
+impl PartialEq<String> for Code {
+    fn eq(&self, other: &String) -> bool {
+        &self.text == other
+    }
+}
+
+impl PartialEq<Code> for &str {
+    fn eq(&self, other: &Code) -> bool {
+        *self == other.text
+    }
+}
+
+impl PartialEq<Code> for String {
+    fn eq(&self, other: &Code) -> bool {
+        self == &other.text
     }
 }
 
@@ -336,6 +387,16 @@ pub fn login_item(login: &str, password: &str, note: &str) -> Result<Item, Error
     if password.is_empty() {
         return Err(Error::Value("the password must not be empty".into()));
     }
+    if login.chars().any(char::is_control) {
+        return Err(Error::Value(
+            "the login must not contain control characters".into(),
+        ));
+    }
+    if password.chars().any(char::is_control) {
+        return Err(Error::Value(
+            "the password must not contain control characters".into(),
+        ));
+    }
     let mut item = Item::new(Category::Login).with(crate::item::OwnedField::new(
         Class::Secret,
         FieldKind::Concealed,
@@ -560,11 +621,18 @@ impl Device {
     }
 
     /// Current code, after the tap. The device has no clock; we send the time.
-    pub fn code(&mut self, name: &str, at: Option<u64>) -> Result<String, Error> {
+    pub fn code(&mut self, name: &str, at: Option<u64>) -> Result<Code, Error> {
         let t = at.unwrap_or_else(now);
         let mut p = name_bytes(name)?;
         p.extend_from_slice(&t.to_le_bytes());
-        Ok(String::from_utf8_lossy(&self.request(Cmd::Code, &p)?).into_owned())
+        let body = self.request(Cmd::Code, &p)?;
+        let (text, period) = if body.len() == 7 || body.len() == 9 {
+            let (&period, code) = body.split_last().ok_or(Error::Device(BAD_LEN))?;
+            (String::from_utf8_lossy(code).into_owned(), period)
+        } else {
+            (String::from_utf8_lossy(&body).into_owned(), 30)
+        };
+        Ok(Code { text, period })
     }
 
     /// `challenge` signed with the auth secret `name`, after a tap; no PIN needed.

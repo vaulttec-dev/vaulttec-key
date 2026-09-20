@@ -421,7 +421,8 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
     ) -> Result<(), Fail> {
         let dek = self.dek()?;
         self.load()?;
-        if Item::parse(plain).is_none() {
+        let item = Item::parse(plain).ok_or(Fail::BadArg)?;
+        if item.category() != category {
             return Err(Fail::BadArg);
         }
         let at = self.index.find(name);
@@ -594,13 +595,13 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         name: Name<'_>,
         unix_time: u64,
         out: &mut [u8; 8],
-    ) -> Result<usize, Fail> {
+    ) -> Result<(usize, u8), Fail> {
         let dek = self.dek()?;
         let r = self.code_into(&dek, name, unix_time, out);
         self.buf.zeroize();
-        let n = r?;
+        let (n, period) = r?;
         self.touch();
-        Ok(n)
+        Ok((n, period))
     }
 
     fn code_into(
@@ -609,7 +610,7 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         name: Name<'_>,
         unix_time: u64,
         out: &mut [u8; 8],
-    ) -> Result<usize, Fail> {
+    ) -> Result<(usize, u8), Fail> {
         let (n, _) = self.open_named(dek, name)?;
         if !ui::await_confirmation(&mut self.ui, &self.clock, TOUCH_TIMEOUT_MS) {
             return Err(Fail::Refused);
@@ -622,7 +623,8 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
             .split_first_chunk::<{ Params::WIRE_LEN }>()
             .ok_or(Fail::BadArg)?;
         let params = Params::from_wire(*params).ok_or(Fail::BadArg)?;
-        Ok(oath::totp(params, secret, unix_time, out))
+        let len = oath::totp(params, secret, unix_time, out);
+        Ok((len, params.period.get()))
     }
 
     /// The host's challenge signed with the auth item called `name`, after a tap - the

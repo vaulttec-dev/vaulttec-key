@@ -415,10 +415,11 @@ fn run_list(dev: &mut Device, long: bool) -> Result<u8, Error> {
         }
         // The open reach costs the PIN and no gesture, so a whole vault can be listed
         // this way; an auth item refuses to be read at all and is reported as it lists.
-        let Ok((open, shape)) = dev.get_with_shape(&e.name, Reach::Open) else {
+        if e.category == Category::Auth {
             println!("{}\t{}\t\t", e.name, item::category_name(e.category));
             continue;
-        };
+        }
+        let (open, shape) = dev.get_with_shape(&e.name, Reach::Open)?;
         let login = open
             .by_label("username")
             .or_else(|| open.by_label("email"))
@@ -821,49 +822,60 @@ fn run_get(dev: &mut Device, version: &str, name: &str, copy: bool) -> Result<u8
         return Ok(0);
     }
 
-    if shape.has_seed() {
-        eprintln!("tap {button} on the board...");
-        let code = dev.code(name, None)?;
-        let remaining = totp::seconds_left(device::Params::DEFAULT);
-        println!(
-            "{code}   ({remaining}s left){}",
-            if copy_to_clipboard(&code, None) {
-                "  copied"
-            } else {
-                ""
-            }
-        );
-        return Ok(0);
-    }
-
     for f in &open.fields {
         eprintln!("{}: {}", f.label, f.text().as_str());
     }
-    if !shape.has_secret() {
-        return Ok(0);
-    }
-    eprintln!("tap {button} on the board...");
-    let shown = dev.get(name, Reach::Secret)?;
-    let secret = shown
-        .first(Class::Secret)
-        .ok_or_else(|| Error::Value("nothing behind the tap in this item".into()))?;
-    let text = secret.text();
-    println!("{}", text.as_str());
-    if copy {
-        match copy_secret(&text) {
-            Some(notice) => eprintln!("{notice}"),
-            None => eprintln!("no clipboard tool found (wl-copy, xclip, pbcopy)"),
+
+    if shape.has_secret() {
+        eprintln!("tap {button} on the board...");
+        let shown = dev.get(name, Reach::Secret)?;
+        let secret = shown
+            .first(Class::Secret)
+            .ok_or_else(|| Error::Value("nothing behind the tap in this item".into()))?;
+        let text = secret.text();
+        println!("{}", text.as_str());
+        if copy {
+            match copy_secret(&text) {
+                Some(notice) => eprintln!("{notice}"),
+                None => eprintln!("no clipboard tool found (wl-copy, xclip, pbcopy)"),
+            }
+        }
+        // Whatever else the tap brought - recovery codes, usually - after a blank line, so
+        // the first line of stdout is always the password alone.
+        for f in shown
+            .fields
+            .iter()
+            .filter(|f| f.class == Class::Secret && f.label != secret.label)
+        {
+            println!("\n{}:\n{}", f.label, f.text().as_str());
         }
     }
-    // Whatever else the tap brought - recovery codes, usually - after a blank line, so
-    // the first line of stdout is always the password alone.
-    for f in shown
-        .fields
-        .iter()
-        .filter(|f| f.class == Class::Secret && f.label != secret.label)
-    {
-        println!("\n{}:\n{}", f.label, f.text().as_str());
+
+    if shape.has_seed() {
+        eprintln!(
+            "tap {button} on the board{}...",
+            if shape.has_secret() { " for code" } else { "" }
+        );
+        let code = dev.code(name, None)?;
+        let params = device::Params {
+            period: std::num::NonZeroU8::new(code.period).unwrap_or(device::Params::DEFAULT.period),
+            ..device::Params::DEFAULT
+        };
+        let remaining = totp::seconds_left(params);
+        if shape.has_secret() {
+            eprintln!("code: {code}   ({remaining}s left)");
+        } else {
+            println!(
+                "{code}   ({remaining}s left){}",
+                if copy && copy_to_clipboard(&code, None) {
+                    "  copied"
+                } else {
+                    ""
+                }
+            );
+        }
     }
+
     Ok(0)
 }
 

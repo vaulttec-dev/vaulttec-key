@@ -34,9 +34,8 @@ use crc::{CRC_32_ISO_HDLC, Crc};
 use embedded_storage::nor_flash::NorFlash;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::item::ITEM_MAX;
 use crate::oath::{NAME_MAX, Name, len_u8, len_u16};
-use crate::vault::{Cost, KEY_LEN, OVERHEAD, SALT_LEN};
+use crate::vault::{Cost, KEY_LEN, SALT_LEN};
 
 pub const MAX_ENTRIES: usize = 256;
 pub const MAX_ATTEMPTS: u8 = 8;
@@ -45,10 +44,10 @@ pub const SECTOR: u32 = 4096;
 /// One image copy. Two of these and the attempt counter are the whole store.
 pub const STATE_SECTORS: u32 = 53;
 /// A sealed item with room for the AEAD overhead: what the board's buffer holds.
-pub const ITEM_BUF_LEN: usize = ITEM_MAX + OVERHEAD;
+pub const ITEM_BUF_LEN: usize = (crate::wire::BACKUP_ITEM_MAX + 3) & !3;
 const _: () = assert!(
-    ITEM_BUF_LEN.is_multiple_of(4),
-    "item bodies are written in words"
+    ITEM_BUF_LEN.is_multiple_of(4) && ITEM_BUF_LEN >= crate::wire::BACKUP_ITEM_MAX,
+    "item bodies are written in words and hold the longest backup item"
 );
 
 /// Where the three regions live. Each must start on a sector boundary; `state_a` and
@@ -422,13 +421,16 @@ impl<F: NorFlash> Store<F> {
     fn image_head(&mut self, addr: u32) -> Result<Option<(u32, u32)>, Error<F::Error>> {
         let mut head = [0u8; 16];
         self.read(addr, &mut head)?;
-        if head[..4] != MAGIC {
+        if head[..4] == [0xFF; 4] {
             return Ok(None);
+        }
+        if head[..4] != MAGIC {
+            return Err(Error::Corrupt);
         }
         let seq = u32::from_le_bytes(word(&head[4..8]));
         let used = u32::from_le_bytes(word(&head[8..12]));
         if (used as usize) < Image::HEAD + 4 || used > SECTOR * STATE_SECTORS {
-            return Ok(None);
+            return Err(Error::Corrupt);
         }
         Ok(Some((seq, used)))
     }
@@ -609,9 +611,11 @@ impl<F: NorFlash> Store<F> {
         // How much of the target the image being replaced occupied: what must be erased
         // even if the new image is shorter, so no tail of the old one stays readable.
         // Unreadable contents mean erasing the copy whole - it is not ours to trust.
-        let stale = self
-            .image_head(target)?
-            .map_or(STATE_SECTORS, |(_, used)| sectors_of(used));
+        let stale = match self.image_head(target) {
+            Ok(Some((_, used))) => sectors_of(used),
+            Ok(None) => 0,
+            Err(_) => STATE_SECTORS,
+        };
         let source = current.map(|(_, addr)| addr);
         self.current = None; // nothing is newest until this write is whole
 
@@ -744,7 +748,7 @@ impl<F: NorFlash> Store<F> {
         };
         let (target, body_end, seq, stale) = (s.target, s.at, s.seq, s.stale);
         let used = off32(body_end + 4);
-        self.room(4)?;
+        self.room(0)?;
         let mut head = self
             .saving
             .as_ref()
@@ -767,16 +771,17 @@ impl<F: NorFlash> Store<F> {
         chunk.zeroize();
         self.write(at(target, body_end), &digest.finalize().to_le_bytes())?;
 
-        // Last: with the magic in place the copy becomes the one a reader takes.
-        self.write(target, &*head)?;
-
         let full = sectors_of(used);
         if stale > full {
             self.erase(target + full * SECTOR, stale - full)?;
         }
+
+        // Last: with the magic in place the copy becomes the one a reader takes.
+        self.write(target, &*head)?;
         self.saving = None;
         self.current = Some((seq, target));
-        self.load(index)
+        let _ = self.load(index);
+        Ok(())
     }
 
     // --- failed-attempt counter -------------------------------------------------

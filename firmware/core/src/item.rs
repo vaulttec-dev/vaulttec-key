@@ -23,7 +23,7 @@ pub const LABEL_MAX: usize = 64;
 /// The longest a single field may be. A project's `.env` is the reason it is this big:
 /// it is one field, it used to have a region of its own with 8000 bytes in it, and
 /// shrinking what the key can hold is not something a change of shape may do quietly.
-pub const VALUE_MAX: usize = 8128;
+pub const VALUE_MAX: usize = 8056;
 /// Fields in one item. An Identity - the fattest 1Password category - has twenty.
 pub const FIELDS_MAX: usize = 32;
 /// A packed item, whole: the biggest field plus room for its head, its label and the
@@ -31,8 +31,8 @@ pub const FIELDS_MAX: usize = 32;
 /// overhead, as it held one `.env` blob before.
 pub const ITEM_MAX: usize = 8192;
 const _: () = assert!(
-    VALUE_MAX + 64 <= ITEM_MAX,
-    "an item must hold the biggest field with its head and label"
+    Packed::HEAD + Packed::FIELD_HEAD + LABEL_MAX * 2 + VALUE_MAX <= ITEM_MAX,
+    "an item must hold the biggest field with its head, section and label"
 );
 
 /// What a field may do when the host asks for it. The one thing in this module that is

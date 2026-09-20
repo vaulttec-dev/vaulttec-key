@@ -1178,9 +1178,12 @@ impl Shell {
     fn use_totp(&mut self, name: &str) -> Result<(), Error> {
         self.tap_hint("");
         let code = self.dev()?.code(name, None)?;
-        // The period is the seed's, and a seed needs the export gesture; the usual
-        // thirty seconds is what the countdown assumes, and it is only a countdown.
-        let remaining = totp::seconds_left(crate::device::Params::DEFAULT);
+        let params = crate::device::Params {
+            period: std::num::NonZeroU8::new(code.period)
+                .unwrap_or(crate::device::Params::DEFAULT.period),
+            ..crate::device::Params::DEFAULT
+        };
+        let remaining = totp::seconds_left(params);
         let copied = copy_to_clipboard(&code, None);
         self.line(Color::Reset, "");
         let tail = format!(
@@ -1597,6 +1600,18 @@ impl Shell {
     /// which is why the tap comes first: the item has to come out before it goes in.
     fn edit_fields(&mut self, name: &str) -> Result<(), Error> {
         let (_, shape) = self.dev()?.get_with_shape(name, Reach::Open)?;
+        let reach = if shape.has_seed() {
+            self.tap_hint(" twice to bring the item out for editing");
+            Reach::Seed
+        } else if shape.has_secret() {
+            self.tap_hint(" to bring the item out for editing");
+            Reach::Secret
+        } else {
+            Reach::Open
+        };
+        let mut item = self.dev()?.get(name, reach)?;
+        let mut changed = false;
+
         if shape.has_seed()
             && let Some(source) = self.ask(
                 "new QR text (otpauth://...) or base32 secret, hidden (Enter keeps it): ",
@@ -1604,15 +1619,19 @@ impl Shell {
             )
         {
             let r = totp::resolve(&source, Some(name), None, None, false)?;
-            self.forget_logins(Some(name));
-            let item = r.item();
-            return self.after_prompt(|d| d.put(name, &item, true));
+            let new_seed = totp::seed_field(r.params, &r.secret)?;
+            if let Some(seed_f) = item.fields.iter_mut().find(|f| f.class == Class::Seed) {
+                *seed_f = new_seed;
+            } else {
+                item.fields.push(new_seed);
+            }
+            changed = true;
         }
 
-        self.tap_hint(" to bring the item out for editing");
-        let mut item = self.dev()?.get(name, Reach::Secret)?;
-        let mut changed = false;
         for f in &mut item.fields {
+            if f.class == Class::Seed {
+                continue;
+            }
             let current = f.text();
             let label = if f.class == Class::Secret {
                 format!("{} (Enter keeps it, hidden): ", f.label)
