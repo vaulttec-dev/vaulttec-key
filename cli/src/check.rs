@@ -17,10 +17,11 @@ use ed25519_dalek::SigningKey;
 use zeroize::Zeroizing;
 
 use crate::device::{
-    AUTH_CHALLENGE_LEN, AUTH_SECRET_LEN, Device, EnvBlob, Error, Kind, MAX_ATTEMPTS, Params,
-    passphrase, password_blob, pin,
+    AUTH_CHALLENGE_LEN, AUTH_SECRET_LEN, Category, Class, Device, EnvBlob, Error, FieldKind,
+    MAX_ATTEMPTS, Params, Reach, login_item, passphrase, pin,
 };
-use crate::totp::{TEST_SECRET, decode_base32, selftest};
+use crate::item::{Item, OwnedField};
+use crate::totp::{TEST_SECRET, decode_base32, seed_field, selftest};
 use crate::{auth, backup, boards};
 
 const PIN: &str = "12345678";
@@ -30,11 +31,12 @@ const PASSWORD: &str = "correct horse battery staple";
 const NOTE: &str = "recovery:\n1234-5678\n8765-4321";
 
 /// A service's usual credential, with a chosen period.
-const fn totp(period: u8) -> Kind {
-    Kind::Totp(Params {
+fn totp_item(period: u8, secret: &[u8]) -> Item {
+    let params = Params {
         period: NonZeroU8::new(period).expect("periods here are never zero"),
         ..Params::DEFAULT
-    })
+    };
+    Item::new(Category::Login).with(seed_field(params, secret))
 }
 
 /// Counts failures and prints one line per check.
@@ -171,7 +173,7 @@ fn unprovisioned(d: &mut Device, rep: &mut Report) -> Result<(), Error> {
     );
     rep.expect(
         "add refused before a PIN exists",
-        &d.add("x", b"xxxxxxxxxx", totp(30), false),
+        &d.put("x", &totp_item(30, b"xxxxxxxxxx"), false),
         &Error::Locked,
     );
     rep.expect(
@@ -212,19 +214,18 @@ fn provisioning(d: &mut Device, rep: &mut Report) -> Result<(), Error> {
 /// Adds, refuses a duplicate, replaces; returns the first code for the rekey check.
 fn entries(d: &mut Device, rep: &mut Report) -> Result<String, Error> {
     let secret = decode_base32(TEST_SECRET)?;
-    d.add("t", &secret, totp(30), false)?;
+    d.put("t", &totp_item(30, &secret), false)?;
     rep.check("add", d.list()?.iter().any(|e| e.name == "t"), "");
     rep.expect(
         "duplicate name refused without replace",
-        &d.add("t", &secret, totp(30), false),
+        &d.put("t", &totp_item(30, &secret), false),
         &Error::Exists,
     );
-    d.add("t", &secret, totp(60), true)?;
-    let e = d.list()?.into_iter().find(|e| e.name == "t");
+    d.put("t", &totp_item(60, &secret), true)?;
     rep.check(
-        "replace honoured (period 60)",
-        e.as_ref().map(|e| e.kind) == Some(totp(60)),
-        &format!("{e:?}"),
+        "replace honoured, and it replaced rather than added",
+        d.list()?.iter().filter(|e| e.name == "t").count() == 1,
+        "",
     );
     // A rename re-seals the entry under the new name; the code below proves the
     // secret survived the round trip.
@@ -248,33 +249,55 @@ fn entries(d: &mut Device, rep: &mut Report) -> Result<String, Error> {
 }
 
 fn password(d: &mut Device, rep: &mut Report) -> Result<(), Error> {
-    let blob = password_blob("p", LOGIN, PASSWORD, NOTE)?;
-    d.add("p", &blob, Kind::Password, false)?;
+    d.put("p", &login_item(LOGIN, PASSWORD, NOTE)?, false)?;
     rep.expect(
         "no code from a password",
         &d.code("p", Some(59)),
         &Error::BadArg,
     );
-    rep.expect("no reveal of a TOTP seed", &d.reveal("t"), &Error::BadArg);
-    rep.expect("no login of a TOTP seed", &d.login("t"), &Error::BadArg);
+    let open = d.get("p", Reach::Open)?;
     rep.check(
         "login without a gesture",
-        *d.login("p")? == LOGIN.as_bytes(),
+        open.by_label("username").map(|f| f.text().to_string()) == Some(LOGIN.to_string()),
         "",
     );
+    rep.check(
+        "and nothing but the login",
+        open.fields.iter().all(|f| f.class == Class::Open),
+        "",
+    );
+    // A seed belongs to no reach below Seed: the item comes back without it.
+    let totp_open = d.get("t", Reach::Open)?;
+    rep.check(
+        "no seed among a TOTP entry's open fields",
+        totp_open.fields.is_empty(),
+        "",
+    );
+
     d.rename("p", "p2")?;
     rep.check(
         "login intact after a rename",
-        *d.login("p2")? == LOGIN.as_bytes(),
+        d.get("p2", Reach::Open)?
+            .by_label("username")
+            .map(|f| f.text().to_string())
+            == Some(LOGIN.to_string()),
         "",
     );
     d.rename("p2", "p")?;
+
     rep.tap();
-    let shown = d.reveal("p")?;
+    let shown = d.get("p", Reach::Secret)?;
     rep.check(
-        "password and note revealed after a tap",
-        shown.password_bytes() == Some(PASSWORD.as_bytes())
-            && shown.note() == Some(NOTE.as_bytes()),
+        "password and note after a tap",
+        shown.by_label("password").map(|f| f.text().to_string()) == Some(PASSWORD.to_string())
+            && shown.by_label("notesPlain").map(|f| f.text().to_string()) == Some(NOTE.to_string()),
+        "",
+    );
+    rep.tap();
+    let seedless = d.get("t", Reach::Secret)?;
+    rep.check(
+        "a tap never hands over a seed",
+        seedless.first(Class::Seed).is_none(),
         "",
     );
     Ok(())
@@ -287,41 +310,34 @@ fn env(d: &mut Device, rep: &mut Report) -> Result<Vec<u8>, Error> {
         blob.extend_from_slice(format!("VAR_{i}={}\n", "x".repeat(40)).as_bytes());
     }
     let env = EnvBlob::new(Zeroizing::new(blob.clone()))?;
-    d.env_put("e", &env, false)?;
+    d.put("e", &env.item(), false)?;
     rep.check(
         "env stored and listed as env",
         d.list()?
             .iter()
-            .any(|e| e.name == "e" && e.kind == Kind::Env),
+            .any(|e| e.name == "e" && e.category == Category::Env),
         "",
     );
     rep.expect(
         "duplicate env refused without replace",
-        &d.env_put("e", &env, false),
-        &Error::Exists,
-    );
-    rep.expect(
-        "no entry over an env name",
-        &d.add("e", &decode_base32(TEST_SECRET)?, totp(30), true),
-        &Error::Exists,
-    );
-    rep.expect(
-        "no env over an entry name",
-        &d.env_put("t", &env, true),
+        &d.put("e", &env.item(), false),
         &Error::Exists,
     );
     rep.expect(
         "no code from an env",
         &d.code("e", Some(59)),
-        &Error::NotFound,
+        &Error::BadArg,
     );
-    rep.expect("no env from a password", &d.env_get("p"), &Error::NotFound);
     rep.tap();
-    let shown = d.env_get("e")?;
+    let shown = d.get("e", Reach::Secret)?;
+    let bytes = shown
+        .by_label(".env")
+        .map(|f| f.value.to_vec())
+        .unwrap_or_default();
     rep.check(
         "env revealed whole after a tap",
-        *shown == blob,
-        &format!("{} bytes", shown.len()),
+        bytes == blob,
+        &format!("{} bytes", bytes.len()),
     );
     Ok(blob)
 }
@@ -352,15 +368,23 @@ fn backup(
         &backup::import(d, &dir, passphrase("correct horse battery")?),
         &Error::BadBackup,
     );
-    let n = backup::import(d, &dir, passphrase(PASS)?)?;
-    rep.check("restore", n == 3, &format!("{n} items"));
+    let done = backup::import(d, &dir, passphrase(PASS)?)?;
+    rep.check(
+        "restore",
+        done.count == 3 && done.skipped.is_empty(),
+        &format!("{} items", done.count),
+    );
     let _ = std::fs::remove_file(&dir);
     rep.tap();
     let c = d.code("t", Some(59))?;
     rep.check("code after restore", c == first_code, &c);
     rep.tap();
-    let shown = d.env_get("e")?;
-    rep.check("env after restore", *shown == env_blob, "");
+    let shown = d.get("e", Reach::Secret)?;
+    rep.check(
+        "env after restore",
+        shown.by_label(".env").map(|f| f.value.to_vec()).as_deref() == Some(env_blob),
+        "",
+    );
     Ok(())
 }
 
@@ -373,11 +397,15 @@ fn lock_unlock(d: &mut Device, rep: &mut Report) -> Result<(), Error> {
         &Error::Locked,
     );
     rep.expect(
-        "reveal refused while locked",
-        &d.reveal("p"),
+        "fields refused while locked",
+        &d.get("p", Reach::Secret),
         &Error::Locked,
     );
-    rep.expect("env refused while locked", &d.env_get("e"), &Error::Locked);
+    rep.expect(
+        "even open fields refused while locked",
+        &d.get("p", Reach::Open),
+        &Error::Locked,
+    );
     rep.expect("list refused while locked", &d.list(), &Error::Locked);
     match d.pin_unlock(pin("99999999")?) {
         Err(Error::WrongPin(n)) => rep.check(
@@ -406,8 +434,12 @@ fn rekey(d: &mut Device, rep: &mut Report, first_code: &str, env_blob: &[u8]) ->
         &format!("{first_code} vs {c2}"),
     );
     rep.tap();
-    let again = d.env_get("e")?;
-    rep.check("same env after PIN change", *again == env_blob, "");
+    let again = d.get("e", Reach::Secret)?;
+    rep.check(
+        "same env after PIN change",
+        again.by_label(".env").map(|f| f.value.to_vec()).as_deref() == Some(env_blob),
+        "",
+    );
     d.lock()?;
     rep.expect_with("old PIN no longer works", &d.pin_unlock(pin(PIN)?), |e| {
         matches!(e, Error::WrongPin(_))
@@ -423,7 +455,13 @@ fn rekey(d: &mut Device, rep: &mut Report, first_code: &str, env_blob: &[u8]) ->
 fn auth(d: &mut Device, rep: &mut Report) -> Result<(), Error> {
     const SECRET: [u8; AUTH_SECRET_LEN] = [0x5A; AUTH_SECRET_LEN];
     let bound = d.pin_status()?.chip_bound;
-    let added = d.add("a", &SECRET, Kind::Auth, false);
+    let auth_item = Item::new(Category::Auth).with(OwnedField::new(
+        Class::Secret,
+        FieldKind::Concealed,
+        "seed",
+        &SECRET,
+    ));
+    let added = d.put("a", &auth_item, false);
     if !bound {
         rep.expect(
             "no auth secret without a chip key",

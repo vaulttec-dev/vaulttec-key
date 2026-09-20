@@ -1,5 +1,10 @@
-//! What the key does, independent of how bytes arrive: PIN lifecycle and entries.
+//! What the key does, independent of how bytes arrive: PIN lifecycle and items.
 //! One owner of the flash, the keys, the button, the entropy source and the chip key.
+//!
+//! The rule that matters is here and nowhere else: **a field's class decides what may
+//! leave**. `Open` needs the PIN, `Secret` needs a tap, `Seed` needs the double tap
+//! that a backup needs - a whole secret leaving the key is one act with one gesture.
+//! Categories are labels; classes are the boundary.
 
 use ed25519_dalek::{Signer, SigningKey};
 use embedded_storage::nor_flash::NorFlash;
@@ -7,19 +12,16 @@ use rand_core::{CryptoRng, RngCore};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::hal::{Clock, DeviceKey, Ui};
-use crate::oath::{
-    self, AUTH_SECRET_LEN, ENV_MAX, Entry, Kind, NAME_MAX, Name, SECRET_MAX, len_u8,
-};
-use crate::store::{
-    ENV_BUF_LEN, ENV_SLOTS, Header, MAX_ATTEMPTS, MAX_ENTRIES, Record, State, Store, StoredName,
-};
+use crate::item::{Category, Class, Item, Writer};
+use crate::oath::{self, AUTH_SECRET_LEN, NAME_MAX, Name, Params, len_u8};
+use crate::store::{Header, ITEM_BUF_LEN, Index, MAX_ATTEMPTS, Slot, Store, StoredName};
 use crate::ui;
 use crate::vault::{
     self, BACKUP_AAD, Block, Cost, KEY_LEN, Keys, NONCE_LEN, Passphrase, Pin, SALT_LEN,
 };
 use crate::wire::{
-    AUTH_CHALLENGE_LEN, AUTH_SIGNATURE_LEN, AUTH_SIGNED_PREFIX, BackupHead, Fail, ITEM_MAX,
-    PinStatus,
+    AUTH_CHALLENGE_LEN, AUTH_SIGNATURE_LEN, AUTH_SIGNED_PREFIX, BackupHead, Fail, HAS_OPEN,
+    HAS_SECRET, HAS_SEED, PinStatus,
 };
 
 /// Unlocked and idle this long, the device forgets the key on its own. Two minutes:
@@ -33,20 +35,43 @@ const AUTH_TOUCH_TIMEOUT_MS: u64 = 10_000;
 /// A wipe after five seconds of red: no reflex reaches it.
 const WIPE_HOLD_MS: u64 = 5_000;
 
-/// The board's working buffer: one env blob, sealed or open, or one backup item,
-/// which is a blob with a kind and a name in front and the AEAD overhead behind.
-pub const BUF_LEN: usize = ITEM_MAX;
-const _: () = assert!(BUF_LEN >= ENV_BUF_LEN, "the buffer holds a sealed blob");
+/// The board's working buffer: two item-sized halves. Two, because rewriting the image
+/// carries items across one at a time while the new item waits its turn - one buffer
+/// would have the copying tread on what is being written.
+pub const BUF_LEN: usize = 2 * ITEM_BUF_LEN;
 
 /// A resident copy of the data key that scrubs itself when dropped.
 type Dek = Zeroizing<[u8; KEY_LEN]>;
 
-/// A backup in flight: the passphrase key, and how far it got. Ended by the last
-/// item, by a lock, or by any operation that reloads the table it walks.
+/// Which classes a request may have. The device never returns a field outside it, and
+/// the gesture is decided by the highest class in it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Reach {
+    /// The PIN alone.
+    Open,
+    /// A tap: everything but seeds.
+    Secret,
+    /// The double tap: seeds too - the whole item, as an export or a backup needs it.
+    Seed,
+}
+
+impl Reach {
+    const fn allows(self, class: Class) -> bool {
+        matches!(
+            (self, class),
+            (Reach::Open, Class::Open)
+                | (Reach::Secret, Class::Open | Class::Secret)
+                | (Reach::Seed, _)
+        )
+    }
+}
+
+/// A backup in flight: the passphrase key, and how far it got. Ended by the last item,
+/// by a lock, or by any operation that reloads the index it walks.
 enum Session {
     Export {
         key: Dek,
-        /// The table slot to look at next; the blobs follow the table.
+        /// The index position to look at next.
         slot: usize,
         /// Items handed out so far: the next one's position in the file.
         item: u32,
@@ -54,8 +79,6 @@ enum Session {
     Import {
         key: Dek,
         item: u32,
-        /// Whether the table in RAM differs from flash: `import_end` writes it.
-        dirty: bool,
     },
 }
 
@@ -67,24 +90,24 @@ pub struct Device<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: D
     key: K,
     /// The Argon2 working memory, owned by the board for the life of the program.
     mem: &'m mut [Block],
-    /// The persistent state as last read from flash, owned by the board the same way:
-    /// it is ~80 KiB, and passing it by value once per call level blew the stack.
-    /// Every operation reloads it before looking at it.
-    state: &'m mut State,
-    /// The working buffer, owned by the board too: 8 KiB, held once, and scrubbed at
-    /// the end of every operation that used it.
+    /// Where every item is, as last read from flash. The bodies stay in flash; this is
+    /// ~10 KiB and the board owns it. Every operation reloads it before looking at it.
+    index: &'m mut Index,
+    /// The working buffer, owned by the board too: two item-sized halves, held once,
+    /// and scrubbed at the end of every operation that used it.
     buf: &'m mut [u8; BUF_LEN],
     dek: Option<Dek>,
     backup: Option<Session>,
     last_activity_ms: u64,
 }
 
-/// The front of the buffer, sized as the store's blob functions want it.
-fn env_part(buf: &mut [u8; BUF_LEN]) -> &mut [u8; ENV_BUF_LEN] {
-    let (env, _) = buf
-        .split_first_chunk_mut()
-        .expect("BUF_LEN >= ENV_BUF_LEN, asserted above");
-    env
+/// One class as a bit of the mask an `ItemGet` answers with.
+const fn class_bit(class: Class) -> u8 {
+    match class {
+        Class::Open => HAS_OPEN,
+        Class::Secret => HAS_SECRET,
+        Class::Seed => HAS_SEED,
+    }
 }
 
 /// `BACKUP_AAD` followed by the item's position in the file.
@@ -93,19 +116,6 @@ fn item_aad(item: u32) -> [u8; BACKUP_AAD.len() + 4] {
     aad[..BACKUP_AAD.len()].copy_from_slice(BACKUP_AAD);
     aad[BACKUP_AAD.len()..].copy_from_slice(&item.to_le_bytes());
     aad
-}
-
-/// `kind | name_len | name` at the front of an item's plaintext, which starts after
-/// the nonce; how many bytes that took.
-fn item_prefix(kind: Kind, name: Name<'_>, buf: &mut [u8; BUF_LEN]) -> usize {
-    let name = name.as_bytes();
-    let mut at = NONCE_LEN;
-    buf[at..at + Kind::WIRE_LEN].copy_from_slice(&kind.wire());
-    at += Kind::WIRE_LEN;
-    buf[at] = len_u8(name.len());
-    at += 1;
-    buf[at..at + name.len()].copy_from_slice(name);
-    at + name.len() - NONCE_LEN
 }
 
 impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
@@ -122,7 +132,7 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         clock: C,
         key: K,
         mem: &'m mut [Block],
-        state: &'m mut State,
+        index: &'m mut Index,
         buf: &'m mut [u8; BUF_LEN],
     ) -> Self {
         let now = clock.now_ms();
@@ -133,7 +143,7 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
             clock,
             key,
             mem,
-            state,
+            index,
             buf,
             dek: None,
             backup: None,
@@ -159,13 +169,13 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
     pub fn lock(&mut self) {
         self.dek = None; // Zeroizing scrubs it on drop
         self.backup = None;
+        self.store.save_abort();
         self.buf.zeroize();
     }
 
-    /// Factory reset: every secret and the PIN. Confirmed by the longest hold, never
-    /// by the tap that approves a code. Whoever holds the key can empty it anyway
-    /// (eight wrong PINs, or the flash tools); this protects the owner who did not
-    /// mean to.
+    /// Factory reset: every secret and the PIN. Confirmed by the longest hold, never by
+    /// the tap that approves a code. Whoever holds the key can empty it anyway (eight
+    /// wrong PINs, or the flash tools); this protects the owner who did not mean to.
     pub fn wipe(&mut self) -> Result<(), Fail> {
         if !ui::await_hold(&mut self.ui, &self.clock, TOUCH_TIMEOUT_MS, WIPE_HOLD_MS) {
             return Err(Fail::Refused);
@@ -182,18 +192,19 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
             .ok_or(Fail::Locked)
     }
 
-    /// The persistent state into `self.state`. Unreadable flash is an error, never
-    /// "empty": nothing gets written over it without `wipe`. A backup in flight
-    /// walks the table as it was when it began; reloading ends it.
+    /// The index into `self.index`. Unreadable flash is an error, never "empty":
+    /// nothing gets written over it without `wipe`. A backup in flight walks the index
+    /// as it was when it began; reloading ends it.
     fn load(&mut self) -> Result<(), Fail> {
         self.backup = None;
-        self.store.load(self.state).map_err(|_| Fail::Internal)
+        self.store.save_abort();
+        self.store.load(self.index).map_err(|_| Fail::Internal)
     }
 
     // --- PIN ----------------------------------------------------------------------
 
-    /// Asked every second by the shell's status row: answered from the image heads
-    /// and the attempt words alone, never a full load.
+    /// Asked every second by the shell's status row: answered from the image heads and
+    /// the attempt words alone, never a full load.
     pub fn pin_status(&mut self) -> PinStatus {
         let has_pin = self.store.has_pin().unwrap_or(false);
         let used = self.store.attempts_used().unwrap_or(MAX_ATTEMPTS);
@@ -213,51 +224,34 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         vault::derive(pin, salt, cost, &mut self.key, self.mem).ok_or(Fail::Internal)
     }
 
-    /// New salt and verifier for `pin` into the state, `env_key` sealed under the new
-    /// dek next to them, and the resident key switched to match. The caller saves the
-    /// state; until it does, flash still holds the old PIN.
-    fn install_pin(&mut self, pin: Pin<'_>, env_key: &[u8; KEY_LEN]) -> Result<(), Fail> {
+    /// A header for `pin`, and the resident key switched to match. The caller writes it;
+    /// until it does, flash still holds the old PIN.
+    fn install_pin(&mut self, pin: Pin<'_>) -> Result<Header, Fail> {
         let mut salt = [0u8; SALT_LEN];
         self.rng.fill_bytes(&mut salt);
         let keys = self.derive(pin, &salt, Cost::CURRENT)?;
-        let mut wrapped = [0u8; KEY_LEN + vault::OVERHEAD];
-        vault::seal(
-            &keys.dek,
-            &mut self.rng,
-            vault::ENV_KEY_AAD,
-            env_key,
-            &mut wrapped,
-        )
-        .ok_or(Fail::Internal)?;
-        self.state.header = Some(Header {
+        let header = Header {
             salt,
             cost: Cost::CURRENT,
             bound: self.key.bound(),
             verifier: vault::verifier_of(&keys.kek),
-            env_key: wrapped,
-        });
+        };
         self.dek = Some(Zeroizing::new(keys.dek));
-        Ok(())
-    }
-
-    /// The env key out of the loaded header, under `dek`.
-    fn unwrap_env_key(&self, dek: &[u8; KEY_LEN]) -> Result<Zeroizing<[u8; KEY_LEN]>, Fail> {
-        let hdr = self.state.header.ok_or(Fail::NoPin)?;
-        let mut key = Zeroizing::new([0u8; KEY_LEN]);
-        vault::open(dek, vault::ENV_KEY_AAD, &hdr.env_key, &mut *key).ok_or(Fail::Internal)?;
-        Ok(key)
+        Ok(header)
     }
 
     pub fn pin_set(&mut self, pin: Pin<'_>) -> Result<(), Fail> {
         self.load()?;
-        if self.state.header.is_some() {
+        if self.index.header.is_some() {
             return Err(Fail::PinExists);
         }
         self.store.reset_attempts().map_err(|_| Fail::Internal)?;
-        let mut env_key = Zeroizing::new([0u8; KEY_LEN]);
-        self.rng.fill_bytes(&mut *env_key);
-        self.install_pin(pin, &env_key)?;
-        if self.store.save(self.state).is_err() {
+        let header = self.install_pin(pin)?;
+        let written = self
+            .store
+            .save_begin(Some(&header))
+            .and_then(|()| self.store.save_finish(self.index));
+        if written.is_err() {
             self.lock();
             return Err(Fail::Internal);
         }
@@ -267,11 +261,11 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
 
     pub fn pin_unlock(&mut self, pin: Pin<'_>) -> Result<(), Fail> {
         self.load()?;
-        let Some(hdr) = self.state.header else {
+        let Some(hdr) = self.index.header else {
             return Err(Fail::NoPin);
         };
-        // A vault from a firmware with the other key setup would fail every PIN;
-        // say so instead of spending the attempts.
+        // A vault from a firmware with the other key setup would fail every PIN; say so
+        // instead of spending the attempts.
         if hdr.bound != self.key.bound() {
             return Err(Fail::Incompatible);
         }
@@ -282,8 +276,8 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
             let _ = self.store.wipe();
             return Err(Fail::Wiped);
         }
-        // Spend the attempt before checking, so a power cut during the check cannot
-        // be used to try for free. Restored to the maximum only after success.
+        // Spend the attempt before checking, so a power cut during the check cannot be
+        // used to try for free. Restored to the maximum only after success.
         let used = self.store.spend_attempt().map_err(|_| Fail::Internal)?;
 
         let keys = self.derive(pin, &hdr.salt, hdr.cost)?;
@@ -304,141 +298,297 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         Ok(())
     }
 
-    /// Verifies the old PIN, re-seals every entry and the env key under the new one,
-    /// writes all of it in a single image. A host that found the device unlocked still
-    /// cannot take it over. The env blobs themselves stay as they are: their key did
-    /// not change, only its wrapping.
+    /// Verifies the old PIN, re-seals every item under the new one, writes all of it as
+    /// a single image. A host that found the device unlocked still cannot take it over.
+    /// Auth items are sealed under the chip key, not the PIN: they are carried across
+    /// untouched.
     pub fn pin_change(&mut self, old: Pin<'_>, new: Pin<'_>) -> Result<(), Fail> {
-        self.pin_unlock(old)?; // loads the state too
+        self.pin_unlock(old)?; // loads the index too
         let old_dek = self.dek()?;
-        let env_key = self.unwrap_env_key(&old_dek)?;
-        if let Err(f) = self.install_pin(new, &env_key) {
-            self.lock();
-            return Err(f);
-        }
+        let header = match self.install_pin(new) {
+            Ok(h) => h,
+            Err(f) => {
+                self.lock();
+                return Err(f);
+            }
+        };
         let new_dek = self.dek()?;
-        // Re-sealed in RAM one entry at a time; flash is written only once every
-        // entry made it, so a failure half-way leaves the old PIN and the old image.
-        // Each plaintext `Entry` zeroizes itself as soon as it is sealed again. Auth
-        // secrets are under the chip key, not the PIN: they stay as they are.
-        let mut resealed = true;
-        for slot in self
-            .state
-            .slots
-            .iter_mut()
-            .filter(|r| !r.is_empty() && r.kind != Kind::Auth)
-        {
-            let Some(r) = Self::open_record(&old_dek, slot)
-                .and_then(|e| Self::seal_record(&new_dek, &mut self.rng, &e))
-            else {
-                resealed = false;
-                break;
-            };
-            *slot = r;
-        }
-        if !resealed || self.store.save(self.state).is_err() {
+        let r = self.reseal_all(&old_dek, &new_dek, &header);
+        self.buf.zeroize();
+        if r.is_err() {
+            // Nothing was made visible: the copy being written has no magic word yet.
+            self.store.save_abort();
             self.lock();
             return Err(Fail::Internal);
         }
         Ok(())
     }
 
-    // --- entries ---------------------------------------------------------------
+    /// Every item opened under `old` and sealed under `new`, into one fresh image.
+    fn reseal_all(&mut self, old: &Dek, new: &Dek, header: &Header) -> Result<(), Fail> {
+        self.store
+            .save_begin(Some(header))
+            .map_err(|_| Fail::Internal)?;
+        for i in 0..self.index.len() {
+            let slot = *self.index.get(i).ok_or(Fail::Internal)?;
+            // An auth item's key does not change with the PIN.
+            if slot.category == Category::Auth.wire() {
+                let (_, carry) = self.buf.split_at_mut(ITEM_BUF_LEN);
+                self.store
+                    .save_keep(&slot, carry)
+                    .map_err(|_| Fail::Internal)?;
+                continue;
+            }
+            let n = {
+                let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+                self.store
+                    .save_read(&slot, work)
+                    .map_err(|_| Fail::Internal)?
+            };
+            let name = StoredName::of(slot.name());
+            let opened = {
+                let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+                Self::open_in(old, name.get(), slot.category, &mut work[..n])
+            }
+            .ok_or(Fail::Internal)?;
+            let sealed = {
+                let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+                // The plaintext sits after the nonce, which `seal_in_place` overwrites.
+                work.copy_within(NONCE_LEN..NONCE_LEN + opened, NONCE_LEN);
+                Self::seal_in(new, &mut self.rng, name.get(), slot.category, work, opened)
+            }
+            .ok_or(Fail::Internal)?;
+            let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+            let body = &work[..sealed];
+            self.store
+                .save_put(name.get(), slot.category, body)
+                .map_err(|_| Fail::Internal)?;
+        }
+        self.store
+            .save_finish(self.index)
+            .map_err(|_| Fail::Internal)
+    }
 
-    /// What the AEAD binds a secret to: its name and its kind. The kind sits in flash
-    /// as plaintext; without it under the tag, one rewritten byte would turn a TOTP
-    /// seed into a "password" and hand it out through the reveal gesture.
-    fn aad<'b>(
-        name: Name<'_>,
-        kind: Kind,
-        buf: &'b mut [u8; NAME_MAX + Kind::WIRE_LEN],
-    ) -> &'b [u8] {
+    // --- items ---------------------------------------------------------------------
+
+    /// What the AEAD binds an item to: its name and its category. The category sits in
+    /// flash as plaintext; without it under the tag, one rewritten byte would turn a
+    /// TOTP seed into some other category and change which gesture reaches it.
+    fn aad<'b>(name: Name<'_>, category: u8, buf: &'b mut [u8; NAME_MAX + 1]) -> &'b [u8] {
         let name = name.as_bytes();
         buf[..name.len()].copy_from_slice(name);
-        buf[name.len()..name.len() + Kind::WIRE_LEN].copy_from_slice(&kind.wire());
-        &buf[..name.len() + Kind::WIRE_LEN]
+        buf[name.len()] = category;
+        &buf[..=name.len()]
     }
 
-    fn seal_record(dek: &[u8; KEY_LEN], rng: &mut R, e: &Entry) -> Option<Record> {
-        let mut aad = [0u8; NAME_MAX + Kind::WIRE_LEN];
-        let mut sealed = [0u8; SECRET_MAX + vault::OVERHEAD];
-        let aad = Self::aad(e.name(), e.kind, &mut aad);
-        let n = vault::seal(dek, rng, aad, e.secret(), &mut sealed)?;
-        Record::new(e.name(), e.kind, &sealed[..n])
+    /// Seals `len` plaintext bytes sitting at `NONCE_LEN` in `buf`, in place.
+    fn seal_in(
+        key: &[u8; KEY_LEN],
+        rng: &mut R,
+        name: Name<'_>,
+        category: u8,
+        buf: &mut [u8],
+        len: usize,
+    ) -> Option<usize> {
+        let mut aad = [0u8; NAME_MAX + 1];
+        let aad = Self::aad(name, category, &mut aad);
+        vault::seal_in_place(key, rng, aad, buf, len)
     }
 
-    fn open_record(dek: &[u8; KEY_LEN], r: &Record) -> Option<Entry> {
-        let mut aad = [0u8; NAME_MAX + Kind::WIRE_LEN];
-        let mut plain = Zeroizing::new([0u8; SECRET_MAX]);
-        let aad = Self::aad(r.name(), r.kind, &mut aad);
-        let n = vault::open(dek, aad, r.sealed(), &mut *plain)?;
-        Entry::new(r.name(), r.kind, &plain[..n])
+    /// Opens a sealed item in place; the plaintext then sits at `NONCE_LEN`.
+    fn open_in(key: &[u8; KEY_LEN], name: Name<'_>, category: u8, buf: &mut [u8]) -> Option<usize> {
+        let mut aad = [0u8; NAME_MAX + 1];
+        let aad = Self::aad(name, category, &mut aad);
+        vault::open_in_place(key, aad, buf)
     }
 
-    /// The key a record of `kind` is sealed under: the chip key alone for an auth
+    /// The key an item of this category is sealed under: the chip key alone for an auth
     /// secret, the PIN's for everything else. The one place that decides.
-    fn record_key(&mut self, dek: &[u8; KEY_LEN], kind: Kind) -> Result<Dek, Fail> {
-        match kind {
-            Kind::Auth => vault::auth_key(&mut self.key).ok_or(Fail::Incompatible),
-            Kind::Totp(_) | Kind::Password | Kind::Env => Ok(Zeroizing::new(*dek)),
+    fn item_key(&mut self, dek: &[u8; KEY_LEN], category: u8) -> Result<Dek, Fail> {
+        if category == Category::Auth.wire() {
+            return vault::auth_key(&mut self.key).ok_or(Fail::Incompatible);
         }
+        Ok(Zeroizing::new(*dek))
     }
 
-    /// The stored entry called `name`, decrypted - never an auth secret, which only
-    /// `respond` opens.
-    fn entry(&mut self, dek: &[u8; KEY_LEN], name: Name<'_>) -> Result<Entry, Fail> {
-        self.load()?;
-        let i = self.state.find(name).ok_or(Fail::NotFound)?;
-        let r = &self.state.slots[i];
-        if r.kind == Kind::Auth {
-            return Err(Fail::BadArg);
-        }
-        Self::open_record(dek, r).ok_or(Fail::Internal)
-    }
-
-    /// Whether a blob answers to `name`. Names are one namespace across the table and
-    /// the blobs: `get` by name must have one meaning.
-    fn env_exists(&mut self, name: Name<'_>) -> Result<bool, Fail> {
-        Ok(self
-            .store
-            .env_find(name)
-            .map_err(|_| Fail::Internal)?
-            .is_some())
-    }
-
-    pub fn add(&mut self, e: &Entry, replace: bool) -> Result<(), Fail> {
+    /// Stores an item. The PIN is enough, like every write: nothing comes out.
+    pub fn put(
+        &mut self,
+        name: Name<'_>,
+        category: Category,
+        plain: &[u8],
+        replace: bool,
+    ) -> Result<(), Fail> {
         let dek = self.dek()?;
         self.load()?;
-        if self.env_exists(e.name())? {
+        if Item::parse(plain).is_none() {
+            return Err(Fail::BadArg);
+        }
+        let at = self.index.find(name);
+        if at.is_some() && !replace {
             return Err(Fail::Exists);
         }
-        let slot = match self.state.find(e.name()) {
-            Some(_) if !replace => return Err(Fail::Exists),
-            Some(i) => i,
-            None => self.state.free_slot().ok_or(Fail::Full)?,
-        };
-        let key = self.record_key(&dek, e.kind)?;
-        let sealed = Self::seal_record(&key, &mut self.rng, e).ok_or(Fail::Internal)?;
-        self.state.slots[slot] = sealed;
-        self.store.save(self.state).map_err(|_| Fail::Internal)?;
+        if !self.index.room_for(name, plain.len() + vault::OVERHEAD, at) {
+            return Err(Fail::Full);
+        }
+        let key = self.item_key(&dek, category.wire())?;
+        let r = self.write_item(&key, name, category.wire(), plain, at);
+        self.buf.zeroize();
+        r?;
         self.touch();
         Ok(())
     }
 
-    /// Name and kind of every stored entry and blob. Needs the PIN: which services
-    /// someone uses is theirs to know, not any program's that found the port.
-    pub fn list(&mut self, mut each: impl FnMut(Name<'_>, Kind)) -> Result<(), Fail> {
-        self.dek()?;
-        self.load()?;
-        for r in self.state.used() {
-            each(r.name(), r.kind);
+    /// Seals `plain` and rewrites the image with it in place of the item at `at`, or
+    /// appended when there is none.
+    fn write_item(
+        &mut self,
+        key: &[u8; KEY_LEN],
+        name: Name<'_>,
+        category: u8,
+        plain: &[u8],
+        at: Option<usize>,
+    ) -> Result<(), Fail> {
+        let sealed = {
+            let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+            work[NONCE_LEN..NONCE_LEN + plain.len()].copy_from_slice(plain);
+            Self::seal_in(key, &mut self.rng, name, category, work, plain.len())
+                .ok_or(Fail::Internal)?
+        };
+        self.store
+            .save_begin(self.index.header.as_ref())
+            .map_err(|_| Fail::Internal)?;
+        let r = self.rewrite(at, Some((name, category, sealed)));
+        if r.is_err() {
+            self.store.save_abort();
+        }
+        r
+    }
+
+    /// Writes the image: every item of the index, with the one at `at` replaced by
+    /// `new` (or dropped when `new` is None), and `new` appended when `at` is None.
+    fn rewrite(
+        &mut self,
+        at: Option<usize>,
+        new: Option<(Name<'_>, u8, usize)>,
+    ) -> Result<(), Fail> {
+        for i in 0..self.index.len() {
+            if Some(i) == at {
+                if let Some((name, category, sealed)) = new {
+                    let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+                    self.store
+                        .save_put(name, category, &work[..sealed])
+                        .map_err(|_| Fail::Internal)?;
+                }
+                continue;
+            }
+            let slot = *self.index.get(i).ok_or(Fail::Internal)?;
+            let (_, carry) = self.buf.split_at_mut(ITEM_BUF_LEN);
+            self.store
+                .save_keep(&slot, carry)
+                .map_err(|_| Fail::Internal)?;
+        }
+        if at.is_none()
+            && let Some((name, category, sealed)) = new
+        {
+            let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+            self.store
+                .save_put(name, category, &work[..sealed])
+                .map_err(|_| Fail::Internal)?;
         }
         self.store
-            .env_names(|n| each(n, Kind::Env))
+            .save_finish(self.index)
             .map_err(|_| Fail::Internal)
     }
 
-    /// A TOTP code, after a tap. Only a TOTP entry has one.
+    /// Name and category of every stored item. Needs the PIN: which services someone
+    /// uses is theirs to know, not any program's that found the port.
+    pub fn list(&mut self, mut each: impl FnMut(Name<'_>, u8)) -> Result<(), Fail> {
+        self.dek()?;
+        self.load()?;
+        for slot in self.index.used_slots() {
+            each(slot.name(), slot.category);
+        }
+        Ok(())
+    }
+
+    /// The item called `name`, opened into the working half of the buffer: how many
+    /// plaintext bytes, sitting at `NONCE_LEN`. Never an auth item, which only
+    /// `respond` opens.
+    fn open_named(&mut self, dek: &[u8; KEY_LEN], name: Name<'_>) -> Result<(usize, u8), Fail> {
+        self.load()?;
+        let i = self.index.find(name).ok_or(Fail::NotFound)?;
+        let slot = *self.index.get(i).ok_or(Fail::Internal)?;
+        if slot.category == Category::Auth.wire() {
+            return Err(Fail::BadArg);
+        }
+        let n = {
+            let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+            self.store
+                .read_item(&slot, work)
+                .map_err(|_| Fail::Internal)?
+        };
+        let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+        let opened =
+            Self::open_in(dek, name, slot.category, &mut work[..n]).ok_or(Fail::Internal)?;
+        Ok((opened, slot.category))
+    }
+
+    /// The fields of `name` that `reach` allows, packed as an item, to `f`. The gesture
+    /// is the reach's: none for open fields, a tap for secrets, the double tap for
+    /// seeds. This is the only way a field's value leaves the device.
+    pub fn get(
+        &mut self,
+        name: Name<'_>,
+        reach: Reach,
+        f: impl FnOnce(u8, u8, &[u8]),
+    ) -> Result<(), Fail> {
+        let dek = self.dek()?;
+        let r = self.get_into(&dek, name, reach, f);
+        self.buf.zeroize();
+        r?;
+        self.touch();
+        Ok(())
+    }
+
+    fn get_into(
+        &mut self,
+        dek: &[u8; KEY_LEN],
+        name: Name<'_>,
+        reach: Reach,
+        f: impl FnOnce(u8, u8, &[u8]),
+    ) -> Result<(), Fail> {
+        let (n, category) = self.open_named(dek, name)?;
+        let gesture = match reach {
+            Reach::Open => true,
+            Reach::Secret => ui::await_confirmation(&mut self.ui, &self.clock, TOUCH_TIMEOUT_MS),
+            Reach::Seed => ui::await_double_tap(&mut self.ui, &self.clock, TOUCH_TIMEOUT_MS),
+        };
+        if !gesture {
+            return Err(Fail::Refused);
+        }
+        let (work, out) = self.buf.split_at_mut(ITEM_BUF_LEN);
+        let item = Item::parse(&work[NONCE_LEN..NONCE_LEN + n]).ok_or(Fail::Internal)?;
+        let cat = Category::from_wire(category).ok_or(Fail::Internal)?;
+        // Which classes the item holds at all, so the host knows a code can be had from
+        // it without spending a gesture to find out. A field's existence is not its
+        // value: the sealed length already says roughly how much is in there.
+        let present = item
+            .fields()
+            .fold(0u8, |m, field| m | class_bit(field.class));
+        let mut w = Writer::new(out, cat).ok_or(Fail::Internal)?;
+        for field in item.fields().filter(|field| reach.allows(field.class)) {
+            if !w.push(&field) {
+                return Err(Fail::Full);
+            }
+        }
+        let len = w.finish();
+        f(category, present, &out[..len]);
+        Ok(())
+    }
+
+    /// A TOTP code, after a tap: from the item's first seed field, whose value is the
+    /// parameters and then the seed. A seed never leaves this way - only the code does.
     pub fn code(
         &mut self,
         name: Name<'_>,
@@ -446,53 +596,39 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         out: &mut [u8; 8],
     ) -> Result<usize, Fail> {
         let dek = self.dek()?;
-        let e = self.entry(&dek, name)?;
-        let Kind::Totp(params) = e.kind else {
-            return Err(Fail::BadArg);
-        };
-        if !ui::await_confirmation(&mut self.ui, &self.clock, TOUCH_TIMEOUT_MS) {
-            return Err(Fail::Refused);
-        }
-        let n = oath::totp(params, e.secret(), unix_time, out);
+        let r = self.code_into(&dek, name, unix_time, out);
+        self.buf.zeroize();
+        let n = r?;
         self.touch();
         Ok(n)
     }
 
-    /// The login of a password entry: the PIN is enough, no gesture - it is not the
-    /// secret, and the site asks for it first.
-    pub fn login(&mut self, name: Name<'_>, out: &mut [u8; SECRET_MAX]) -> Result<usize, Fail> {
-        let dek = self.dek()?;
-        let e = self.entry(&dek, name)?;
-        let login = e.login().ok_or(Fail::BadArg)?;
-        out[..login.len()].copy_from_slice(login);
-        self.touch();
-        Ok(login.len())
-    }
-
-    /// A password entry as stored - `login_len | login | password_len | password |
-    /// note`, the host unpacks it with the same `Entry` - after a tap, the same gesture
-    /// as a code. A TOTP seed never comes out this way: `Entry::password_bytes` is None
-    /// for it, and this is the one place that asks.
-    pub fn reveal(&mut self, name: Name<'_>, out: &mut [u8; SECRET_MAX]) -> Result<usize, Fail> {
-        let dek = self.dek()?;
-        let e = self.entry(&dek, name)?;
-        if e.password_bytes().is_none() {
-            return Err(Fail::BadArg);
-        }
+    fn code_into(
+        &mut self,
+        dek: &[u8; KEY_LEN],
+        name: Name<'_>,
+        unix_time: u64,
+        out: &mut [u8; 8],
+    ) -> Result<usize, Fail> {
+        let (n, _) = self.open_named(dek, name)?;
         if !ui::await_confirmation(&mut self.ui, &self.clock, TOUCH_TIMEOUT_MS) {
             return Err(Fail::Refused);
         }
-        let packed = e.secret();
-        out[..packed.len()].copy_from_slice(packed);
-        self.touch();
-        Ok(packed.len())
+        let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+        let item = Item::parse(&work[NONCE_LEN..NONCE_LEN + n]).ok_or(Fail::Internal)?;
+        let seed = item.first(Class::Seed).ok_or(Fail::BadArg)?;
+        let (params, secret) = seed
+            .value()
+            .split_first_chunk::<{ Params::WIRE_LEN }>()
+            .ok_or(Fail::BadArg)?;
+        let params = Params::from_wire(*params).ok_or(Fail::BadArg)?;
+        Ok(oath::totp(params, secret, unix_time, out))
     }
 
-    /// The host's challenge signed with the auth secret called `name` as an Ed25519
-    /// seed, after a tap - the same gesture as a code. The one command that needs no
-    /// PIN: the secret is sealed under the chip key, it never comes out, and a login
-    /// is proven by the finger on this board. Leaves the PIN session as it was, and
-    /// spends no attempt.
+    /// The host's challenge signed with the auth item called `name`, after a tap - the
+    /// same gesture as a code. The one command that needs no PIN: the secret is sealed
+    /// under the chip key, it never comes out, and a login is proven by the finger on
+    /// this board. Leaves the PIN session as it was, and spends no attempt.
     pub fn respond(
         &mut self,
         name: Name<'_>,
@@ -500,181 +636,141 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         out: &mut [u8; AUTH_SIGNATURE_LEN],
     ) -> Result<(), Fail> {
         self.load()?;
-        // Any other kind reads as absent: without the PIN, which names exist is nobody's
-        // to learn, and a different answer for "exists, but not auth" would tell.
+        // Any other category reads as absent: without the PIN, which names exist is
+        // nobody's to learn, and a different answer for "exists, but not auth" would
+        // tell.
         let i = self
-            .state
+            .index
             .find(name)
-            .filter(|&i| self.state.slots[i].kind == Kind::Auth)
+            .filter(|&i| {
+                self.index
+                    .get(i)
+                    .is_some_and(|s| s.category == Category::Auth.wire())
+            })
             .ok_or(Fail::NotFound)?;
+        let slot = *self.index.get(i).ok_or(Fail::Internal)?;
         let key = vault::auth_key(&mut self.key).ok_or(Fail::Incompatible)?;
-        let e = Self::open_record(&key, &self.state.slots[i]).ok_or(Fail::Internal)?;
+        let r = self.sign_with(&key, &slot, name, challenge, out);
+        self.buf.zeroize();
+        r
+    }
+
+    fn sign_with(
+        &mut self,
+        key: &[u8; KEY_LEN],
+        slot: &Slot,
+        name: Name<'_>,
+        challenge: &[u8; AUTH_CHALLENGE_LEN],
+        out: &mut [u8; AUTH_SIGNATURE_LEN],
+    ) -> Result<(), Fail> {
+        let n = {
+            let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+            self.store
+                .read_item(slot, work)
+                .map_err(|_| Fail::Internal)?
+        };
+        let opened = {
+            let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+            Self::open_in(key, name, slot.category, &mut work[..n]).ok_or(Fail::Internal)?
+        };
         if !ui::await_confirmation(&mut self.ui, &self.clock, AUTH_TOUCH_TIMEOUT_MS) {
             return Err(Fail::Refused);
         }
-        let seed: &[u8; AUTH_SECRET_LEN] = e.secret().try_into().map_err(|_| Fail::Internal)?;
-        let key = SigningKey::from_bytes(seed);
+        let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+        let item = Item::parse(&work[NONCE_LEN..NONCE_LEN + opened]).ok_or(Fail::Internal)?;
+        let seed: &[u8; AUTH_SECRET_LEN] = item
+            .first(Class::Secret)
+            .ok_or(Fail::Internal)?
+            .value()
+            .try_into()
+            .map_err(|_| Fail::Internal)?;
+        let signing = SigningKey::from_bytes(seed);
         let mut msg = [0u8; AUTH_SIGNED_PREFIX.len() + AUTH_CHALLENGE_LEN];
         msg[..AUTH_SIGNED_PREFIX.len()].copy_from_slice(AUTH_SIGNED_PREFIX);
         msg[AUTH_SIGNED_PREFIX.len()..].copy_from_slice(challenge);
-        *out = key.sign(&msg).to_bytes();
+        *out = signing.sign(&msg).to_bytes();
         Ok(())
     }
 
-    /// An entry or a blob, gone.
+    /// An item, gone.
     pub fn delete(&mut self, name: Name<'_>) -> Result<(), Fail> {
         self.dek()?;
         self.load()?;
-        if let Some(i) = self.state.find(name) {
-            self.state.slots[i] = Record::EMPTY;
-            self.store.save(self.state).map_err(|_| Fail::Internal)?;
-        } else {
-            let slot = self
-                .store
-                .env_find(name)
-                .map_err(|_| Fail::Internal)?
-                .ok_or(Fail::NotFound)?;
-            self.store.env_delete(slot).map_err(|_| Fail::Internal)?;
+        let at = self.index.find(name).ok_or(Fail::NotFound)?;
+        self.store
+            .save_begin(self.index.header.as_ref())
+            .map_err(|_| Fail::Internal)?;
+        let r = self.rewrite(Some(at), None);
+        self.buf.zeroize();
+        if r.is_err() {
+            self.store.save_abort();
+            return r;
         }
         self.touch();
         Ok(())
     }
 
-    /// The entry called `from`, now called `to`, in the same slot. The name is under
-    /// the AEAD tag, so this is a decrypt and a re-seal, not a metadata edit - and
-    /// therefore the device's job: the secret never leaves it. No gesture, like `add`
-    /// and `delete`: nothing comes out, and a rename can be renamed back.
+    /// The item called `from`, now called `to`. The name is under the AEAD tag, so this
+    /// is a decrypt and a re-seal, not a metadata edit - and therefore the device's job:
+    /// the secret never leaves it. No gesture, like `put` and `delete`: nothing comes
+    /// out, and a rename can be renamed back.
     pub fn rename(&mut self, from: Name<'_>, to: Name<'_>) -> Result<(), Fail> {
         let dek = self.dek()?;
         self.load()?;
-        let i = self.state.find(from).ok_or(Fail::NotFound)?;
-        if self.state.find(to).is_some() || self.env_exists(to)? {
+        let at = self.index.find(from).ok_or(Fail::NotFound)?;
+        if self.index.find(to).is_some() {
             return Err(Fail::Exists);
         }
-        let key = self.record_key(&dek, self.state.slots[i].kind)?;
-        let r = &self.state.slots[i];
-        let e = Self::open_record(&key, r).ok_or(Fail::Internal)?;
-        let e = Entry::new(to, e.kind, e.secret()).ok_or(Fail::Internal)?;
-        let sealed = Self::seal_record(&key, &mut self.rng, &e).ok_or(Fail::Internal)?;
-        self.state.slots[i] = sealed;
-        self.store.save(self.state).map_err(|_| Fail::Internal)?;
-        self.touch();
-        Ok(())
-    }
-
-    // --- env blobs -----------------------------------------------------------------
-
-    /// The env key for one operation: the state reloaded, the wrapped key opened.
-    fn env_key(&mut self, dek: &[u8; KEY_LEN]) -> Result<Zeroizing<[u8; KEY_LEN]>, Fail> {
-        self.load()?;
-        self.unwrap_env_key(dek)
-    }
-
-    /// Stores `plain` as the blob called `name`. The PIN is enough, like `add`: nothing
-    /// comes out. Sealed in the board's buffer and written from there.
-    pub fn env_put(&mut self, name: Name<'_>, plain: &[u8], replace: bool) -> Result<(), Fail> {
-        let dek = self.dek()?;
-        let key = self.env_key(&dek)?;
-        if plain.is_empty() || plain.len() > ENV_MAX {
-            return Err(Fail::BadArg);
-        }
-        if self.state.find(name).is_some() {
-            return Err(Fail::Exists);
-        }
-        let slot = match self.store.env_find(name).map_err(|_| Fail::Internal)? {
-            Some(_) if !replace => return Err(Fail::Exists),
-            Some(i) => i,
-            None => self
-                .store
-                .env_free()
-                .map_err(|_| Fail::Internal)?
-                .ok_or(Fail::Full)?,
-        };
-        self.buf.zeroize();
-        self.buf[NONCE_LEN..NONCE_LEN + plain.len()].copy_from_slice(plain);
-        let written = Self::seal_env(&key, &mut self.rng, name, self.buf, plain.len()).map_or(
-            Err(Fail::Internal),
-            |len| {
-                self.store
-                    .env_write(slot, name, env_part(self.buf), len)
-                    .map_err(|_| Fail::Internal)
-            },
-        );
-        self.buf.zeroize();
-        written?;
-        self.touch();
-        Ok(())
-    }
-
-    /// A blob sitting open in `buf` at `NONCE_LEN`, `len` bytes of it, the rest zero,
-    /// sealed in place under the env key as `name`: the sealed length.
-    fn seal_env(
-        key: &[u8; KEY_LEN],
-        rng: &mut R,
-        name: Name<'_>,
-        buf: &mut [u8; BUF_LEN],
-        len: usize,
-    ) -> Option<usize> {
-        let mut aad = [0u8; NAME_MAX + Kind::WIRE_LEN];
-        let aad = Self::aad(name, Kind::Env, &mut aad);
-        vault::seal_in_place(key, rng, aad, buf, len)
-    }
-
-    /// The blob called `name`, open, to `f` - after a tap, the same gesture as a
-    /// password. It is handed over from the board's buffer and scrubbed right after.
-    pub fn env_get(&mut self, name: Name<'_>, f: impl FnOnce(&[u8])) -> Result<(), Fail> {
-        let dek = self.dek()?;
-        let key = self.env_key(&dek)?;
-        let slot = self
-            .store
-            .env_find(name)
-            .map_err(|_| Fail::Internal)?
-            .ok_or(Fail::NotFound)?;
-        self.buf.zeroize();
-        let opened = self
-            .open_env(&key, slot)
-            .and_then(|found| found.ok_or(Fail::NotFound));
-        let r = opened.and_then(|(n, _)| {
-            if ui::await_confirmation(&mut self.ui, &self.clock, TOUCH_TIMEOUT_MS) {
-                f(&self.buf[NONCE_LEN..NONCE_LEN + n]);
-                Ok(())
-            } else {
-                Err(Fail::Refused)
-            }
-        });
+        let slot = *self.index.get(at).ok_or(Fail::Internal)?;
+        let key = self.item_key(&dek, slot.category)?;
+        let r = self.rename_into(&key, &slot, from, to, at);
         self.buf.zeroize();
         r?;
         self.touch();
         Ok(())
     }
 
-    /// The blob in `slot`, read and opened in the buffer: its length - it sits at
-    /// `NONCE_LEN` - and its name, or None for a free slot.
-    fn open_env(
+    fn rename_into(
         &mut self,
         key: &[u8; KEY_LEN],
-        slot: usize,
-    ) -> Result<Option<(usize, StoredName)>, Fail> {
-        let Some((len, name)) = self
-            .store
-            .env_read(slot, env_part(self.buf))
-            .map_err(|_| Fail::Internal)?
-        else {
-            return Ok(None);
+        slot: &Slot,
+        from: Name<'_>,
+        to: Name<'_>,
+        at: usize,
+    ) -> Result<(), Fail> {
+        let n = {
+            let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+            self.store
+                .read_item(slot, work)
+                .map_err(|_| Fail::Internal)?
         };
-        let mut aad = [0u8; NAME_MAX + Kind::WIRE_LEN];
-        let aad = Self::aad(name.get(), Kind::Env, &mut aad);
-        let n = vault::open_in_place(key, aad, &mut self.buf[..len]).ok_or(Fail::Internal)?;
-        Ok(Some((n, name)))
+        let opened = {
+            let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+            Self::open_in(key, from, slot.category, &mut work[..n]).ok_or(Fail::Internal)?
+        };
+        let sealed = {
+            let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+            work.copy_within(NONCE_LEN..NONCE_LEN + opened, NONCE_LEN);
+            Self::seal_in(key, &mut self.rng, to, slot.category, work, opened)
+                .ok_or(Fail::Internal)?
+        };
+        self.store
+            .save_begin(self.index.header.as_ref())
+            .map_err(|_| Fail::Internal)?;
+        let r = self.rewrite(Some(at), Some((to, slot.category, sealed)));
+        if r.is_err() {
+            self.store.save_abort();
+        }
+        r
     }
 
     // --- backup ----------------------------------------------------------------------
     //
-    // Every entry and blob leaves the device once, sealed under a key made from a
-    // passphrase alone - no chip key, so the file opens on another board - one item
-    // per request, in the order of the table and then the blob slots. The gesture is
-    // two taps at blue: a tap alone is the code reflex, a hold is the wipe, and
-    // neither must be turned into an export by a host that asks at the right moment.
+    // Every item leaves the device once, sealed under a key made from a passphrase
+    // alone - no chip key, so the file opens on another board - one item per request.
+    // The gesture is two taps at blue: a tap alone is the code reflex, a hold is the
+    // wipe, and neither must be turned into an export by a host that asks at the right
+    // moment.
 
     /// Starts a backup: the double tap, then the key for `pass` under a fresh salt.
     /// What the host needs to make that key again comes back; the items follow.
@@ -697,12 +793,15 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         Ok(BackupHead { salt, cost })
     }
 
-    /// The next item to `f`, sealed, out of the buffer; an empty slice once every
-    /// entry and blob has been handed out, which also ends the backup.
+    /// The next item to `f`, sealed, out of the buffer; an empty slice once every item
+    /// has been handed out, which also ends the backup.
     pub fn export_next(&mut self, f: impl FnOnce(&[u8])) -> Result<(), Fail> {
         let r = self.export_item();
         match r {
-            Ok(Some(n)) => f(&self.buf[..n]),
+            Ok(Some(n)) => {
+                let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+                f(&work[..n]);
+            }
             Ok(None) => f(&[]),
             Err(_) => {}
         }
@@ -713,197 +812,165 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         r.map(|_| self.touch())
     }
 
-    /// The next non-empty slot sealed into the buffer: the sealed length, or None
-    /// when there is nothing left.
+    /// The next item sealed into the working half: its length, or None when there is
+    /// nothing left. A backup item is `category | name_len | name | plaintext item`.
     fn export_item(&mut self) -> Result<Option<usize>, Fail> {
         let dek = self.dek()?;
         let Some(Session::Export { key, slot, item }) = &self.backup else {
             return Err(Fail::BadBackup);
         };
-        let (key, mut slot, item) = (Zeroizing::new(**key), *slot, *item);
-        let n = loop {
-            if slot >= MAX_ENTRIES + ENV_SLOTS {
-                return Ok(None);
-            }
-            let plain = if slot < MAX_ENTRIES {
-                if self.state.slots[slot].is_empty() {
-                    None
-                } else {
-                    let record_key = self.record_key(&dek, self.state.slots[slot].kind)?;
-                    let r = &self.state.slots[slot];
-                    let e = Self::open_record(&record_key, r).ok_or(Fail::Internal)?;
-                    let prefix = item_prefix(e.kind, e.name(), self.buf);
-                    let at = NONCE_LEN + prefix;
-                    self.buf[at..at + e.secret().len()].copy_from_slice(e.secret());
-                    Some(prefix + e.secret().len())
-                }
-            } else {
-                let env_key = self.unwrap_env_key(&dek)?;
-                self.open_env(&env_key, slot - MAX_ENTRIES)?
-                    .map(|(n, name)| {
-                        // The blob sits right after the nonce; the prefix goes in front.
-                        let prefix = Kind::WIRE_LEN + 1 + name.get().as_bytes().len();
-                        self.buf
-                            .copy_within(NONCE_LEN..NONCE_LEN + n, NONCE_LEN + prefix);
-                        item_prefix(Kind::Env, name.get(), self.buf) + n
-                    })
-            };
-            slot += 1;
-            if let Some(n) = plain {
-                break n;
-            }
+        let (key, at, item) = (Zeroizing::new(**key), *slot, *item);
+        if at >= self.index.len() {
+            return Ok(None);
+        }
+        let slot = *self.index.get(at).ok_or(Fail::Internal)?;
+        let name = StoredName::of(slot.name());
+        let item_key = self.item_key(&dek, slot.category)?;
+
+        let n = {
+            let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+            self.store
+                .read_item(&slot, work)
+                .map_err(|_| Fail::Internal)?
         };
-        let sealed = vault::seal_in_place(&key, &mut self.rng, &item_aad(item), self.buf, n)
-            .ok_or(Fail::Internal)?;
+        let opened = {
+            let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+            Self::open_in(&item_key, name.get(), slot.category, &mut work[..n])
+                .ok_or(Fail::Internal)?
+        };
+        // The plaintext moves back to make room for the prefix, which goes after the
+        // nonce that `seal_in_place` writes over.
+        let prefix = 2 + name.get().as_bytes().len();
+        let total = prefix + opened;
+        if NONCE_LEN + total > ITEM_BUF_LEN {
+            return Err(Fail::Internal);
+        }
+        {
+            let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+            work.copy_within(NONCE_LEN..NONCE_LEN + opened, NONCE_LEN + prefix);
+            let bytes = name.get().as_bytes();
+            work[NONCE_LEN] = slot.category;
+            work[NONCE_LEN + 1] = len_u8(bytes.len());
+            work[NONCE_LEN + 2..NONCE_LEN + 2 + bytes.len()].copy_from_slice(bytes);
+        }
+        let sealed = {
+            let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+            vault::seal_in_place(&key, &mut self.rng, &item_aad(item), work, total)
+                .ok_or(Fail::Internal)?
+        };
         self.backup = Some(Session::Export {
             key,
-            slot,
+            slot: at + 1,
             item: item + 1,
         });
         Ok(Some(sealed))
     }
 
-    /// Starts a restore: the key for `pass` as the backup's head describes it. The
-    /// PIN is enough, like `add`: nothing comes out.
+    /// Starts a restore: the key for `pass` as the backup's head describes it, and a
+    /// fresh image to write the items into. The PIN is enough, like `put`: nothing
+    /// comes out. Everything already stored is replaced - a restore is a restore.
     pub fn import_begin(&mut self, pass: Passphrase<'_>, head: BackupHead) -> Result<(), Fail> {
         self.dek()?;
         self.load()?;
         let key = vault::backup_key(pass, &head.salt, head.cost, self.mem).ok_or(Fail::Internal)?;
-        self.backup = Some(Session::Import {
-            key,
-            item: 0,
-            dirty: false,
-        });
+        self.store
+            .save_begin(self.index.header.as_ref())
+            .map_err(|_| Fail::Internal)?;
+        self.backup = Some(Session::Import { key, item: 0 });
         self.touch();
         Ok(())
     }
 
-    /// One item back in, under the name it carries: an entry of that name is
-    /// replaced, a blob of that name too, and one of the other kind is removed, since
-    /// names are one namespace. Entries land in the table in RAM and reach flash at
-    /// `import_end`, in one image; a blob is written as it arrives, after any table
-    /// change before it, so flash never holds a name twice. Any failure ends the
-    /// restore: what reached flash stays, what did not is gone, and the file can be
-    /// restored again.
+    /// One item back in, under the name it carries. Items are appended to the image
+    /// being written and become visible together at `import_end`; any failure ends the
+    /// restore and leaves what was there before, because the new image never got its
+    /// magic word.
     pub fn import_item(&mut self, sealed: &[u8]) -> Result<(), Fail> {
         let dek = self.dek()?;
-        let Some(Session::Import { key, item, dirty }) = &self.backup else {
+        let Some(Session::Import { key, item }) = &self.backup else {
             return Err(Fail::BadBackup);
         };
-        let (key, item, dirty) = (Zeroizing::new(**key), *item, *dirty);
-        let r = self.import_sealed(&dek, &key, item, dirty, sealed);
+        let (key, item) = (Zeroizing::new(**key), *item);
+        let r = self.import_sealed(&dek, &key, item, sealed);
         self.buf.zeroize();
         match r {
-            Ok(dirty) => {
+            Ok(()) => {
                 self.backup = Some(Session::Import {
                     key,
                     item: item + 1,
-                    dirty,
                 });
                 self.touch();
                 Ok(())
             }
             Err(f) => {
                 self.backup = None;
+                self.store.save_abort();
                 Err(f)
             }
         }
     }
 
-    /// `import_item` with the session's parts in hand: whether the table in RAM is
-    /// now ahead of flash.
     fn import_sealed(
         &mut self,
         dek: &[u8; KEY_LEN],
         key: &[u8; KEY_LEN],
         item: u32,
-        dirty: bool,
         sealed: &[u8],
-    ) -> Result<bool, Fail> {
-        if sealed.len() > BUF_LEN {
+    ) -> Result<(), Fail> {
+        if sealed.len() > ITEM_BUF_LEN {
             return Err(Fail::BadBackup);
         }
-        self.buf[..sealed.len()].copy_from_slice(sealed);
-        let n = vault::open_in_place(key, &item_aad(item), &mut self.buf[..sealed.len()])
-            .ok_or(Fail::BadBackup)?;
-        let plain = &self.buf[NONCE_LEN..NONCE_LEN + n];
-        let (meta, rest) = plain
-            .split_first_chunk::<{ Kind::WIRE_LEN }>()
-            .ok_or(Fail::BadBackup)?;
-        let kind = Kind::from_wire(*meta).ok_or(Fail::BadBackup)?;
-        let (name, secret) = Name::take(rest).ok_or(Fail::BadBackup)?;
-        if kind == Kind::Env {
-            if secret.is_empty() || secret.len() > ENV_MAX {
+        let n = {
+            let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+            work[..sealed.len()].copy_from_slice(sealed);
+            vault::open_in_place(key, &item_aad(item), &mut work[..sealed.len()])
+                .ok_or(Fail::BadBackup)?
+        };
+        // `category | name_len | name | item`, as `export_item` packed it.
+        let (category, name, body_at, body_len) = {
+            let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+            let plain = &work[NONCE_LEN..NONCE_LEN + n];
+            let (&category, rest) = plain.split_first().ok_or(Fail::BadBackup)?;
+            let (name, body) = Name::take(rest).ok_or(Fail::BadBackup)?;
+            if Item::parse(body).is_none() || Category::from_wire(category).is_none() {
                 return Err(Fail::BadBackup);
             }
-            let name = StoredName::of(name);
-            let (at, len) = (NONCE_LEN + n - secret.len(), secret.len());
-            self.import_env(dek, name.get(), at, len, dirty)?;
-            return Ok(false);
-        }
-        let e = Entry::new(name, kind, secret).ok_or(Fail::BadBackup)?;
-        if let Some(slot) = self.store.env_find(e.name()).map_err(|_| Fail::Internal)? {
-            self.store.env_delete(slot).map_err(|_| Fail::Internal)?;
-        }
-        let slot = match self.state.find(e.name()) {
-            Some(i) => i,
-            None => self.state.free_slot().ok_or(Fail::Full)?,
+            (
+                category,
+                StoredName::of(name),
+                NONCE_LEN + n - body.len(),
+                body.len(),
+            )
         };
-        let record_key = self.record_key(dek, e.kind)?;
-        self.state.slots[slot] =
-            Self::seal_record(&record_key, &mut self.rng, &e).ok_or(Fail::Internal)?;
-        Ok(true)
-    }
-
-    /// The blob open in the buffer at `at`, `len` bytes, stored as `name`; the table
-    /// written first if it is dirty or loses an entry of that name here.
-    fn import_env(
-        &mut self,
-        dek: &[u8; KEY_LEN],
-        name: Name<'_>,
-        at: usize,
-        len: usize,
-        dirty: bool,
-    ) -> Result<(), Fail> {
-        let mut dirty = dirty;
-        if let Some(i) = self.state.find(name) {
-            self.state.slots[i] = Record::EMPTY;
-            dirty = true;
-        }
-        if dirty {
-            self.store.save(self.state).map_err(|_| Fail::Internal)?;
-        }
-        let slot = match self.store.env_find(name).map_err(|_| Fail::Internal)? {
-            Some(i) => i,
-            None => self
-                .store
-                .env_free()
-                .map_err(|_| Fail::Internal)?
-                .ok_or(Fail::Full)?,
+        let item_key = self.item_key(dek, category)?;
+        let resealed = {
+            let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+            work.copy_within(body_at..body_at + body_len, NONCE_LEN);
+            Self::seal_in(
+                &item_key,
+                &mut self.rng,
+                name.get(),
+                category,
+                work,
+                body_len,
+            )
+            .ok_or(Fail::Internal)?
         };
-        let env_key = self.unwrap_env_key(dek)?;
-        // Back to where a blob is sealed from; what trailed it must not reach flash.
-        self.buf.copy_within(at..at + len, NONCE_LEN);
-        self.buf[NONCE_LEN + len..].zeroize();
-        let sealed =
-            Self::seal_env(&env_key, &mut self.rng, name, self.buf, len).ok_or(Fail::Internal)?;
+        let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
         self.store
-            .env_write(slot, name, env_part(self.buf), sealed)
-            .map_err(|_| Fail::Internal)
+            .save_put(name.get(), category, &work[..resealed])
+            .map_err(|_| Fail::Full)
     }
 
-    /// The restored table to flash, in one image, and the restore over.
+    /// The restored items become the image, and the restore is over.
     pub fn import_end(&mut self) -> Result<(), Fail> {
-        let Some(Session::Import { dirty, .. }) = &self.backup else {
+        let Some(Session::Import { .. }) = &self.backup else {
             return Err(Fail::BadBackup);
         };
-        let r = if *dirty {
-            self.store.save(self.state).map_err(|_| Fail::Internal)
-        } else {
-            Ok(())
-        };
         self.backup = None;
-        r?;
+        self.store
+            .save_finish(self.index)
+            .map_err(|_| Fail::Internal)?;
         self.touch();
         Ok(())
     }

@@ -12,6 +12,7 @@
 
 pub mod device;
 pub mod hal;
+pub mod item;
 pub mod oath;
 pub mod proto;
 pub mod store;

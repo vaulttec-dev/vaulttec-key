@@ -43,21 +43,27 @@ const VERSION: &str = vaultkey_core::version!("esp32c6-zero");
 const LAYOUT: Layout = Layout {
     attempts: 0x11_0000,
     state_a: 0x11_1000,
-    state_b: 0x12_6000,
-    env: 0x13_B000,
+    state_b: 0x14_6000,
 };
+const _: () = assert!(
+    LAYOUT.state_b - LAYOUT.state_a == store::SECTOR * store::STATE_SECTORS
+        && LAYOUT.state_b + store::SECTOR * store::STATE_SECTORS == 0x17_B000,
+    "the two copies fill the region exactly, and neither runs past its end"
+);
 
 /// Argon2 working memory, in RAM for the life of the program: the key derivation has
 /// no allocator, and 128 KiB does not belong on the stack.
 static KDF_MEM: ConstStaticCell<[Block; KDF_BLOCKS]> =
     ConstStaticCell::new([Block::new(); KDF_BLOCKS]);
 
-/// The vault as last read from flash, ~80 KiB: same reason, same place. Filled in at
-/// boot rather than a `const`: a constant with padding in it is not "all zeros" to the
-/// linker, and this one would be copied out of the firmware image byte for byte.
-static VAULT: StaticCell<store::State> = StaticCell::new();
+/// Where every item sits in the image, ~10 KiB: same reason, same place. The bodies
+/// stay in flash. Filled in at boot rather than a `const`: a constant with padding in
+/// it is not "all zeros" to the linker, and this one would be copied out of the
+/// firmware image byte for byte.
+static VAULT: StaticCell<store::Index> = StaticCell::new();
 
-/// One env blob or one backup item, sealed or open, 8 KiB: same reason, same place.
+/// Two item-sized halves, 16 KiB: one to open or build an item in, one for the items
+/// carried across while the image is rewritten.
 static BUF: ConstStaticCell<[u8; device::BUF_LEN]> = ConstStaticCell::new([0; device::BUF_LEN]);
 
 /// The built-in USB-Serial/JTAG port. It also carries esp-println output; frames
@@ -183,7 +189,7 @@ fn main() -> ! {
         Uptime,
         ChipKey::detect(p.HMAC),
         KDF_MEM.take(),
-        VAULT.init_with(store::State::empty),
+        VAULT.init_with(store::Index::empty),
         BUF.take(),
     );
 

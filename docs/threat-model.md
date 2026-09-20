@@ -64,25 +64,38 @@ The eFuse burn of 2026-09-08 put 32 bytes from `/dev/urandom` into `BLOCK_KEY0`,
 was kept (`shred`): a key in a file makes a flash dump useful again. The vault written
 before the burn became `Incompatible` and was wiped.
 
-## Gestures and entry kinds
+## Gestures and field classes
 
 | Gesture | Action | LED |
 |---|---|---|
-| Tap | code, password (with note), `.env`, `vkey auth` login | amber |
+| Tap | code, the secret fields of an item, a `.env`, a `vkey auth` login | amber |
 | Hold 5 s | wipe | red |
-| Double tap, 800 ms window | encrypted backup export | blue |
+| Double tap, 800 ms window | encrypted backup, **and an export to 1Password** | blue |
 
 A tap never wipes and never exports; a hold never exports; a double tap never wipes. One
 gesture would defend badly: a hostile host asks for a wipe exactly when the owner expects
 a code, and the same reflex hands it over. A new command with consequences gets a new
 gesture, never an existing one.
 
-| Kind | May ever leave the device | Gesture |
+An item is a list of fields, and it is the **class of the field** - not the category of
+the item - that decides what may leave. This replaced the entry kinds on 2026-09-19,
+when the key became a mirror of a whole 1Password vault: a credit card carries a number
+anyone with the PIN may read and a CVV that needs a tap, and one kind per item could not
+say that.
+
+| Class | May ever leave the device | Gesture |
 |---|---|---|
-| `Totp` | The code only — the secret has no path to `respond` under any gesture | tap |
-| `Password` | Login without a gesture, under PIN (not a secret; the site asks for it first), then password and note | tap |
-| `Env` | The whole blob, up to `ENV_MAX` = 8000 bytes | tap |
-| `Auth` | Ed25519 signatures of a host's challenges, **without the PIN** — the seed has no path out | tap |
+| `Open` | The value, under the PIN alone: a login, a URL, an account number, an issuer | none |
+| `Secret` | The value: a password, a note, a CVV, a private key, a whole `.env` | tap |
+| `Seed` | A **code** computed from it on a tap; the seed itself only under the export gesture | tap / double tap |
+
+The host names a reach with every request and the device hands back only the fields of
+that reach - the rest are not in the answer at all. An unknown reach byte is refused
+rather than rounded down. A host that writes a seed marked `Open` gains nothing: it holds
+that seed already; the class guards the next read, not this write. The class lives inside
+the sealed item, so there is no plaintext class byte in flash to rewrite; the category
+beside it is plaintext, and it is under the AEAD tag, so rewriting it - even with the CRC
+repaired - leaves an item that opens for nobody.
 
 A password comes out on the same tap as a code (2026-09-08): for a single owner a separate
 2 s hold cost more than it protected, and it is **not coming back**. The price: a hostile
@@ -92,17 +105,32 @@ and the most expensive on the key, releasing every secret of a project at once; 
 file on disk that is the only way to launch the project, and a separate gesture would add
 nothing beyond PIN plus tap.
 
-Rejected as confirmation: `sudo` (the device cannot see host privileges — the same bytes
-arrive over the wire, and anything with port access can send them), BOOT+RESET (a reset
-with BOOT held hands the chip to the ROM loader, invisible to firmware),
-`USB_JTAG_BRIDGE_EN` via the PAC (needs `unsafe`; an eFuse closes it better). `--no-touch`
-was removed: without the button a hostile host would harvest codes for future windows.
+### A seed can now leave in the clear
+
+This is the maintainer's decision of 2026-09-19, and it costs something real. Until then
+this document said a TOTP seed had no path out of the device at all: a backup carried one
+only sealed under a passphrase, so the host saw ciphertext and nothing else.
+
+`vkey export` ends that. Writing an item back into 1Password means writing the item that
+was taken - one-time password included - and `op item create` takes a plaintext
+`otpauth://` URI. So a seed leaves in the clear, under the double tap, the same gesture a
+backup costs, because it is the same act: a whole secret leaving the key.
+
+What that buys the owner is a mirror that runs both ways. What it costs is the hardware
+boundary itself: **a key that can write its secrets back into a cloud manager protects
+them only as well as that manager does.** After an export, the seed's security is
+1Password's, the host's, and whatever else can read that process - not this device's. The
+gesture keeps it from happening behind the owner's back; it does not make it safe.
+
+Unchanged: a tap never exports a seed, an auth secret is never exported at all (`vkey
+auth` is this machine's login and 1Password has no use for it), and an item without a
+seed costs no double tap to export - only the tap its secrets already cost.
 
 ## What it protects against
 
 | Threat | Verdict |
 |---|---|
-| Malware copying the secret database off the host | Yes — a secret goes in once and never comes back out; there is no export like an authenticator app's |
+| Malware copying the secret database off the host | Yes, while the owner does not export: a secret comes back out only under a gesture - a tap for a password, two for a seed - one item per press, never in bulk without the button |
 | Silent code generation in the background | No code without a **new** press: a held or taped-down button does not count — confirmation is a press with a release, after the request |
 | A wipe disguised as a code request | Yes — different gesture, different LED |
 | A password request disguised as a code request | No — same tap, deliberately (above) |
@@ -343,11 +371,11 @@ Listed openly so nobody has to discover them.
 
 | | This key | Phone authenticator app | YubiKey 5 (OATH) |
 |---|---|---|---|
-| Secret never leaves the device in the clear | **Yes**; backup is encrypted on the device itself, behind a separate gesture | No: cloud backup, plaintext export | Yes |
+| Secret never leaves the device in the clear | **Only until the owner exports one**: a backup is encrypted on the device itself, but `vkey export` writes an item back to 1Password in the clear, under the double tap | No: cloud backup, plaintext export | Yes |
 | Button press per code | **Yes** | No | Yes (touch) |
 | PIN with wipe | **Yes**, 8 digits, Argon2id | Phone passcode | OATH password |
 | Passwords and their notes (recovery codes) | **Yes**, shown only after a press | Separate app | No (OATH) |
-| Project `.env` files | **Yes**, whole, after a press; up to 16 files of 8000 bytes | 1Password Environments, in the cloud | No |
+| Project `.env` files | **Yes**, whole, after a press; each up to 8128 bytes, as many as the vault holds | 1Password Environments, in the cloud | No |
 | Resistance to physical attacks | Partial: flash dump useless without the chip, foreign firmware will not run (Secure Boot v2); with the chip — PIN brute force through the real firmware with the counter erased, power glitching | No | Secure element, not absolute |
 | Backup | One file under a backup passphrase, restorable to any vkey | Yes, in the cloud | None |
 | Phishing resistance | No | No | No (OATH) |

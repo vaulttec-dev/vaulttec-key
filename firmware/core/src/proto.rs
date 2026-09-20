@@ -11,20 +11,22 @@ use embedded_storage::nor_flash::NorFlash;
 use rand_core::{CryptoRng, RngCore};
 use zeroize::Zeroizing;
 
-use crate::device::Device;
+use crate::device::{Device, Reach};
 use crate::hal::{Clock, DeviceKey, Port, Ui};
-use crate::oath::{Entry, Kind, NAME_MAX, Name, SECRET_MAX, len_u8};
-use crate::store::{ENV_SLOTS, MAX_ENTRIES};
+use crate::item::{Category, ITEM_MAX};
+use crate::oath::{NAME_MAX, Name, len_u8};
+use crate::store::MAX_ENTRIES;
 use crate::vault::{Passphrase, Pin};
 use crate::wire::{
     AUTH_CHALLENGE_LEN, AUTH_SIGNATURE_LEN, BAD_CMD, BAD_LEN, BackupHead, Cmd, FLAG_REPLACE, Fail,
-    MAGIC, MAX_PAYLOAD, OK, PinStatus, frame_head, scan_magic,
+    MAGIC, MAX_PAYLOAD, OK, PinStatus, REACH_OPEN, REACH_SECRET, REACH_SEED, frame_head,
+    scan_magic,
 };
 
 /// ~5 s of silence mid-frame resynchronises the framer instead of leaving it stuck.
 const FRAME_TIMEOUT_MS: u64 = 5_000;
-/// A full `List`: every entry and every blob as `len | name | kind`.
-const LIST_MAX: usize = (MAX_ENTRIES + ENV_SLOTS) * (NAME_MAX + Kind::WIRE_LEN + 1);
+/// A full `List`: every item as `len | name | category`.
+const LIST_MAX: usize = MAX_ENTRIES * (NAME_MAX + 2);
 
 /// A request that never reaches the device: the payload does not have the shape the
 /// command needs (`Len`), or it has the shape but not the values (`Arg`).
@@ -92,6 +94,24 @@ impl<P: Port, C: Clock> Proto<P, C> {
         self.port.write(&frame_head(status, len));
         if !payload.is_empty() {
             self.port.write(payload);
+        }
+        self.port.flush();
+    }
+
+    /// One frame out of two pieces, so a body that is only in the device's buffer is
+    /// not copied somewhere else just to put a byte in front of it.
+    fn respond_parts(&mut self, status: u8, head: &[u8], body: &[u8]) {
+        const _: () = assert!(
+            MAX_PAYLOAD <= u16::MAX as usize,
+            "an answer's length must fit the u16 length field"
+        );
+        let total = head.len() + body.len();
+        #[expect(clippy::cast_possible_truncation, reason = "asserted above")]
+        let len = total as u16;
+        self.port.write(&frame_head(status, len));
+        self.port.write(head);
+        if !body.is_empty() {
+            self.port.write(body);
         }
         self.port.flush();
     }
@@ -177,9 +197,9 @@ impl<P: Port, C: Clock> Proto<P, C> {
         match cmd {
             Cmd::Info => self.respond(OK, self.version.as_bytes()),
 
-            Cmd::Add => match parse_add(p) {
-                Ok((entry, replace)) => {
-                    let r = dev.add(&entry, replace);
+            Cmd::ItemPut => match parse_item_put(p) {
+                Ok((name, category, item, replace)) => {
+                    let r = dev.put(name, category, item, replace);
                     self.result(r);
                 }
                 Err(m) => self.reject(m),
@@ -188,13 +208,13 @@ impl<P: Port, C: Clock> Proto<P, C> {
             Cmd::List => {
                 let mut out = [0u8; LIST_MAX];
                 let mut o = 0;
-                let r = dev.list(|name, kind| {
+                let r = dev.list(|name, category| {
                     let n = name.as_bytes();
                     out[o] = len_u8(n.len());
                     out[o + 1..o + 1 + n.len()].copy_from_slice(n);
                     o += 1 + n.len();
-                    out[o..o + Kind::WIRE_LEN].copy_from_slice(&kind.wire());
-                    o += Kind::WIRE_LEN;
+                    out[o] = category;
+                    o += 1;
                 });
                 match r {
                     Ok(()) => self.respond(OK, &out[..o]),
@@ -230,19 +250,22 @@ impl<P: Port, C: Clock> Proto<P, C> {
                 }
             }
 
-            Cmd::Reveal | Cmd::Login => {
-                let Some((name, _)) = take_name(p) else {
+            Cmd::ItemGet => {
+                let Some((name, rest)) = take_name(p) else {
                     return self.reject(Malformed::Len);
                 };
-                let mut out = Zeroizing::new([0u8; SECRET_MAX]);
-                let r = if cmd == Cmd::Reveal {
-                    dev.reveal(name, &mut out)
-                } else {
-                    dev.login(name, &mut out)
+                let Some(reach) = rest.first().copied().and_then(reach_of) else {
+                    return self.reject(Malformed::Arg);
                 };
-                match r {
-                    Ok(n) => self.respond(OK, &out[..n]),
-                    Err(f) => self.fail(f),
+                // Answered straight out of the device's buffer: the only copy of those
+                // fields in RAM, scrubbed as soon as this returns. The category and the
+                // classes the item holds come in front, so the host need neither have
+                // listed first nor spend a gesture to learn what kind of thing this is.
+                let r = dev.get(name, reach, |category, present, item| {
+                    self.respond_parts(OK, &[category, present], item);
+                });
+                if let Err(f) = r {
+                    self.fail(f);
                 }
             }
 
@@ -263,26 +286,6 @@ impl<P: Port, C: Clock> Proto<P, C> {
                 };
                 let r = dev.rename(from, to);
                 self.result(r);
-            }
-
-            Cmd::EnvPut => match parse_env_put(p) {
-                Ok((name, blob, replace)) => {
-                    let r = dev.env_put(name, blob, replace);
-                    self.result(r);
-                }
-                Err(m) => self.reject(m),
-            },
-
-            Cmd::EnvGet => {
-                let Some((name, _)) = take_name(p) else {
-                    return self.reject(Malformed::Len);
-                };
-                // The blob is answered straight out of the device's buffer: the only
-                // copy of it in RAM, scrubbed as soon as this returns.
-                let r = dev.env_get(name, |plain| self.respond(OK, plain));
-                if let Err(f) = r {
-                    self.fail(f);
-                }
             }
 
             Cmd::PinStatus => {
@@ -371,30 +374,29 @@ fn parse_import_begin(p: &[u8]) -> Result<(Passphrase<'_>, BackupHead), Malforme
     Ok((pass, head))
 }
 
-/// `name | kind | flags | secret` into an entry and the replace flag.
-fn parse_add(p: &[u8]) -> Result<(Entry, bool), Malformed> {
+/// `name | category | flags | item` into its parts and the replace flag. The item's
+/// own bytes are checked by the device, which parses them before storing anything.
+fn parse_item_put(p: &[u8]) -> Result<(Name<'_>, Category, &[u8], bool), Malformed> {
     let (name, rest) = take_name(p).ok_or(Malformed::Len)?;
-    let (meta, rest) = rest
-        .split_first_chunk::<{ Kind::WIRE_LEN }>()
-        .ok_or(Malformed::Len)?;
-    let (flags, secret) = rest.split_first().ok_or(Malformed::Len)?;
-    if flags & !FLAG_REPLACE != 0 || secret.len() > SECRET_MAX {
+    let (&category, rest) = rest.split_first().ok_or(Malformed::Len)?;
+    let (flags, item) = rest.split_first().ok_or(Malformed::Len)?;
+    if flags & !FLAG_REPLACE != 0 || item.len() > ITEM_MAX {
         return Err(Malformed::Arg);
     }
-    let kind = Kind::from_wire(*meta).ok_or(Malformed::Arg)?;
-    let entry = Entry::new(name, kind, secret).ok_or(Malformed::Arg)?;
-    Ok((entry, flags & FLAG_REPLACE != 0))
+    let category = Category::from_wire(category).ok_or(Malformed::Arg)?;
+    Ok((name, category, item, flags & FLAG_REPLACE != 0))
 }
 
-/// `name | flags | blob` into its parts and the replace flag. The blob's size is the
-/// device's call: it owns the buffer.
-fn parse_env_put(p: &[u8]) -> Result<(Name<'_>, &[u8], bool), Malformed> {
-    let (name, rest) = take_name(p).ok_or(Malformed::Len)?;
-    let (flags, blob) = rest.split_first().ok_or(Malformed::Len)?;
-    if flags & !FLAG_REPLACE != 0 {
-        return Err(Malformed::Arg);
+/// The reach byte of an `ItemGet`. An unknown one is refused rather than rounded down
+/// to something safe-looking: a host that asks in a language this firmware does not
+/// speak gets no fields at all.
+const fn reach_of(b: u8) -> Option<Reach> {
+    match b {
+        REACH_OPEN => Some(Reach::Open),
+        REACH_SECRET => Some(Reach::Secret),
+        REACH_SEED => Some(Reach::Seed),
+        _ => None,
     }
-    Ok((name, blob, flags & FLAG_REPLACE != 0))
 }
 
 /// `old_len u8 | old | new` into two PINs.

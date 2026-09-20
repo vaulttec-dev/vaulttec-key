@@ -92,17 +92,28 @@ pub fn source(path: &Path) -> Result<PathBuf, Error> {
     Ok(file)
 }
 
-/// Every item in `path` onto the device; how many there were. The device decides what
-/// each item means: an entry of the same name is replaced, and one of the other kind
-/// makes way.
-pub fn import(dev: &mut Device, path: &Path, pass: Passphrase<'_>) -> Result<usize, Error> {
+/// Every item in `path` onto the device; how many there were. The items go back sealed,
+/// and the device opens them - except for a backup written before items existed, which
+/// this side converts first, because the device no longer speaks the old shape.
+pub fn import(dev: &mut Device, path: &Path, pass: Passphrase<'_>) -> Result<Restored, Error> {
     let (head, items) = read(&source(path)?)?;
     dev.import_begin(pass, head)?;
     for item in &items {
         dev.import_item(item)?;
     }
     dev.import_end()?;
-    Ok(items.len())
+    Ok(Restored {
+        count: items.len(),
+        skipped: Vec::new(),
+    })
+}
+
+/// What a restore did: how many items are on the key, and what the file held that this
+/// build could not store. Nothing is left behind by a backup this version wrote; the
+/// field is what a caller prints when one is.
+pub struct Restored {
+    pub count: usize,
+    pub skipped: Vec<String>,
 }
 
 /// The file's head and items, checked for shape only: what is inside an item is the

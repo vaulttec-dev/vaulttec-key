@@ -6,28 +6,30 @@
 //!   request:   "VTC2" | cmd u8    | len u16le | payload
 //!   response:  "VTC2" | status u8 | len u16le | payload
 //!
-//! Payloads: a name is a u8 length followed by its bytes. `Add` carries
-//! `name | kind(4) | flags | secret`; `List` answers with `name | kind(4)` per entry;
-//! `Code` sends `name | time u64le` and gets the ASCII code back; `Login` sends a name
-//! and gets the login of a password entry back; `Reveal` the entry's whole secret as
-//! it was added, after a tap; `Rename` carries two names, `old | new`; `EnvPut` is
-//! `name | flags | blob`, the whole `.env` in one frame; `EnvGet` sends a name and
-//! gets the blob back after a tap; `Respond` sends `name | challenge(32)` and gets
-//! the Ed25519 signature of `AUTH_SIGNED_PREFIX | challenge` back after a tap;
-//! `PinChange` is `old_len u8 | old | new`;
-//! `PinStatus` answers `has_pin | unlocked | attempts_left | chip_bound`. A password
-//! entry's secret is `login_len u8 | login | password_len u8 | password | note`.
+//! Payloads: a name is a u8 length followed by its bytes. `ItemPut` carries
+//! `name | category u8 | flags u8 | item`; `List` answers with `name | category u8`
+//! per item; `Code` sends `name | time u64le` and gets the ASCII code back; `ItemGet`
+//! sends `name | reach u8` and gets `category u8 | item` back, holding only the fields
+//! that reach allows - and taking the gesture that reach costs; `Rename` carries two
+//! names, `old | new`; `Respond` sends `name | challenge(32)` and gets the Ed25519
+//! signature of `AUTH_SIGNED_PREFIX | challenge` back after a tap; `PinChange` is
+//! `old_len u8 | old | new`; `PinStatus` answers
+//! `has_pin | unlocked | attempts_left | chip_bound`.
 //!
-//! A backup is every entry and blob, each sealed on the device under a key made from
-//! a passphrase (Argon2id, no chip key): `ExportBegin` carries the passphrase, needs a
-//! double tap, and answers a [`BackupHead`]; each `ExportNext` answers one sealed
-//! item - `kind(4) | name | secret` under the tag, `BACKUP_AAD` plus the item's index
-//! as associated data - and an empty answer ends it. `ImportBegin` is the head with
-//! the passphrase behind it, `ImportItem` one sealed item, `ImportEnd` writes the
-//! table. The host keeps the items in a file in that order; the device never sees
-//! the file.
+//! An item's own bytes are `crate::item`'s: `category | count | field*`, where a field
+//! is `class | kind | section | label | value`. The class is what the device enforces;
+//! the reach byte of `ItemGet` is `Reach` as a number.
+//!
+//! A backup is every item, each sealed on the device under a key made from a passphrase
+//! (Argon2id, no chip key): `ExportBegin` carries the passphrase, needs a double tap, and
+//! answers a [`BackupHead`]; each `ExportNext` answers one sealed item (`category | name |
+//! item` under the tag, `BACKUP_AAD` plus the item's index as associated data), and an
+//! empty answer ends it. `ImportBegin` is the head with the passphrase behind it,
+//! `ImportItem` one sealed item, `ImportEnd` makes them the vault. The host keeps the
+//! items in a file in that order; the device never sees the file.
 
-use crate::oath::{ENV_MAX, Kind, NAME_MAX};
+use crate::item::ITEM_MAX;
+use crate::oath::NAME_MAX;
 use crate::vault::{Cost, OVERHEAD, SALT_LEN};
 
 pub const MAGIC: [u8; 4] = *b"VTC2";
@@ -56,36 +58,32 @@ pub fn frame_head(tag: u8, len: u16) -> [u8; 7] {
     head[5..7].copy_from_slice(&len.to_le_bytes());
     head
 }
-/// The longest backup item: an env blob with its kind and name, sealed.
-pub const ITEM_MAX: usize = Kind::WIRE_LEN + 1 + NAME_MAX + ENV_MAX + OVERHEAD;
-/// The longest request: an `ImportItem` with the biggest item, which outgrows an
-/// `EnvPut` by the kind and the AEAD overhead. Requests only; a response is bounded
-/// by its u16 length alone.
-pub const MAX_PAYLOAD: usize = ITEM_MAX;
+/// The longest backup item: an item with its category and name in front, sealed.
+pub const BACKUP_ITEM_MAX: usize = 2 + NAME_MAX + ITEM_MAX + OVERHEAD;
+/// The longest request: an `ImportItem` carrying the biggest backup item, which
+/// outgrows an `ItemPut` by the AEAD overhead. Requests only; a response is bounded by
+/// its u16 length alone.
+pub const MAX_PAYLOAD: usize = 1 + NAME_MAX + BACKUP_ITEM_MAX;
 const _: () = assert!(
-    MAX_PAYLOAD >= 2 + NAME_MAX + ENV_MAX && ITEM_MAX <= u16::MAX as usize,
-    "an EnvPut and an item both fit a frame"
+    MAX_PAYLOAD >= 2 + NAME_MAX + ITEM_MAX && MAX_PAYLOAD <= u16::MAX as usize,
+    "an ItemPut and a backup item both fit a frame"
 );
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum Cmd {
     Info = 0x01,
-    Add = 0x10,
+    /// A whole item in; the PIN is enough - nothing comes out.
+    ItemPut = 0x10,
     List = 0x11,
     /// A TOTP code; the button must be tapped.
     Code = 0x12,
     Delete = 0x13,
-    /// A password, as stored; the button must be tapped.
-    Reveal = 0x14,
-    /// The login that goes with a password; the PIN is enough.
-    Login = 0x15,
-    /// A new name for an entry; the PIN is enough, nothing leaves the device.
+    /// The fields of an item that the request's reach allows, and the gesture that
+    /// reach costs: none for open fields, a tap for secrets, two for seeds.
+    ItemGet = 0x14,
+    /// A new name for an item; the PIN is enough, nothing leaves the device.
     Rename = 0x16,
-    /// A whole env blob in; the PIN is enough.
-    EnvPut = 0x17,
-    /// A whole env blob out; the button must be tapped.
-    EnvGet = 0x18,
     /// A challenge signed with an auth secret; the button must be tapped, the PIN is
     /// not needed.
     Respond = 0x19,
@@ -114,15 +112,12 @@ impl Cmd {
     pub const fn from_wire(b: u8) -> Option<Self> {
         Some(match b {
             0x01 => Self::Info,
-            0x10 => Self::Add,
+            0x10 => Self::ItemPut,
             0x11 => Self::List,
             0x12 => Self::Code,
             0x13 => Self::Delete,
-            0x14 => Self::Reveal,
-            0x15 => Self::Login,
+            0x14 => Self::ItemGet,
             0x16 => Self::Rename,
-            0x17 => Self::EnvPut,
-            0x18 => Self::EnvGet,
             0x19 => Self::Respond,
             0x20 => Self::PinStatus,
             0x21 => Self::PinSet,
@@ -153,8 +148,21 @@ pub const AUTH_SIGNATURE_LEN: usize = 64;
 /// valid as anything else.
 pub const AUTH_SIGNED_PREFIX: &[u8; 16] = b"vaultkey/auth/v1";
 
-/// `Add` and `EnvPut` flags.
+/// `ItemPut` flags.
 pub const FLAG_REPLACE: u8 = 0x01;
+
+/// How far into an item a request reaches, and therefore what gesture it costs. The
+/// byte an `ItemGet` carries; the device turns it into a `device::Reach`.
+pub const REACH_OPEN: u8 = 0x01;
+pub const REACH_SECRET: u8 = 0x02;
+pub const REACH_SEED: u8 = 0x03;
+
+/// The second byte of an `ItemGet` answer: which classes the item holds at all, so the
+/// host can tell a TOTP item from a password one without spending a gesture to find
+/// out. It says what exists, never what it is.
+pub const HAS_OPEN: u8 = 0x01;
+pub const HAS_SECRET: u8 = 0x02;
+pub const HAS_SEED: u8 = 0x04;
 
 /// Status bytes that are not a [`Fail`]: success, and two ways to send garbage.
 pub const OK: u8 = 0x00;

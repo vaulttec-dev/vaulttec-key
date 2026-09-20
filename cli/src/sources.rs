@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::replace_file;
-use crate::device::{Device, Error, Kind, Stored};
+use crate::device::{Category, Device, Error, Reach, Stored};
 use crate::import::Summary;
 use crate::prompt::SyncUi;
 
@@ -224,20 +224,14 @@ pub(crate) fn absorb(
 }
 
 /// Pings the device at most every 30 s during a long sync to reset its auto-lock.
-pub(crate) fn keep_unlocked(dev: &mut Device, target: Option<&(String, Kind)>, last: &mut Instant) {
+/// Reading the open fields of an item is the ping: it needs the PIN and no gesture, so
+/// a long sync never asks the person to touch the board for a heartbeat.
+pub(crate) fn keep_unlocked(dev: &mut Device, target: Option<&String>, last: &mut Instant) {
     if last.elapsed() < Duration::from_secs(30) {
         return;
     }
-    if let Some((name, kind)) = target {
-        match kind {
-            Kind::Password => {
-                let _ = dev.login(name);
-            }
-            Kind::Env => {
-                let _ = dev.env_get(name);
-            }
-            Kind::Totp(_) | Kind::Auth => {}
-        }
+    if let Some(name) = target {
+        let _ = dev.get(name, Reach::Open);
     }
     *last = Instant::now();
 }
@@ -249,7 +243,7 @@ pub(crate) fn prune(
     map: &mut Manifest,
     phase: &Phase,
     on_device: &BTreeSet<String>,
-    ping: Option<&(String, Kind)>,
+    ping: Option<&String>,
     ui: &mut dyn SyncUi,
     run: &mut SyncRun,
 ) -> Result<(), Error> {
@@ -304,12 +298,13 @@ pub(crate) fn prune(
     Ok(())
 }
 
-/// An entry worth pinging the device with to hold off its auto-lock: one that can be
-/// read back, out of a listing already in hand.
-pub(crate) fn survivor(entries: &[Stored]) -> Option<(String, Kind)> {
-    entries.iter().find_map(|e| {
-        matches!(e.kind, Kind::Password | Kind::Env).then(|| (e.name.clone(), e.kind))
-    })
+/// An item worth pinging the device with to hold off its auto-lock: any but an auth
+/// secret, which refuses to be read at all, out of a listing already in hand.
+pub(crate) fn survivor(entries: &[Stored]) -> Option<String> {
+    entries
+        .iter()
+        .find(|e| e.category != Category::Auth)
+        .map(|e| e.name.clone())
 }
 
 /// Every name the key holds. A listing that does not come back reads as empty, which
@@ -362,7 +357,7 @@ pub(crate) fn finish(
     dev: &mut Device,
     map: &mut Manifest,
     phases: &[Phase],
-    ping: Option<&(String, Kind)>,
+    ping: Option<&String>,
     ui: &mut dyn SyncUi,
     run: &mut SyncRun,
 ) -> Result<(), Error> {

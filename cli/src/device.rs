@@ -11,15 +11,61 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serialport::{SerialPort, SerialPortType};
-pub use vaultkey_core::oath::{
-    AUTH_SECRET_LEN, Algo, Digits, ENV_MAX, Entry, Kind, NAME_MAX, Name, Params, SECRET_MAX,
-};
+pub use vaultkey_core::item::{Category, Class, FieldKind, VALUE_MAX};
+pub use vaultkey_core::oath::{AUTH_SECRET_LEN, Algo, Digits, NAME_MAX, Name, Params};
 pub use vaultkey_core::store::MAX_ATTEMPTS;
 pub use vaultkey_core::vault::{PASS_MIN, PIN_LEN, Passphrase, Pin};
 pub use vaultkey_core::wire::{AUTH_CHALLENGE_LEN, AUTH_SIGNATURE_LEN, AUTH_SIGNED_PREFIX};
-use vaultkey_core::wire::{BAD_LEN, Cmd, FLAG_REPLACE, Fail, MAGIC, OK, frame_head, scan_magic};
+use vaultkey_core::wire::{
+    BAD_LEN, Cmd, FLAG_REPLACE, Fail, HAS_SECRET, HAS_SEED, MAGIC, OK, REACH_OPEN, REACH_SECRET,
+    REACH_SEED, frame_head, scan_magic,
+};
 pub use vaultkey_core::wire::{BackupHead, PinStatus};
 use zeroize::Zeroizing;
+
+use crate::item::Item;
+
+/// How far into an item a request reaches, and therefore what the person at the board
+/// has to do. Named here rather than in `wire` so the CLI reads as the person does:
+/// "the login needs nothing, the password needs a tap, the seed needs two".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Reach {
+    /// The PIN alone: logins, URLs, account numbers.
+    Open,
+    /// A tap: passwords, notes, private keys.
+    Secret,
+    /// Two taps: the seeds as well - the whole item, as an export needs it.
+    Seed,
+}
+
+impl Reach {
+    const fn wire(self) -> u8 {
+        match self {
+            Reach::Open => REACH_OPEN,
+            Reach::Secret => REACH_SECRET,
+            Reach::Seed => REACH_SEED,
+        }
+    }
+}
+
+/// What an item holds, whether or not this request could see it: what exists, never
+/// what it is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Shape(u8);
+
+impl Shape {
+    /// Whether a code can be had from this item.
+    #[must_use]
+    pub const fn has_seed(self) -> bool {
+        self.0 & HAS_SEED != 0
+    }
+
+    /// Whether a tap would bring anything back.
+    #[must_use]
+    pub const fn has_secret(self) -> bool {
+        self.0 & HAS_SECRET != 0
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -161,33 +207,11 @@ pub fn open_port<T>(
     }
 }
 
-/// One stored entry as the device lists it: name and kind, no secret.
+/// One stored item as the device lists it: name and category, no fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stored {
     pub name: String,
-    pub kind: Kind,
-}
-
-/// A kind for a list: what differs from the common case, so the common case reads as
-/// nothing - a TOTP with the usual parameters describes as an empty string.
-pub fn describe(kind: Kind) -> String {
-    let p = match kind {
-        Kind::Totp(p) => p,
-        Kind::Password => return "password".into(),
-        Kind::Env => return "env".into(),
-        Kind::Auth => return "auth".into(),
-    };
-    let mut bits = Vec::new();
-    if p.digits != Digits::Six {
-        bits.push(format!("{} digits", p.digits.wire()));
-    }
-    if p.period.get() != 30 {
-        bits.push(format!("{}s", p.period));
-    }
-    if p.algo == Algo::Sha256 {
-        bits.push("SHA256".into());
-    }
-    bits.join(" · ")
+    pub category: Category,
 }
 
 /// The board's serial port, or None. Never hardcoded: the number changes after a reset.
@@ -242,9 +266,9 @@ pub fn name(text: &str) -> Result<Name<'_>, Error> {
     })
 }
 
-/// What the firmware takes as an env blob - not empty, at most `ENV_MAX` bytes - and
-/// what this side insists on: one `KEY=value` per line, nothing else, so a stored
-/// `.env` is always the one shape `env $(vkey get ...)` can consume.
+/// What this side insists on for a `.env`: one `KEY=value` per line, nothing else, so a
+/// stored `.env` is always the one shape `env $(vkey get ...)` can consume. It is an
+/// item like any other now - one secret field - but the shape is still checked here.
 pub struct EnvBlob(Zeroizing<Vec<u8>>);
 
 impl EnvBlob {
@@ -253,9 +277,9 @@ impl EnvBlob {
         if blob.is_empty() {
             return Err(Error::Value("the .env is empty".into()));
         }
-        if blob.len() > ENV_MAX {
+        if blob.len() > VALUE_MAX {
             return Err(Error::Value(format!(
-                "the .env is {} bytes; the limit is {ENV_MAX}",
+                "the .env is {} bytes; the limit is {VALUE_MAX}",
                 blob.len()
             )));
         }
@@ -277,9 +301,15 @@ impl EnvBlob {
         Ok(EnvBlob(blob))
     }
 
+    /// The item a `.env` is stored as: one secret field, behind a tap like a password.
     #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+    pub fn item(&self) -> Item {
+        Item::new(Category::Env).with(crate::item::OwnedField::new(
+            Class::Secret,
+            FieldKind::String,
+            ".env",
+            &self.0,
+        ))
     }
 }
 
@@ -300,24 +330,41 @@ pub fn env_file(path: &Path) -> Result<EnvBlob, Error> {
     EnvBlob::new(blob)
 }
 
-/// Login, password and note packed the way the firmware stores them, checked by the
-/// same code that will unpack them.
-pub fn password_blob(
-    name: &str,
-    login: &str,
-    password: &str,
-    note: &str,
-) -> Result<Zeroizing<Vec<u8>>, Error> {
-    let name = self::name(name)?;
-    let entry = Entry::password(name, login.as_bytes(), password.as_bytes(), note.as_bytes())
-        .ok_or_else(|| {
-            Error::Value(format!(
-                "the password must not be empty; login and password are one line each \
-                 (no control characters), up to 255 bytes, and with the note - text, \
-                 newlines allowed - {SECRET_MAX} bytes together"
-            ))
-        })?;
-    Ok(Zeroizing::new(entry.secret().to_vec()))
+/// A login item: the login open, the password and the note behind a tap. What `add`
+/// builds, and what an import builds for every row that has a password.
+pub fn login_item(login: &str, password: &str, note: &str) -> Result<Item, Error> {
+    if password.is_empty() {
+        return Err(Error::Value("the password must not be empty".into()));
+    }
+    let mut item = Item::new(Category::Login).with(crate::item::OwnedField::new(
+        Class::Secret,
+        FieldKind::Concealed,
+        "password",
+        password.as_bytes(),
+    ));
+    if !login.is_empty() {
+        item.fields.insert(
+            0,
+            crate::item::OwnedField::new(
+                Class::Open,
+                FieldKind::String,
+                "username",
+                login.as_bytes(),
+            ),
+        );
+    }
+    if !note.is_empty() {
+        item.fields.push(crate::item::OwnedField::new(
+            Class::Secret,
+            FieldKind::String,
+            "notesPlain",
+            note.as_bytes(),
+        ));
+    }
+    // Packed once here and thrown away: an item that cannot be stored must be refused
+    // where it is built, not half-way through a sync that has already written others.
+    item.pack()?;
+    Ok(item)
 }
 
 /// What the firmware accepts as a name, with the wire's length prefix in front.
@@ -459,26 +506,37 @@ impl Device {
 
     // --- entries ---------------------------------------------------------------
 
-    pub fn add(
-        &mut self,
-        name: &str,
-        secret: &[u8],
-        kind: Kind,
-        replace: bool,
-    ) -> Result<(), Error> {
-        if secret.is_empty() || secret.len() > SECRET_MAX {
-            return Err(Error::Value(format!(
-                "secret must be 1..{SECRET_MAX} bytes"
-            )));
-        }
+    /// A whole item in; the PIN is enough, nothing comes out.
+    pub fn put(&mut self, name: &str, item: &Item, replace: bool) -> Result<(), Error> {
+        let packed = item.pack()?;
         let mut p = Zeroizing::new(name_bytes(name)?);
-        p.extend_from_slice(&kind.wire());
+        p.push(item.category.wire());
         p.push(if replace { FLAG_REPLACE } else { 0 });
-        p.extend_from_slice(secret);
-        self.request(Cmd::Add, &p).map(drop)
+        p.extend_from_slice(&packed);
+        self.request(Cmd::ItemPut, &p).map(drop)
     }
 
-    /// Every entry's name and kind; works while locked.
+    /// The fields of an item that `reach` allows, and the gesture it costs: nothing for
+    /// open fields, a tap for secrets, two taps for seeds.
+    pub fn get(&mut self, name: &str, reach: Reach) -> Result<Item, Error> {
+        self.get_with_shape(name, reach).map(|(item, _)| item)
+    }
+
+    /// The same, plus what the item holds beyond this reach: whether there is a secret
+    /// and whether there is a seed. Knowing costs no gesture - it is what lets the
+    /// shell offer a code for an item that has one and a password for one that does
+    /// not, without asking the person to touch the board to find out.
+    pub fn get_with_shape(&mut self, name: &str, reach: Reach) -> Result<(Item, Shape), Error> {
+        let mut p = name_bytes(name)?;
+        p.push(reach.wire());
+        let body = self.request(Cmd::ItemGet, &p)?;
+        let (&category, rest) = body.split_first().ok_or(Error::Device(BAD_LEN))?;
+        let (&present, item) = rest.split_first().ok_or(Error::Device(BAD_LEN))?;
+        let _ = Category::from_wire(category).ok_or(Error::Device(BAD_LEN))?;
+        Ok((Item::unpack(item)?, Shape(present)))
+    }
+
+    /// Every item's name and category. Needs the PIN, like everything else.
     pub fn list(&mut self) -> Result<Vec<Stored>, Error> {
         let body = self.request(Cmd::List, &[])?;
         let mut out = Vec::new();
@@ -488,13 +546,13 @@ impl Device {
             let Some((name, tail)) = tail.split_at_checked(n) else {
                 return Err(Error::Device(BAD_LEN));
             };
-            let Some((meta, tail)) = tail.split_first_chunk::<{ Kind::WIRE_LEN }>() else {
+            let Some((&category, tail)) = tail.split_first() else {
                 return Err(Error::Device(BAD_LEN));
             };
-            let kind = Kind::from_wire(*meta).ok_or(Error::Device(BAD_LEN))?;
+            let category = Category::from_wire(category).ok_or(Error::Device(BAD_LEN))?;
             out.push(Stored {
                 name: String::from_utf8_lossy(name).into_owned(),
-                kind,
+                category,
             });
             rest = tail;
         }
@@ -507,22 +565,6 @@ impl Device {
         let mut p = name_bytes(name)?;
         p.extend_from_slice(&t.to_le_bytes());
         Ok(String::from_utf8_lossy(&self.request(Cmd::Code, &p)?).into_owned())
-    }
-
-    /// The login of a password entry; the PIN is enough.
-    pub fn login(&mut self, name: &str) -> Result<Zeroizing<Vec<u8>>, Error> {
-        let p = name_bytes(name)?;
-        self.request(Cmd::Login, &p)
-    }
-
-    /// A password entry - login, password, note - after a tap. Unpacked by the same
-    /// `Entry` the firmware packed it with; anything else on the wire is a broken device.
-    pub fn reveal(&mut self, name: &str) -> Result<Entry, Error> {
-        let p = name_bytes(name)?;
-        let packed = self.request(Cmd::Reveal, &p)?;
-        let name = Name::new(name.as_bytes()).ok_or(Error::BadArg)?;
-        Entry::new(name, Kind::Password, &packed)
-            .ok_or_else(|| Error::Value("the device sent a malformed password entry".into()))
     }
 
     /// `challenge` signed with the auth secret `name`, after a tap; no PIN needed.
@@ -549,20 +591,6 @@ impl Device {
         let mut p = name_bytes(from)?;
         p.extend_from_slice(&name_bytes(to)?);
         self.request(Cmd::Rename, &p).map(drop)
-    }
-
-    /// A whole `.env` in, one frame; the PIN is enough.
-    pub fn env_put(&mut self, name: &str, blob: &EnvBlob, replace: bool) -> Result<(), Error> {
-        let mut p = Zeroizing::new(name_bytes(name)?);
-        p.push(if replace { FLAG_REPLACE } else { 0 });
-        p.extend_from_slice(blob.as_bytes());
-        self.request(Cmd::EnvPut, &p).map(drop)
-    }
-
-    /// A whole `.env` out, after a tap.
-    pub fn env_get(&mut self, name: &str) -> Result<Zeroizing<Vec<u8>>, Error> {
-        let p = name_bytes(name)?;
-        self.request(Cmd::EnvGet, &p)
     }
 
     // --- backup ----------------------------------------------------------------------

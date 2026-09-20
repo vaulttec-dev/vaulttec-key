@@ -152,58 +152,76 @@ the protocol and logs — hence the `VTC2` magic word in frames. Pins and pitfal
   the real firmware with the counter erased was costed: a fortnight for six digits, four years
   for eight). A backup passphrase is 12–128 bytes, and the CLI asks for five or six random
   words, because 128 KiB of Argon2id does not make up for a phrase a person invented.
-- The entry kind (`oath::Kind`) decides what may leave the device. `Totp` — codes only,
-  after a tap. `Password` — the login with no gesture, the password and note after the same
-  tap (blob `login_len | login | password_len | password | note`, assembled only by
-  `Entry::password`). `Env` — a project `.env` whole, up to `ENV_MAX` = 8000 bytes,
-  `KEY=value` lines only (checked by the CLI, not the firmware), after the same tap. The
-  single `match` on kind lives in `device.rs`; a TOTP secret has no path to `respond`. The
-  kind is in the AAD with the name: a kind byte rewritten in flash breaks the tag instead of
-  turning a seed into a password.
-- `Env` is never an `Entry` (the constructor returns `None`): the blob lives in 16 slots of
-  its own region (`env_*` in `store.rs`), encrypted under a random env key kept in the image
-  header sealed under the DEK — a PIN change reseals 60 bytes in the same atomic write and
-  leaves blobs untouched. Entry and blob names share one namespace. Everything, `list`
-  included, requires the PIN; auto-lock is 2 minutes.
+- **A field's class decides what may leave the device**, not the item's category
+  (2026-09-19, maintainer's decision; `docs/items-v2.md`). An item is a name, a category
+  and up to 32 fields; a field is `class | kind | section | label | value`, the value up
+  to `VALUE_MAX` = 8128 bytes and the packed item up to `ITEM_MAX` = 8192. `Open` needs
+  the PIN alone, `Secret` a tap, `Seed` a tap for the code it computes and the double tap
+  for the seed itself. The host names a reach per request and gets only those fields; an
+  unknown reach byte is refused, never rounded down. The single `match` on class lives in
+  `device.rs`. The category is in the AAD with the name: a category byte rewritten in
+  flash breaks the tag, even with the CRC repaired.
+- The answer to `ItemGet` carries the classes the item holds (`HAS_OPEN`/`HAS_SECRET`/
+  `HAS_SEED`) in front of the fields, so the host can tell a TOTP item from a password one
+  without spending a gesture to find out. What exists, never what it is.
+- A `.env` is an item of category `Env` with one secret field; `KEY=value` lines are
+  checked by the CLI, not the firmware. There is no env region and no env key any more:
+  blobs are items, sealed under the DEK and re-sealed with everything else when the PIN
+  changes. Names are one namespace. Everything, `list` included, requires the PIN;
+  auto-lock is 2 minutes.
+- A seed's value is `algo | digits | period | secret`: the parameters travel with it
+  because the device has nowhere else to keep them, and a code's shape is not a secret.
+  The CLI turns an `otpauth://` URI into that on the way in and back into a URI on the way
+  out (`totp::seed_field`, `totp::seed_uri`).
 - The one exception is `Auth` (2026-09-14, maintainer's decision): a 32-byte Ed25519 seed
   for `vkey auth` (`sudo` and the lock screen via `pam_exec`), sealed under
   `DeviceKey::mac("vaultkey/auth-key/v1")` — the eFuse key alone, never the DEK — so
   `Respond` signs `AUTH_SIGNED_PREFIX | challenge` after a tap while locked, spending no
-  attempt. Refused on an unbound chip. Which key a record is under is decided in one place,
-  `Device::record_key`; a PIN change skips `Auth` records. A login waits 10 s for the tap
+  attempt. Refused on an unbound chip. Which key an item is under is decided in one place,
+  `Device::item_key`; a PIN change carries `Auth` items across untouched. A login waits 10 s for the tap
   (`AUTH_TOUCH_TIMEOUT_MS`), then PAM asks for the password. The host keeps only the public
   key, `/etc/vkey/auth/<user>`, and writes nothing at login. `sudo vkey auth enable` is the
   one place the CLI writes system files: `/usr/local/bin/vkey`, the public key, and one
   `sufficient` line in the PAM services of `SERVICES` (`cli/src/auth.rs`), each original
   kept as `*.before-vkey`; `disable` undoes it.
-- The only way a TOTP secret leaves the device is the backup (`ExportBegin`/`ExportNext`,
-  after a double tap; 2026-09-09): the device reseals every entry and blob under a key
-  derived from a passphrase (Argon2id, `Passphrase` 12–128 bytes, without the chip key, so
-  the file opens on another board) and returns them one at a time; the host sees only
-  ciphertext and assembles a `.vkb`. `ImportBegin`/`ImportItem`/`ImportEnd` is the reverse,
-  under the PIN, with no gesture, like `add`: entries are collected in RAM and written as one
-  image in `ImportEnd`, blobs immediately after the table is written if it is dirty. A backup
+- A TOTP seed leaves the device two ways. The backup (`ExportBegin`/`ExportNext`, after a
+  double tap; 2026-09-09) reseals every item under a key derived from a passphrase
+  (Argon2id, `Passphrase` 12–128 bytes, without the chip key, so the file opens on another
+  board) and returns them one at a time; the host sees only ciphertext and assembles a
+  `.vkb`. `ImportBegin`/`ImportItem`/`ImportEnd` is the reverse, under the PIN with no
+  gesture: the items are appended to a fresh image as they arrive and become the vault at
+  `ImportEnd`, so a restore that stops half-way leaves what was there before. A backup
   session is killed by any `load()`, by `lock`, and by the first error. An item's AAD is
   `BACKUP_AAD` plus its index in the file: a reordered or altered item does not open
   (`BadBackup`).
+  The second way is `vkey export` (2026-09-19): an item written back into 1Password
+  through `op item create`, under the same double tap, with the seed in the clear. That
+  ends the claim that a seed never leaves — `docs/threat-model.md` says what it costs.
 - Secrets and PINs never come from command arguments or environment variables: the CLI asks
   hidden or reads a line from stdin, and holds them in `Zeroizing`.
 - Flash: `store.rs` knows *how*, the board says *where* (`Layout` in its `main.rs`; on
   C6-Zero 0x110000..0x17B000, raw flash past the `factory` partition, which the stock
-  partition table does not describe). The PIN header and the entry table (256 slots of
-  `SECRET_MAX` = 256 bytes) are **one** image, two A/B copies with a serial and a CRC; a PIN
-  change is atomic. Every `add` rewrites the whole image, and the cost is erasing its sectors
-  (~45 ms each): 512-byte slots gave 1.7 s per write, hence 256. The ~80 KiB image lives in
-  RAM in a single instance — `State` in the board's static, filled in place by `Device`.
-  `Store` remembers only which copy is newer, never the content; `pin_status` answers from
-  the 12-byte head of each copy without a CRC — it is the shell's status tick once a second.
-  Never pass or return `State` by value: the stack is 308 KiB and three copies overflowed it.
-- The `.env` region is 16 slots, two copies over 2 sectors, each with its own serial and CRC;
-  a damaged copy reads as empty, not `Corrupt`, because an interrupted write of a new blob
-  has no older copy to roll back to. One blob in RAM — a static buffer, sealed and opened in
-  place. A host request is read into a stack buffer of `MAX_PAYLOAD` bytes: a blob travels in
-  one frame, no chunking. The attempt counter is a separate sector; an attempt is one word
-  write with no erase, only via `NorFlash::write`.
+  partition table does not describe). Three regions: one sector of attempt words and two
+  image copies of `STATE_SECTORS` = 53 each, filling the region exactly.
+- The image is the PIN header and every item, **packed** - `name_len | category |
+  sealed_len | name | pad | sealed | pad` - not fixed slots: a seed is twenty bytes and an
+  SSH key three kilobytes, and slots would make every write cost what the biggest item
+  might have been. A write erases only the sectors the image grows into, plus whatever the
+  image it replaces left beyond it, so an `add` costs the vault's size (~0.8 s for 66
+  items), not the region's.
+- The magic word is written **last**, after the items and the CRC: until it lands the copy
+  reads as blank, so a torn write is not a copy a reader has to reason about. The CRC is
+  computed over what was actually read back from the target, not over what was meant to be
+  written.
+- The image never sits in RAM. What RAM holds is an `Index` - name, category, offset and
+  length per item, ~10 KiB for 256 - in the board's static, and bodies stream through the
+  working buffer. That is what pays for items bigger than the old 256-byte secret. `Store`
+  remembers only which copy is newer, never the content; `pin_status` answers from the
+  20-byte head of each copy without a CRC — it is the shell's status tick once a second.
+- The board's buffer is two item-sized halves (`BUF_LEN` = 2 × `ITEM_BUF_LEN`): one to
+  open or build an item in, one for the items carried across while the image is rewritten.
+  The attempt counter is a separate sector; an attempt is one word write with no erase,
+  only via `NorFlash::write`.
 - Entropy: `TrngSource::new(RNG, ADC1)` before `Trng::try_new()`; do not drop the handle.
 - Acceptance happens on the board, in two tiers, because the full test wipes the device and
   a working key cannot be wiped after every change:

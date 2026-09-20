@@ -4,16 +4,18 @@
 //! 1Password in memory (`Zeroizing`), without writing cleartext files to disk.
 
 use std::collections::{BTreeSet, HashMap};
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
 use crate::auth::replace_file;
-use crate::device::{Device, EnvBlob, Error, Kind, password_blob};
-use crate::import::{Summary, entry_name, truncate};
+use crate::device::{Category, Class, Device, EnvBlob, Error, FieldKind, Reach};
+use crate::import::{Summary, entry_name, truncate, unique_name};
+use crate::item::{Item, OwnedField, class_of, field_kind_name, field_kind_of, op_category};
 use crate::prompt::SyncUi;
 use crate::sources::{
     Manifest, OP_DOC, OP_ENV, OP_ITEM, Outcome, Phase, SyncRun, absorb, claim_written, config_path,
@@ -76,6 +78,39 @@ fn op_exec(args: &[&str]) -> Result<Zeroizing<Vec<u8>>, Error> {
     Ok(Zeroizing::new(output.stdout))
 }
 
+/// Runs `op` with `stdin` fed to it, for the item JSON an export sends back. The
+/// secrets go down a pipe rather than into the command line, where the shell history
+/// and every other process on the machine would see them.
+fn op_exec_stdin(args: &[&str], stdin: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {
+    check_op()?;
+    let mut child = Command::new("op")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| Error::Value(format!("failed to run 'op': {e}")))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| Error::Value("'op' took no stdin".into()))?
+        .write_all(stdin)
+        .map_err(|e| Error::Value(format!("failed to write to 'op': {e}")))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|e| Error::Value(format!("failed to run 'op': {e}")))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        let msg = err.trim();
+        return Err(Error::Value(if msg.is_empty() {
+            format!("'op' failed with exit code {}", output.status)
+        } else {
+            msg.to_string()
+        }));
+    }
+    Ok(Zeroizing::new(output.stdout))
+}
+
 /// `op <what> list` as JSON, narrowed to a tag and a vault when given.
 fn op_list(
     what: &str,
@@ -96,8 +131,6 @@ fn op_list(
 pub(crate) struct OpListEntry {
     pub(crate) id: String,
     pub(crate) title: String,
-    #[serde(default)]
-    pub(crate) category: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -112,6 +145,25 @@ pub(crate) struct OpField {
     pub(crate) purpose: Option<String>,
     #[serde(default)]
     pub(crate) value: Option<String>,
+    /// Which section of the item the field is shown in. Carried because the mirror runs
+    /// both ways: an item written back without its sections is a flat item.
+    #[serde(default)]
+    pub(crate) section: Option<OpSection>,
+}
+
+#[derive(Deserialize, Debug)]
+pub(crate) struct OpSection {
+    #[serde(default)]
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) label: Option<String>,
+}
+
+impl OpSection {
+    /// What to show and store: the label if there is one, else the id 1Password made.
+    fn name(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.id)
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -133,80 +185,152 @@ pub(crate) struct OpItemDetail {
     pub(crate) urls: Vec<OpUrl>,
 }
 
-/// Extracted credentials from a 1Password item.
-pub(crate) struct Extracted {
-    pub(crate) password: Option<(String, Zeroizing<String>, Zeroizing<String>)>,
-    pub(crate) otp: Option<Zeroizing<String>>,
-    pub(crate) env: Option<Zeroizing<Vec<u8>>>,
-}
+/// A 1Password item as the key stores it: every field, with its section, its type and
+/// the class its type implies.
+///
+/// There is no longer a question of "which field is *the* password". The key holds
+/// fields now, so `master-password`, `password_reset[password]` and a custom field
+/// named in any language all travel as themselves, under their own labels, and the
+/// class - not the label - decides which gesture reaches them. What used to be lost or
+/// quietly substituted is simply carried.
+///
+/// The one field that is rewritten is a one-time password: 1Password keeps an
+/// `otpauth://` URI, and the device wants the parameters and the seed, so the URI is
+/// parsed here and rebuilt on the way back out.
+pub(crate) fn item_of(detail: &OpItemDetail) -> Result<(Item, Vec<String>), Error> {
+    let mut item = Item::new(category_of_op(&detail.category));
+    let mut notes = Vec::new();
 
-/// Inspects fields of a 1Password item and categorizes secrets.
-pub(crate) fn parse_item_fields(item: &OpItemDetail) -> Extracted {
-    let mut username = String::new();
-    let mut password = None;
-    let mut note = Zeroizing::new(String::new());
-    let mut otp = None;
-
-    for f in &item.fields {
-        let Some(raw_val) = &f.value else {
-            continue;
-        };
-        let val = raw_val.trim();
+    for f in &detail.fields {
+        let Some(raw) = &f.value else { continue };
+        let val = raw.trim();
         if val.is_empty() {
             continue;
         }
+        let label = if f.label.is_empty() { &f.id } else { &f.label };
+        let section = f.section.as_ref().map(OpSection::name).unwrap_or_default();
 
-        let is_password = f.purpose.as_deref() == Some("PASSWORD")
-            || f.label.eq_ignore_ascii_case("password")
-            || f.id.eq_ignore_ascii_case("password");
-        let is_username = f.purpose.as_deref() == Some("USERNAME")
-            || f.label.eq_ignore_ascii_case("username")
-            || f.id.eq_ignore_ascii_case("username");
-        let is_notes = f.purpose.as_deref() == Some("NOTES")
-            || f.label.eq_ignore_ascii_case("notesPlain")
-            || f.id.eq_ignore_ascii_case("notesPlain");
-        let is_otp = f.field_type == "OTP"
-            || f.label.eq_ignore_ascii_case("one-time password")
-            || val.starts_with("otpauth://");
-
-        if is_password {
-            password = Some(Zeroizing::new(val.to_string()));
-        } else if is_username {
-            username = val.to_string();
-        } else if is_notes {
-            note = Zeroizing::new(raw_val.trim_end_matches('\r').to_string());
-        } else if is_otp {
-            otp = Some(Zeroizing::new(val.to_string()));
+        // A file field carries a reference, not the file: the bytes are an attachment,
+        // and `op item create` will not take one back from anywhere but a path on disk.
+        if f.field_type.eq_ignore_ascii_case("FILE") {
+            notes.push(format!("'{label}' is an attachment and stays in 1Password"));
+            continue;
         }
+
+        let is_otp = f.field_type.eq_ignore_ascii_case("OTP") || val.starts_with("otpauth://");
+        let field = if is_otp {
+            match totp::resolve(val, Some(&detail.title), None, None, false) {
+                Ok(r) => totp::seed_field(r.params, &r.secret),
+                Err(e) => {
+                    notes.push(format!("'{label}': {e}"));
+                    continue;
+                }
+            }
+        } else {
+            let kind = field_kind_of(&f.field_type);
+            // `purpose` is 1Password's own word for what a field is for, and a NOTES
+            // field is text that may be long; everything else follows its type.
+            let class = if f.purpose.as_deref() == Some("PASSWORD") {
+                Class::Secret
+            } else {
+                class_of(kind)
+            };
+            OwnedField {
+                class,
+                kind,
+                section: section.to_string(),
+                label: label.clone(),
+                value: Zeroizing::new(
+                    if f.purpose.as_deref() == Some("NOTES") {
+                        raw.trim_end_matches('\r')
+                    } else {
+                        val
+                    }
+                    .as_bytes()
+                    .to_vec(),
+                ),
+            }
+        };
+        item.fields.push(field);
     }
 
-    // Check if the item is an ENV file stored in notes
-    let is_env_title = std::path::Path::new(&item.title)
+    // A URL is a field of the item in 1Password's JSON but a list beside it; the key
+    // keeps it as a field so an item written back still autofills.
+    for (i, u) in detail
+        .urls
+        .iter()
+        .filter(|u| !u.href.is_empty())
+        .enumerate()
+    {
+        let label = if u.primary || i == 0 {
+            "website"
+        } else {
+            "url"
+        };
+        item.fields.push(OwnedField::new(
+            Class::Open,
+            FieldKind::Url,
+            label,
+            u.href.as_bytes(),
+        ));
+    }
+
+    // A secure note whose body really is a `.env` becomes one: that is what `vkey env`
+    // looks for, and what a project wants back as a file.
+    if item.category == Category::SecureNote
+        && let Some(note) = item
+            .first(Class::Open)
+            .or_else(|| item.first(Class::Secret))
+        && EnvBlob::new(note.value.clone()).is_ok()
+        && (looks_like_env(&detail.title) || item.fields.len() == 1)
+    {
+        let blob = EnvBlob::new(note.value.clone())?;
+        return Ok((blob.item(), notes));
+    }
+
+    if item.fields.is_empty() {
+        return Err(Error::Value(
+            "no password, one-time password or .env in it".into(),
+        ));
+    }
+    Ok((item, notes))
+}
+
+/// Whether a title says this is a `.env` rather than a note that happens to parse.
+fn looks_like_env(title: &str) -> bool {
+    std::path::Path::new(title)
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("env"))
-        || item.title.to_ascii_lowercase().contains("env");
+        || title.to_ascii_lowercase().contains("env")
+}
 
-    let env = if item.category == "SECURE_NOTE" || is_env_title {
-        if note.is_empty() {
-            None
-        } else {
-            let note_bytes = Zeroizing::new(note.as_bytes().to_vec());
-            if EnvBlob::new(note_bytes.clone()).is_ok() {
-                Some(note_bytes)
-            } else {
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    let pass_tuple = password.map(|pw| (username, pw, note));
-
-    Extracted {
-        password: pass_tuple,
-        otp,
-        env,
+/// 1Password's category name as the key's category. Every one of the twenty-two is
+/// stored; an unknown one becomes a secure note rather than being dropped, because a
+/// category the key cannot name is still an item someone wants back.
+fn category_of_op(cat: &str) -> Category {
+    match cat.to_ascii_uppercase().as_str() {
+        "LOGIN" => Category::Login,
+        "PASSWORD" => Category::Password,
+        "CREDIT_CARD" => Category::CreditCard,
+        "IDENTITY" => Category::Identity,
+        "DOCUMENT" => Category::Document,
+        "SOFTWARE_LICENSE" => Category::SoftwareLicense,
+        "BANK_ACCOUNT" => Category::BankAccount,
+        "DATABASE" => Category::Database,
+        "DRIVER_LICENSE" => Category::DriverLicense,
+        "OUTDOOR_LICENSE" => Category::OutdoorLicense,
+        "MEMBERSHIP" => Category::Membership,
+        "PASSPORT" => Category::Passport,
+        "REWARD_PROGRAM" => Category::RewardProgram,
+        "SOCIAL_SECURITY_NUMBER" => Category::SocialSecurityNumber,
+        "WIRELESS_ROUTER" => Category::WirelessRouter,
+        "SERVER" => Category::Server,
+        "EMAIL_ACCOUNT" => Category::EmailAccount,
+        "API_CREDENTIAL" => Category::ApiCredential,
+        "MEDICAL_RECORD" => Category::MedicalRecord,
+        "SSH_KEY" => Category::SshKey,
+        "CRYPTO_WALLET" => Category::CryptoWallet,
+        _ => Category::SecureNote,
     }
 }
 
@@ -226,7 +350,7 @@ pub(crate) fn env_entry_name(title: &str) -> String {
     if final_name.is_empty() {
         "env".to_string()
     } else {
-        truncate(final_name.to_string())
+        truncate(final_name)
     }
 }
 
@@ -295,15 +419,6 @@ pub fn save_saved_env(name: &str, id: &str) {
     }
 }
 
-/// Checks whether an item category might contain credentials or environment files.
-#[must_use]
-pub(crate) fn is_supported_category(cat: &str) -> bool {
-    matches!(
-        cat.to_ascii_uppercase().as_str(),
-        "LOGIN" | "PASSWORD" | "SECURE_NOTE" | "SERVER" | "DATABASE" | ""
-    )
-}
-
 /// Returns true if an `op` error is critical (missing binary, session locked, auth failure).
 #[must_use]
 pub(crate) fn is_critical_op_error(msg: &str) -> bool {
@@ -314,20 +429,20 @@ pub(crate) fn is_critical_op_error(msg: &str) -> bool {
         || msg.contains("failed to run 'op'")
 }
 
-/// Stores or updates an entry on the device, skipping it when it already exists and
-/// `replace` is false.
-fn put_entry(
+/// Stores or updates an item on the device, skipping it when it already exists and
+/// `replace` is false. One function for every kind of thing there is, because there is
+/// now only one kind of thing: an item.
+fn put_item(
     dev: &mut Device,
     name: &str,
-    secret: &[u8],
-    kind: Kind,
+    item: &Item,
     replace: bool,
     ui: &mut dyn SyncUi,
     run: &mut SyncRun,
 ) -> Result<(), Error> {
     let mut retried = false;
     loop {
-        match dev.add(name, secret, kind, false) {
+        match dev.put(name, item, false) {
             Ok(()) => {
                 run.summary.added += 1;
                 run.saw(name, Outcome::Wrote);
@@ -335,7 +450,7 @@ fn put_entry(
                 return Ok(());
             }
             Err(Error::Exists) if replace => {
-                dev.add(name, secret, kind, true)?;
+                dev.put(name, item, true)?;
                 run.summary.replaced += 1;
                 run.saw(name, Outcome::Wrote);
                 ui.info(&format!("  updated '{name}'"));
@@ -362,52 +477,6 @@ fn put_entry(
     }
 }
 
-/// Stores or updates an `.env` blob on the device.
-fn put_env(
-    dev: &mut Device,
-    name: &str,
-    blob: &EnvBlob,
-    replace: bool,
-    ui: &mut dyn SyncUi,
-    run: &mut SyncRun,
-) -> Result<(), Error> {
-    let mut retried = false;
-    loop {
-        match dev.env_put(name, blob, false) {
-            Ok(()) => {
-                run.summary.added += 1;
-                run.saw(name, Outcome::Wrote);
-                ui.info(&format!("  stored env '{name}'"));
-                return Ok(());
-            }
-            Err(Error::Exists) if replace => {
-                dev.env_put(name, blob, true)?;
-                run.summary.replaced += 1;
-                run.saw(name, Outcome::Wrote);
-                ui.info(&format!("  updated env '{name}'"));
-                return Ok(());
-            }
-            Err(Error::Exists) => {
-                run.summary.skipped += 1;
-                run.saw(name, Outcome::Offered);
-                ui.info(&format!("  skipped env '{name}' (already exists)"));
-                return Ok(());
-            }
-            Err(Error::Full) => {
-                run.saw(name, Outcome::Offered);
-                ui.info("the device is full");
-                return Err(Error::Full);
-            }
-            Err(Error::Locked) if !retried => {
-                retried = true;
-                ui.info("  device locked: re-authenticating PIN...");
-                ui.unlock(dev)?;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
 /// Imports secrets from a detailed 1Password item.
 pub(crate) fn process_item(
     dev: &mut Device,
@@ -416,6 +485,7 @@ pub(crate) fn process_item(
     replace: bool,
     ui: &mut dyn SyncUi,
     run: &mut SyncRun,
+    taken: &mut BTreeSet<String>,
 ) -> Result<(), Error> {
     let primary_url = item
         .urls
@@ -423,85 +493,40 @@ pub(crate) fn process_item(
         .find(|u| u.primary)
         .map_or_else(|| item.urls.first().map_or("", |u| &u.href), |u| &u.href);
 
-    let base_name = entry_name(&item.title, primary_url)
-        .unwrap_or_else(|| truncate(item.title.trim().to_string()));
+    let base_name =
+        entry_name(&item.title, primary_url).unwrap_or_else(|| truncate(item.title.trim()));
 
     if base_name.is_empty() {
         run.summary.skipped += 1;
         return Ok(());
     }
 
-    let extracted = parse_item_fields(item);
-    let mut touched = false;
-
-    // 1. Password
-    if let Some((login, pw, note)) = extracted.password {
-        let name = if qualify_dup && !login.is_empty() {
-            truncate(format!("{base_name}:{login}"))
-        } else {
-            base_name.clone()
-        };
-
-        match password_blob(&name, &login, &pw, &note) {
-            Ok(blob) => {
-                put_entry(dev, &name, &blob, Kind::Password, replace, ui, run)?;
-                touched = true;
-            }
-            Err(e) => {
-                run.saw(&name, Outcome::Offered);
-                ui.info(&format!("  skipped password for '{name}': {e}"));
-            }
+    // One 1Password item is one item on the key: its fields travel together, under one
+    // name and one tap, the way they sit together in the manager.
+    let (stored, notes) = match item_of(item) {
+        Ok(pair) => pair,
+        Err(e) => {
+            // Saying nothing here is what made a sync look like it had lost entries.
+            ui.info(&format!("  skipped '{base_name}': {e}"));
+            run.summary.skipped += 1;
+            return Ok(());
         }
+    };
+    for note in &notes {
+        ui.info(&format!("  '{base_name}': {note}"));
     }
 
-    // 2. TOTP
-    if let Some(otp_val) = extracted.otp {
-        let otp_name = if touched {
-            truncate(format!("{base_name}:otp"))
-        } else {
-            base_name.clone()
-        };
-
-        match totp::resolve(&otp_val, Some(&otp_name), None, None, false) {
-            Ok(resolved) => {
-                put_entry(
-                    dev,
-                    &resolved.name,
-                    &resolved.secret,
-                    Kind::Totp(resolved.params),
-                    replace,
-                    ui,
-                    run,
-                )?;
-                touched = true;
-            }
-            Err(e) => {
-                run.saw(&otp_name, Outcome::Offered);
-                ui.info(&format!("  skipped TOTP for '{otp_name}': {e}"));
-            }
-        }
-    }
-
-    // 3. ENV (from notes if applicable)
-    if let Some(env_bytes) = extracted.env {
-        let env_name = env_entry_name(&base_name);
-        match EnvBlob::new(env_bytes) {
-            Ok(blob) => {
-                put_env(dev, &env_name, &blob, replace, ui, run)?;
-                touched = true;
-            }
-            Err(e) => {
-                run.saw(&env_name, Outcome::Offered);
-                ui.info(&format!("  skipped env '{env_name}': {e}"));
-            }
-        }
-    }
-
-    if !touched {
-        run.summary.skipped += 1;
-    }
-
-    Ok(())
+    // The login tells two items of one title apart, so it is what qualifies the name.
+    let qualifier = if qualify_dup {
+        stored
+            .by_label("username")
+            .map(OwnedField::text)
+            .unwrap_or_default()
+    } else {
+        Zeroizing::new(String::new())
+    };
+    let name = unique_name(&base_name, &qualifier, taken);
+    put_item(dev, &name, &stored, replace, ui, run)
 }
 
 /// Imports an `.env` document from 1Password.
@@ -534,7 +559,7 @@ pub(crate) fn process_document(
         }
     };
 
-    put_env(dev, &name, &blob, replace, ui, run)
+    put_item(dev, &name, &blob.item(), replace, ui, run)
 }
 
 /// Imports a 1Password Developer Environment by its ID.
@@ -601,7 +626,7 @@ pub fn process_environment(
     };
 
     save_saved_env(&name, env_id);
-    put_env(dev, &name, &blob, replace, ui, run)
+    put_item(dev, &name, &blob.item(), replace, ui, run)
 }
 
 /// Which 1Password account `op` is signed in to. A run that finds a different account
@@ -681,7 +706,15 @@ pub fn pull_item(
         Ok(raw_json) => {
             let item: OpItemDetail = serde_json::from_slice(&raw_json)
                 .map_err(|e| Error::Value(format!("failed to parse 1Password item JSON: {e}")))?;
-            process_item(dev, &item, false, replace, ui, &mut run)?;
+            process_item(
+                dev,
+                &item,
+                false,
+                replace,
+                ui,
+                &mut run,
+                &mut BTreeSet::new(),
+            )?;
             claim_written(&mut run, OP_ITEM)?;
             return Ok(run.summary);
         }
@@ -702,7 +735,7 @@ pub fn pull_item(
                 ))
             })?;
             let name = env_entry_name(item_query);
-            put_env(dev, &name, &blob, replace, ui, &mut run)?;
+            put_item(dev, &name, &blob.item(), replace, ui, &mut run)?;
             claim_written(&mut run, OP_DOC)?;
             return Ok(run.summary);
         }
@@ -737,7 +770,7 @@ pub fn pull_item(
             "content of environment '{item_query}' is not a valid .env: {e}"
         ))
     })?;
-    put_env(dev, &name, &blob, replace, ui, &mut run)?;
+    put_item(dev, &name, &blob.item(), replace, ui, &mut run)?;
     claim_written(&mut run, OP_ENV)?;
     Ok(run.summary)
 }
@@ -749,10 +782,13 @@ struct Mirror<'a> {
     map: &'a mut Manifest,
     run: &'a mut SyncRun,
     ui: &'a mut dyn SyncUi,
-    ping: Option<(String, Kind)>,
+    ping: Option<String>,
     last_ping: Instant,
     /// What the key already held when the run started.
     existing: BTreeSet<String>,
+    /// What this run has already named. Two items of one site and one login would
+    /// otherwise both ask for the same name, and the second would be refused.
+    taken: BTreeSet<String>,
     replace: bool,
     /// Set once the key has no room left. The phases go on naming what the source
     /// offers - otherwise the rest would read as withdrawn - but write nothing more.
@@ -772,13 +808,11 @@ impl Mirror<'_> {
         let mut offered = BTreeSet::new();
         let mut unread: Option<String> = None;
         for entry in items {
-            if !is_supported_category(&entry.category) {
-                self.run.summary.skipped += 1;
-                continue;
-            }
-
+            // Every category is mirrored now: a passport and a credit card go on the
+            // key like a login does. What an item is decides nothing about whether it
+            // is stored - only its fields' classes decide what comes back out.
             let is_dup = counts.get(entry.title.as_str()).copied().unwrap_or(0) > 1;
-            let base_name = truncate(entry.title.trim().to_string());
+            let base_name = truncate(entry.title.trim());
 
             // An untitled item is named after its URL, which the listing does not
             // carry: this run cannot say which entry is its, so it must not delete.
@@ -802,6 +836,8 @@ impl Mirror<'_> {
                 self.ui
                     .info(&format!("  skipped '{base_name}' (already exists)"));
                 self.run.summary.skipped += 1;
+                // Unread, but its name is spoken for all the same.
+                self.taken.insert(base_name.clone());
                 offered.extend(item_names(self.map, &base_name));
                 continue;
             }
@@ -823,7 +859,15 @@ impl Mirror<'_> {
                 }
             };
 
-            match process_item(self.dev, &detail, is_dup, self.replace, self.ui, self.run) {
+            match process_item(
+                self.dev,
+                &detail,
+                is_dup,
+                self.replace,
+                self.ui,
+                self.run,
+                &mut self.taken,
+            ) {
                 Ok(()) => {}
                 Err(Error::Full) => {
                     self.full = true;
@@ -999,6 +1043,7 @@ pub fn sync(
     let entries = dev.list().unwrap_or_default();
     let mut mirror = Mirror {
         existing: entries.iter().map(|e| e.name.clone()).collect(),
+        taken: BTreeSet::new(),
         ping: survivor(&entries),
         last_ping: Instant::now(),
         dev,
@@ -1060,12 +1105,109 @@ pub fn sync(
     Ok(run.summary)
 }
 
+/// An item off the key, written back into 1Password as `op item create` takes it: the
+/// same JSON `op item get` hands out.
+///
+/// This is the direction that made `threat-model.md` lose a claim. A seed leaves the
+/// key here, in the clear, because an item written back without its one-time password
+/// is not the item that was taken - and that costs the double tap, the same gesture a
+/// backup costs, because it is the same act.
+pub fn export_item(
+    dev: &mut Device,
+    name: &str,
+    vault: Option<&str>,
+    ui: &mut dyn SyncUi,
+) -> Result<String, Error> {
+    let stored = dev
+        .list()?
+        .into_iter()
+        .find(|e| e.name == name)
+        .ok_or(Error::NotFound)?;
+    let Some(category) = op_category(stored.category) else {
+        return Err(Error::Value(
+            "an auth secret is not written back: it is this machine's login, and 1Password \
+             has no use for it"
+                .into(),
+        ));
+    };
+
+    // What reach the item needs is what it holds: a seed costs the double tap, and
+    // nothing else does. Asking for the seed reach on an item without one would cost a
+    // gesture for nothing.
+    let (_, shape) = dev.get_with_shape(name, Reach::Open)?;
+    let reach = if shape.has_seed() {
+        ui.info("tap the button twice: the whole item, seed included, is leaving the key");
+        Reach::Seed
+    } else if shape.has_secret() {
+        ui.info("tap the button: the item is leaving the key");
+        Reach::Secret
+    } else {
+        Reach::Open
+    };
+    let item = dev.get(name, reach)?;
+
+    let json = item_json(name, category, &item)?;
+    let mut args = vec!["item", "create", "-", "--format", "json"];
+    if let Some(v) = vault {
+        args.extend(["--vault", v]);
+    }
+    let out = op_exec_stdin(&args, json.as_bytes())?;
+    let made: OpListEntry = serde_json::from_slice(&out)
+        .map_err(|e| Error::Value(format!("'op' answered something unexpected: {e}")))?;
+    Ok(made.id)
+}
+
+/// The item JSON `op item create` reads: the category, the title, and every field with
+/// the section, type and label it had. Built with `serde_json` rather than by hand, so
+/// a password with a quote in it cannot break the shape.
+fn item_json(name: &str, category: &str, item: &Item) -> Result<Zeroizing<String>, Error> {
+    let mut fields = Vec::new();
+    let mut urls = Vec::new();
+    for f in &item.fields {
+        // A URL is a field here and a list there.
+        if f.kind == FieldKind::Url {
+            urls.push(serde_json::json!({
+                "href": f.text().as_str(),
+                "primary": f.label == "website",
+            }));
+            continue;
+        }
+        // A seed is stored as the parameters and the secret; 1Password wants the URI.
+        let value = if f.class == Class::Seed {
+            totp::seed_uri(name, &f.value)?
+        } else {
+            f.text()
+        };
+        let mut field = serde_json::Map::new();
+        field.insert("id".into(), f.label.clone().into());
+        field.insert("label".into(), f.label.clone().into());
+        field.insert("type".into(), field_kind_name(f.kind).into());
+        field.insert("value".into(), value.as_str().into());
+        if !f.section.is_empty() {
+            field.insert(
+                "section".into(),
+                serde_json::json!({ "id": f.section, "label": f.section }),
+            );
+        }
+        fields.push(serde_json::Value::Object(field));
+    }
+    let doc = serde_json::json!({
+        "title": name,
+        "category": category.to_ascii_uppercase().replace(' ', "_"),
+        "fields": fields,
+        "urls": urls,
+    });
+    serde_json::to_string(&doc)
+        .map(Zeroizing::new)
+        .map_err(|e| Error::Value(format!("cannot build the item JSON: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parse_login_with_otp() {
+    fn every_field_of_a_login_travels_under_its_own_label() {
         let json = r#"{
             "id": "item1",
             "title": "GitHub",
@@ -1073,6 +1215,8 @@ mod tests {
             "fields": [
                 { "id": "username", "label": "username", "purpose": "USERNAME", "value": "testuser" },
                 { "id": "password", "label": "password", "purpose": "PASSWORD", "value": "secret123" },
+                { "id": "x", "label": "master-password", "type": "CONCEALED", "value": "other" },
+                { "id": "y", "label": "\u043f\u0430\u0440\u043e\u043b\u044c", "type": "CONCEALED", "value": "custom" },
                 { "id": "totp", "label": "one-time password", "type": "OTP", "value": "otpauth://totp/GitHub:testuser?secret=JBSWY3DPEHPK3PXP" }
             ],
             "urls": [
@@ -1081,22 +1225,58 @@ mod tests {
         }"#;
 
         let detail: OpItemDetail = serde_json::from_str(json).expect("valid JSON");
-        let ext = parse_item_fields(&detail);
+        let (item, notes) = item_of(&detail).expect("an item");
+        assert!(notes.is_empty());
+        assert_eq!(item.category, Category::Login);
 
-        assert!(ext.password.is_some());
-        let (user, pass, _) = ext.password.expect("password exists");
-        assert_eq!(user, "testuser");
-        assert_eq!(*pass, "secret123");
-
-        assert!(ext.otp.is_some());
         assert_eq!(
-            *ext.otp.expect("otp exists"),
-            "otpauth://totp/GitHub:testuser?secret=JBSWY3DPEHPK3PXP"
+            item.by_label("username")
+                .expect("a username")
+                .text()
+                .as_str(),
+            "testuser"
+        );
+        assert_eq!(
+            item.by_label("password")
+                .expect("a password")
+                .text()
+                .as_str(),
+            "secret123"
+        );
+        // The two fields the old importer lost: one it substituted for the password,
+        // one it could not name at all.
+        assert_eq!(
+            item.by_label("master-password")
+                .expect("kept")
+                .text()
+                .as_str(),
+            "other"
+        );
+        assert_eq!(
+            item.by_label("пароль").expect("kept").text().as_str(),
+            "custom"
+        );
+        assert_eq!(
+            item.by_label("master-password").expect("kept").class,
+            Class::Secret,
+            "a concealed field needs a tap, whatever it is called"
+        );
+
+        let seed = item.first(Class::Seed).expect("a seed");
+        assert_eq!(seed.kind, FieldKind::Otp);
+        assert_eq!(
+            &seed.value[3..],
+            b"Hello!\xde\xad\xbe\xef".as_slice(),
+            "the URI was decoded to the parameters and the secret"
+        );
+        assert_eq!(
+            item.by_label("website").expect("a url").text().as_str(),
+            "https://github.com"
         );
     }
 
     #[test]
-    fn parse_secure_note_env() {
+    fn a_secure_note_that_is_an_env_becomes_one() {
         let json = r#"{
             "id": "note1",
             "title": "myapp.env",
@@ -1108,15 +1288,81 @@ mod tests {
         }"#;
 
         let detail: OpItemDetail = serde_json::from_str(json).expect("valid JSON");
-        let ext = parse_item_fields(&detail);
-
-        assert!(ext.env.is_some());
-        let env_bytes = ext.env.expect("env exists");
-        let blob = EnvBlob::new(env_bytes).expect("valid env blob");
+        let (item, _) = item_of(&detail).expect("an item");
+        assert_eq!(item.category, Category::Env);
         assert_eq!(
-            blob.as_bytes(),
+            &item.by_label(".env").expect("the blob").value[..],
             b"DATABASE_URL=postgres://localhost\nPORT=8080\n"
         );
+    }
+
+    #[test]
+    fn a_category_this_cli_has_not_met_is_kept_rather_than_dropped() {
+        let json = r#"{
+            "id": "p",
+            "title": "Passport",
+            "category": "PASSPORT",
+            "fields": [
+                { "id": "number", "label": "number", "type": "STRING", "value": "AA123456" }
+            ],
+            "urls": []
+        }"#;
+        let detail: OpItemDetail = serde_json::from_str(json).expect("valid JSON");
+        let (item, _) = item_of(&detail).expect("an item");
+        assert_eq!(item.category, Category::Passport);
+        assert_eq!(
+            item.by_label("number").expect("kept").class,
+            Class::Open,
+            "a passport number is not behind a tap: it is not a secret to type in"
+        );
+    }
+
+    #[test]
+    fn an_item_with_nothing_in_it_says_so() {
+        let json =
+            r#"{ "id": "e", "title": "Empty", "category": "LOGIN", "fields": [], "urls": [] }"#;
+        let detail: OpItemDetail = serde_json::from_str(json).expect("valid JSON");
+        assert!(
+            item_of(&detail).is_err(),
+            "an item with no fields is named in the summary, not stored"
+        );
+    }
+
+    #[test]
+    fn an_item_written_back_is_the_json_op_hands_out() {
+        let item = Item::new(Category::Login)
+            .with(OwnedField::new(
+                Class::Open,
+                FieldKind::String,
+                "username",
+                b"me@example.com",
+            ))
+            .with(OwnedField::new(
+                Class::Secret,
+                FieldKind::Concealed,
+                "password",
+                b"hunter2",
+            ))
+            .with(OwnedField::new(
+                Class::Open,
+                FieldKind::Url,
+                "website",
+                b"https://github.com",
+            ));
+        let json = item_json("github.com", "Login", &item).expect("builds");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+
+        assert_eq!(v["title"], "github.com");
+        assert_eq!(v["category"], "LOGIN");
+        assert_eq!(v["urls"][0]["href"], "https://github.com");
+        assert_eq!(
+            v["urls"][0]["primary"], true,
+            "the field labelled website is the autofill URL"
+        );
+        let fields = v["fields"].as_array().expect("fields");
+        assert_eq!(fields.len(), 2, "the URL left the field list");
+        assert_eq!(fields[1]["type"], "CONCEALED");
+        assert_eq!(fields[1]["value"], "hunter2");
     }
 
     #[test]
@@ -1129,13 +1375,7 @@ mod tests {
     }
 
     #[test]
-    fn test_category_and_error_filters() {
-        assert!(is_supported_category("LOGIN"));
-        assert!(is_supported_category("PASSWORD"));
-        assert!(is_supported_category("SECURE_NOTE"));
-        assert!(!is_supported_category("CREDIT_CARD"));
-        assert!(!is_supported_category("PASSPORT"));
-
+    fn test_error_filters() {
         assert!(is_critical_op_error(
             "1Password CLI ('op') not found in PATH"
         ));

@@ -147,19 +147,24 @@ line to add by hand.
 
 | Gesture | LED | What it releases |
 |---|---|---|
-| Tap | amber | one TOTP code, one password, one `.env`, or one `vkey auth` login |
+| Tap | amber | one TOTP code, the secret fields of one item, one `.env`, or one `vkey auth` login |
 | Hold 5 s | red | factory wipe: every secret and the PIN |
-| Double tap | blue | the encrypted backup file |
+| Double tap | blue | the encrypted backup file, or an export back into 1Password |
 
 A tap never wipes and never exports, so a hostile host cannot swap a code request for a
 wipe or an export: the gesture the owner makes for one satisfies neither of the others.
+A TOTP seed leaves the key in the clear only under the double tap, and only because
+`vkey export` writes an item back into 1Password whole — what that costs is written out
+in `docs/threat-model.md`.
 
 | | Limit |
 |---|---|
-| Entries (TOTP secrets and passwords together) | 256 slots |
-| `.env` blobs | 16, up to 8000 bytes each |
-| Entry name | 32 bytes; names are one namespace |
-| Login, password, note | 255 bytes each, 256 per entry in total |
+| Items (every category together) | 256 |
+| Fields per item | 32 |
+| One field | 8128 bytes — a `.env`, an SSH key, a note |
+| One item | 8192 bytes, packed |
+| The vault | ~210 KB, two copies; a write costs what the vault holds, not what it might |
+| Item name | 32 bytes; names are one namespace |
 | PIN | exactly 8 digits, 8 attempts |
 | Backup passphrase | 12–128 characters; five or six random words, not an invented one |
 
