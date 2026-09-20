@@ -53,29 +53,25 @@ the same offset so there is a single table for both.
 0x010000  factory app: vaultkey.bin | vaultkey.signed.bin
 0x110000  +-- vault region, raw flash, 428 KiB = 107 sectors of 4 KiB --+
           | attempt counter                                  1 sector  |
-          | vault image copy A: PIN header + 256 entries    21 sectors  |
-          | vault image copy B                              21 sectors  |
-          | 16 .env blob slots x 2 copies x 8 KiB           64 sectors  |
+          | vault image copy A: PIN header + packed items   53 sectors |
+          | vault image copy B: PIN header + packed items   53 sectors |
 0x17B000  +------------------------------------------------------------+
 ```
 
-Every image and blob copy carries its own sequence number and CRC; the attempt counter is one
+Every image carries its own sequence number and CRC; the attempt counter is one
 word written with no erase (`NorFlash::write`, not the inherent `write`, which does
-read-erase-write). Core's flash requirements — 4 KiB sector, 4-byte word writes, three regions
-on sector boundaries — are checked at startup. In RAM: 128 KiB Argon2, ~80 KiB state, 8 KiB
-blob buffer, three statics in `main.rs`. To make the region visible to `esptool` it is one
-line, `vault, data, 0x40, 0x110000, 0x1B000`, via `espflash partition-table --to-binary` —
+read-erase-write). Core's flash requirements — 4 KiB sector, 4-byte word writes, regions
+on sector boundaries — are checked at startup. In RAM: 128 KiB Argon2, ~10 KiB index,
+16 KiB scratch buffer, three statics in `main.rs`. To make the region visible to `esptool`
+it is one line, `vault, data, 0x40, 0x110000, 0x6B000`, via `espflash partition-table --to-binary` —
 not part of the flashed table.
 
 | Decision | Why |
 |---|---|
-| 256 entries, not more | RAM. `State` holds every slot, Argon2 takes 128 KiB, and the C6 stack after that is 308 KiB — the first 256-entry build overflowed it because `State` was passed by value. It now lives as one instance in a board static (`VAULT`), filled in place, never copied; 512 is a one-constant change |
-| `SECRET_MAX` = 256, not 512 | Measured on the board: 512-byte slots cost 1.7 s per `add` against ~0.65 s, because `save` erases all image sectors (37 x ~45 ms) — 200 imported passwords would take 6 minutes |
-| Import via CSV, terminal only | `vkey import <file>` from the export 1Password and Google Password Manager offer: even 256 slots are not a whole vault, and the key should hold only what must be offline. An entry already there is skipped unless `--replace`, and one the export has stopped offering is deleted, which is what keeps the slot count from creeping up. Parser is `csv-core` — already in the tree via `espflash`, no buffers of its own, correct on multi-line `Notes` |
-| `.env` blobs are a region, not entries | `Kind::Env` is never an `Entry`: a blob of up to `ENV_MAX` = 8000 bytes takes one of the 16 slots |
-| A damaged blob copy reads as empty, not `Corrupt` | A truncated first write has nothing to roll back to and must not lock the key. Deletion erases both copies, newer first, or the older resurrects |
-| Blob key is random, sealed under the DEK in the image header | A PIN change then reseals 60 bytes inside the atomic `save` rather than 16 blobs outside it, where power loss would leave blobs under a key the header no longer describes |
-| One frame, no chunking | `MAX_PAYLOAD` bounds requests only, so 8034 bytes in a stack buffer are cheaper than a staging command, an offset counter and a reset on auto-lock. If 8000 bytes run out, `ENV_MAX`, `ENV_COPY_SECTORS` and `ENV_BUF` double with no format change |
+| 256 items, not more | RAM. `Index` holds every slot (~10 KiB), Argon2 takes 128 KiB, and the scratch buffer is 16 KiB |
+| Packed records, up to 8192 bytes | Items share the image space; small TOTP secrets take few bytes while .env files can take up to 8056 bytes |
+| Import via CSV, terminal only | `vkey import <file>` from the export 1Password and Google Password Manager offer: even 256 slots are not a whole vault, and the key should hold only what must be offline |
+| One frame, no chunking | Frame buffer fits `ITEM_MAX` (8192 bytes) plus overhead, so items transfer in a single frame |
 
 ## A board is a folder
 

@@ -12,18 +12,26 @@ use std::path::Path;
 use csv_core::{ReadRecordResult, Reader};
 use zeroize::Zeroizing;
 
-use crate::device::{Device, Error, Kind, NAME_MAX, password_blob};
+use crate::device::{Device, Error, NAME_MAX, login_item};
+use crate::item::Item;
 use crate::prompt::SyncUi;
 use crate::sources::{self, FILE, Manifest, Outcome, Phase, SyncRun};
 use crate::totp;
 
-/// One entry the export can put on the device. The name and the login are printed;
-/// the secret never is.
+/// One item the export can put on the device. The name and the login are printed; the
+/// fields never are.
 pub struct Row {
     pub name: String,
     pub login: String,
-    pub kind: Kind,
-    pub secret: Zeroizing<Vec<u8>>,
+    pub item: Item,
+}
+
+impl Row {
+    /// Whether this row is a one-time password rather than a password, for the summary
+    /// that counts them apart.
+    fn is_totp(&self) -> bool {
+        self.item.first(vaultkey_core::item::Class::Seed).is_some()
+    }
 }
 
 pub struct Parsed {
@@ -41,11 +49,7 @@ impl Parsed {
     /// `1Password export: 42 passwords, 7 TOTP codes; 3 rows skipped`
     #[must_use]
     pub fn summary(&self) -> String {
-        let totp = self
-            .rows
-            .iter()
-            .filter(|r| matches!(r.kind, Kind::Totp(_)))
-            .count();
+        let totp = self.rows.iter().filter(|r| r.is_totp()).count();
         let skipped = if self.skipped.is_empty() {
             String::new()
         } else {
@@ -185,13 +189,15 @@ pub fn parse(csv: &[u8]) -> Result<Parsed, Error> {
 }
 
 /// Device entries out of the raw rows. Two rows with the same title get the login
-/// appended, so `google.com` with three accounts becomes three entries.
+/// appended, so `google.com` with three accounts becomes three entries; `unique_name`
+/// settles what is still not unique after that.
 fn rows_of(raws: &[Raw], out: &mut Parsed) {
     let names: Vec<Option<String>> = raws.iter().map(|r| entry_name(&r.title, &r.url)).collect();
     let mut seen: HashMap<&str, usize> = HashMap::new();
     for name in names.iter().flatten() {
         *seen.entry(name).or_default() += 1;
     }
+    let mut taken = BTreeSet::new();
     for (i, raw) in raws.iter().enumerate() {
         let Some(name) = &names[i] else {
             out.skipped
@@ -199,23 +205,19 @@ fn rows_of(raws: &[Raw], out: &mut Parsed) {
             continue;
         };
         let dup = seen.get(name.as_str()).is_some_and(|n| *n > 1);
-        let name = if dup && !raw.login.is_empty() {
-            truncate(format!("{name}:{}", raw.login))
-        } else {
-            name.clone()
-        };
+        let login = if dup { raw.login.as_str() } else { "" };
+        let name = unique_name(name, login, &mut taken);
         if raw.password.is_empty() && raw.otp.is_none() {
             out.skipped.push(format!("{name}: no password"));
             out.dropped.push(name);
             continue;
         }
         if !raw.password.is_empty() {
-            match password_blob(&name, &raw.login, &raw.password, "") {
-                Ok(secret) => out.rows.push(Row {
+            match login_item(&raw.login, &raw.password, "") {
+                Ok(item) => out.rows.push(Row {
                     name: name.clone(),
                     login: raw.login.clone(),
-                    kind: Kind::Password,
-                    secret,
+                    item,
                 }),
                 Err(e) => {
                     out.skipped.push(format!("{name}: {e}"));
@@ -224,13 +226,12 @@ fn rows_of(raws: &[Raw], out: &mut Parsed) {
             }
         }
         if let Some(otp) = &raw.otp {
-            let otp_name = truncate(format!("{name}:otp"));
+            let otp_name = unique_name(&name, "otp", &mut taken);
             match totp::resolve(otp, Some(&otp_name), None, None, false) {
                 Ok(r) => out.rows.push(Row {
-                    name: r.name,
+                    name: r.name.clone(),
                     login: String::new(),
-                    kind: Kind::Totp(r.params),
-                    secret: r.secret,
+                    item: r.item(),
                 }),
                 Err(e) => {
                     out.skipped.push(format!("{otp_name}: {e}"));
@@ -255,15 +256,54 @@ pub(crate) fn entry_name(title: &str, url: &str) -> Option<String> {
     if name.is_empty() {
         return None;
     }
-    Some(truncate(name))
+    Some(truncate(&name))
 }
 
 /// At most `NAME_MAX` bytes, never mid-character.
-pub(crate) fn truncate(mut s: String) -> String {
-    while s.len() > NAME_MAX {
+pub(crate) fn truncate(s: &str) -> String {
+    cut(s, NAME_MAX)
+}
+
+/// The first `max` bytes of `s`, never mid-character.
+fn cut(s: &str, max: usize) -> String {
+    let mut s = s.to_string();
+    while s.len() > max {
         s.pop();
     }
     s
+}
+
+/// The shortest a site is cut to before the login is cut instead: `dash.cloud…` still
+/// says which site it is, `d:` does not.
+const MIN_SITE: usize = 12;
+
+/// The name an entry gets: `site`, or `site:login` where the site alone would not say
+/// which account this is. A name is `NAME_MAX` bytes at most, and it is the *site*
+/// that is shortened to make room - the login is what tells two accounts apart, so
+/// cutting it is what silently merged them. `taken` is what this import has already
+/// named: two rows that still collide - one site, one login, twice - are numbered,
+/// because the device holds one entry per name and the second would be refused.
+pub(crate) fn unique_name(site: &str, login: &str, taken: &mut BTreeSet<String>) -> String {
+    let mut n = 1;
+    loop {
+        let suffix = if n == 1 {
+            String::new()
+        } else {
+            format!(":{n}")
+        };
+        let room = NAME_MAX - suffix.len();
+        let name = if login.is_empty() {
+            cut(site, room)
+        } else {
+            let login = cut(login, room.saturating_sub(1 + MIN_SITE));
+            let site = cut(site, room - 1 - login.len());
+            format!("{site}:{login}")
+        } + &suffix;
+        if taken.insert(name.clone()) {
+            return name;
+        }
+        n += 1;
+    }
 }
 
 /// Every record of `csv` as its fields, unescaped. `csv-core` is a state machine over
@@ -352,7 +392,7 @@ pub fn run(
 
         let mut retried = false;
         loop {
-            match dev.add(&row.name, &row.secret, row.kind, replace) {
+            match dev.put(&row.name, &row.item, replace) {
                 Ok(()) => {
                     if replace && existing.contains(&row.name) {
                         run.summary.replaced += 1;
@@ -365,7 +405,7 @@ pub fn run(
                     break;
                 }
                 Err(Error::Exists) if replace => {
-                    dev.add(&row.name, &row.secret, row.kind, true)?;
+                    dev.put(&row.name, &row.item, true)?;
                     run.summary.replaced += 1;
                     run.saw(&row.name, Outcome::Wrote);
                     ui.info(&format!("  updated '{desc}'"));
@@ -453,6 +493,29 @@ mod tests {
     }
 
     #[test]
+    fn a_name_that_does_not_fit_loses_the_site_and_never_the_login() {
+        let mut taken = BTreeSet::new();
+        let long = unique_name(
+            "stakanopt.keepincrm.com",
+            "systema98opt@gmail.com",
+            &mut taken,
+        );
+        assert_eq!(
+            long, "stakanopt.ke:systema98opt@gmail.",
+            "the site is shortened to make room; the login is what tells two \
+             accounts apart, so cutting it is what merged them"
+        );
+        assert_eq!(long.len(), NAME_MAX);
+
+        // One site, one login, twice - the second name is numbered, or the device
+        // would refuse it as taken and the entry would be lost.
+        let first = unique_name("github.com", "eloicompany", &mut taken);
+        let second = unique_name("github.com", "eloicompany", &mut taken);
+        assert_eq!(first, "github.com:eloicompany");
+        assert_eq!(second, "github.com:eloicompany:2");
+    }
+
+    #[test]
     fn google_rows_and_duplicates() {
         let p = parse(GOOGLE.as_bytes()).expect("parses");
         assert_eq!(
@@ -466,7 +529,7 @@ mod tests {
             "title, then title:login for duplicates, then the host"
         );
         assert!(
-            p.rows.iter().all(|r| r.kind == Kind::Password),
+            p.rows.iter().all(|r| !r.is_totp()),
             "Google has no TOTP column"
         );
         assert_eq!(
@@ -489,14 +552,24 @@ mod tests {
             ["GitHub", "GitHub:otp", "Counter"],
             "OTPAuth adds :otp"
         );
-        assert!(
-            matches!(p.rows[1].kind, Kind::Totp(_)),
-            ":otp is a TOTP entry"
+        assert!(p.rows[1].is_totp(), ":otp is a one-time password");
+        let login = &p.rows[0].item;
+        assert_eq!(
+            login
+                .by_label("username")
+                .expect("a username field")
+                .text()
+                .as_str(),
+            "me"
         );
         assert_eq!(
-            &p.rows[0].secret[..],
-            b"\x02me\x08say \"hi\"",
-            "login_len | login | password_len | password, quotes unescaped"
+            login
+                .by_label("password")
+                .expect("a password field")
+                .text()
+                .as_str(),
+            "say \"hi\"",
+            "quotes unescaped"
         );
         assert_eq!(p.skipped.len(), 2, "archived + HOTP: {:?}", p.skipped);
         assert_eq!(
@@ -518,13 +591,25 @@ mod tests {
             "p".repeat(300)
         );
         let p = parse(csv.as_bytes()).expect("parses");
-        assert_eq!(names(&p), ["ok"], "the oversized secret is not a row");
-        assert_eq!(p.skipped.len(), 1, "one reason: {:?}", p.skipped);
-        assert!(
-            p.skipped[0].starts_with(&"x".repeat(NAME_MAX)),
-            "the name is cut to NAME_MAX bytes: {}",
-            p.skipped[0]
+        assert_eq!(
+            names(&p),
+            ["x".repeat(NAME_MAX), "ok".to_string()],
+            "a 300-byte password is a password now: the 256-byte secret is gone, and \
+             the name is what is still cut to NAME_MAX"
         );
+        assert!(p.skipped.is_empty(), "nothing to skip: {:?}", p.skipped);
+
+        // Past the field limit, though, it is still refused - here, before the wire.
+        let csv = format!(
+            "name,url,username,password,note\ntoobig,,me,{},\n",
+            "p".repeat(crate::device::VALUE_MAX + 1)
+        );
+        let p = parse(csv.as_bytes()).expect("parses");
+        assert!(
+            names(&p).is_empty(),
+            "a password past VALUE_MAX does not fit"
+        );
+        assert_eq!(p.skipped.len(), 1, "and it says so: {:?}", p.skipped);
     }
 
     #[test]

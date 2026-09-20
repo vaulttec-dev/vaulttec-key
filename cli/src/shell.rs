@@ -7,6 +7,7 @@
 //! frame from a known geometry and drawing it again - nothing is left to a widget
 //! library's guesses.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -23,9 +24,10 @@ use crossterm::{execute, queue};
 use zeroize::Zeroizing;
 
 use crate::device::{
-    Device, Entry, EnvBlob, Error, Kind, MAX_ATTEMPTS, Stored, describe, find_port, passphrase,
-    password_blob, pin,
+    Category, Class, Device, EnvBlob, Error, MAX_ATTEMPTS, Reach, Stored, find_port, login_item,
+    passphrase, pin,
 };
+use crate::item::{Item, category_name};
 use crate::prompt::{ACCENT, DIM, PinPrompt, WARN_AT, copy_secret, copy_to_clipboard};
 use crate::{backup, import, op, prompt, setup, sources, totp};
 
@@ -203,8 +205,181 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// One menu row: the text Tab completes to, the login when the row is a password
+/// item, and what the row is.
+struct Row {
+    text: String,
+    login: String,
+    what: String,
+}
+
+/// The table's columns. They come from the terminal width alone: a site or a login
+/// that does not fit is clipped, so the rules stay where they are whatever is stored
+/// and wherever the search has got to.
+struct Cols {
+    site: usize,
+    login: usize,
+    kind: usize,
+}
+
+/// Room for `password` and for the shortest TOTP parameters.
+const KIND_W: usize = 12;
+/// The table sits this far inside the frame, like the other menu rows.
+const TABLE_MARGIN: usize = 2;
+
+impl Cols {
+    /// `  | site | login | kind |`: the margin, four rules and a pair of pad spaces
+    /// per column are fixed, and what is left is split between site and login.
+    fn new(w: usize) -> Cols {
+        let rest = w
+            .saturating_sub(TABLE_MARGIN + 4 + 6 + KIND_W)
+            .max(2 * MIN_COL);
+        let site = rest / 2;
+        Cols {
+            site,
+            login: rest - site,
+            kind: KIND_W,
+        }
+    }
+
+    fn each(&self) -> [usize; 3] {
+        [self.site, self.login, self.kind]
+    }
+}
+
+/// Narrower than this a column says nothing at all; a terminal that small clips the
+/// table itself, which `print_row` already does to every frame row.
+const MIN_COL: usize = 6;
+
+/// `text` in exactly `w` columns: padded with spaces, or cut with an ellipsis so the
+/// rule after it never moves.
+fn fit_cell(text: &str, w: usize) -> String {
+    if text.chars().count() <= w {
+        return format!("{text:<w$}");
+    }
+    let mut s: String = text.chars().take(w.saturating_sub(1)).collect();
+    s.push('…');
+    s
+}
+
+/// One horizontal rule of the table, with the corners and crossings it needs.
+fn table_rule(cols: &Cols, left: char, cross: char, right: char) -> String {
+    let mut s = " ".repeat(TABLE_MARGIN);
+    s.push(left);
+    for (i, w) in cols.each().iter().enumerate() {
+        if i > 0 {
+            s.push(cross);
+        }
+        s.push_str(&"─".repeat(w + 2));
+    }
+    s.push(right);
+    s
+}
+
+/// One row of cells between the vertical rules.
+fn table_row(cols: &Cols, cells: [&str; 3]) -> String {
+    let mut s = " ".repeat(TABLE_MARGIN);
+    s.push('│');
+    for (text, w) in cells.iter().zip(cols.each()) {
+        s.push(' ');
+        s.push_str(&fit_cell(text, w));
+        s.push_str(" │");
+    }
+    s
+}
+
+/// The entries as a table: a header, then one row per entry with a rule under it.
+/// The columns are fixed, so the shape is the same for every vault and every search.
+fn table_lines(m: &mut Menu, w: usize, cap: usize) -> Vec<(bool, String)> {
+    let cols = Cols::new(w);
+    // The header block is three lines, the closing rule one; each entry takes two.
+    let room = cap.saturating_sub(4) / 2;
+    if room == 0 {
+        return Vec::new();
+    }
+    // Scroll the window just enough for the selection to be inside it.
+    match m.selected {
+        Some(sel) => {
+            m.first = m.first.min(sel);
+            m.first = m.first.max((sel + 1).saturating_sub(room));
+        }
+        None => m.first = 0,
+    }
+
+    let last = (m.first + room).min(m.items.len());
+    // An empty tab is a header with nothing under it, so the header closes the table.
+    let under_header = if m.first < last {
+        table_rule(&cols, '├', '┼', '┤')
+    } else {
+        table_rule(&cols, '└', '┴', '┘')
+    };
+    let mut lines = vec![
+        (false, table_rule(&cols, '┌', '┬', '┐')),
+        (false, table_row(&cols, ["site", "login", "kind"])),
+        (false, under_header),
+    ];
+    for (i, item) in m.items[m.first..last].iter().enumerate() {
+        let cells = [item.text.as_str(), item.login.as_str(), item.what.as_str()];
+        lines.push((m.selected == Some(m.first + i), table_row(&cols, cells)));
+        let closing = m.first + i + 1 == last;
+        lines.push((
+            false,
+            if closing {
+                table_rule(&cols, '└', '┴', '┘')
+            } else {
+                table_rule(&cols, '├', '┼', '┤')
+            },
+        ));
+    }
+    lines
+}
+
+/// The commands as the menu has always drawn them: the name column, then the
+/// description wrapped to what is left of the width, continuation lines indented
+/// under it. Nothing is cut off - a command's description is the whole of its help.
+fn command_lines(m: &mut Menu, w: usize, cap: usize) -> Vec<(bool, String)> {
+    let name_w = m
+        .items
+        .iter()
+        .map(|i| i.text.chars().count())
+        .max()
+        .unwrap_or(0);
+    let indent = 3 + name_w + 2;
+    let room = w.saturating_sub(indent).max(10);
+    let wrapped: Vec<Vec<String>> = m.items.iter().map(|i| wrap(&i.what, room)).collect();
+
+    // Scroll the window just enough for the selection to be inside it.
+    if let Some(sel) = m.selected {
+        m.first = m.first.min(sel);
+        let height = |from: usize| wrapped[from..=sel].iter().map(Vec::len).sum::<usize>();
+        while m.first < sel && height(m.first) > cap {
+            m.first += 1;
+        }
+    } else {
+        m.first = 0;
+    }
+
+    let mut lines = Vec::new();
+    for (i, item) in m.items.iter().enumerate().skip(m.first) {
+        let selected = m.selected == Some(i);
+        for (n, chunk) in wrapped[i].iter().enumerate() {
+            let text = &item.text;
+            let line = if n == 0 {
+                format!("   {text:<name_w$}  {chunk}")
+            } else {
+                format!("{:indent$}{chunk}", "")
+            };
+            lines.push((selected, line));
+            if lines.len() >= cap {
+                return lines;
+            }
+        }
+    }
+    lines
+}
+
 struct Menu {
-    items: Vec<(String, String)>, // text to complete to, description
+    items: Vec<Row>,
     selected: Option<usize>,
     /// The first item shown: the window scrolls so the selection stays visible.
     first: usize,
@@ -217,8 +392,8 @@ enum MenuKind {
     Commands,
     /// A typed prefix: entry names to complete.
     Names,
-    /// `/list`: one tab of entries, where a, e and d act even with nothing highlighted.
-    List(Tab),
+    /// `/list`: every item, where a, e and d act even with nothing highlighted.
+    List,
 }
 
 #[derive(Clone, Copy)]
@@ -228,53 +403,45 @@ enum Dir {
 }
 
 /// The tabs of `/list`, in the order ← and → walk them.
+/// What the list is narrowed to. Not a fixed set: `all` and `totp` are always there -
+/// one because twenty-four categories need a way back to everything, the other because
+/// a code is a property of an item rather than a category of one - and the rest are
+/// whatever categories the key actually holds, so there is never an empty tab.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
+    All,
+    Totp,
+    Of(Category),
+}
+
+impl Tab {
+    fn label(self) -> &'static str {
+        match self {
+            Tab::All => "all",
+            Tab::Totp => "totp",
+            Tab::Of(c) => category_name(c),
+        }
+    }
+}
+
+/// Which item the shell knows about without opening it again: what one `ItemGet` at the
+/// open reach answered.
+struct Known {
+    login: String,
+    has_seed: bool,
+}
+
+/// What `/add` can make, which is not the same as what the key can hold: a vault holds
+/// twenty-four categories, and all but these three arrive from 1Password rather than
+/// from someone typing them in at a prompt.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Make {
     Totp,
     Password,
     Env,
 }
 
-const TABS: [Tab; 3] = [Tab::Totp, Tab::Password, Tab::Env];
-
-impl Tab {
-    fn of(kind: Kind) -> Tab {
-        match kind {
-            Kind::Totp(_) => Tab::Totp,
-            Kind::Password | Kind::Auth => Tab::Password,
-            Kind::Env => Tab::Env,
-        }
-    }
-
-    fn what(self) -> &'static str {
-        match self {
-            Tab::Totp => "a TOTP code",
-            Tab::Password => "a password",
-            Tab::Env => "a .env",
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Tab::Totp => "TOTP",
-            Tab::Password => "Passwords",
-            Tab::Env => "ENV",
-        }
-    }
-
-    /// The neighbour in `TABS`, wrapping at either end.
-    fn shift(self, dir: Dir) -> Tab {
-        let i = TABS
-            .iter()
-            .position(|&t| t == self)
-            .expect("every tab is in TABS");
-        let n = TABS.len();
-        TABS[match dir {
-            Dir::Next => (i + 1) % n,
-            Dir::Prev => (i + n - 1) % n,
-        }]
-    }
-}
+impl Make {}
 
 /// One frame row from coloured pieces, never wider than `w`: a wrapped row pushes the
 /// rules apart, and `MoveUp` by frame rows then lands on the wrong line.
@@ -296,8 +463,6 @@ enum Key {
     Quit,
     Redraw,
     Submit(String),
-    /// `a` on a tab of the list: the tab already says what to store.
-    Add(Tab),
 }
 
 pub struct Shell {
@@ -305,6 +470,12 @@ pub struct Shell {
     port: String,
     version: Option<String>,
     entries: Vec<Stored>,
+    /// What one `ItemGet` at the open reach told us about each item, by name: the
+    /// login for the list's column, and whether a code can be had from it. Filled with
+    /// the names in `relist` and nowhere else.
+    known: HashMap<String, Known>,
+    /// Which tab of `/list` is showing.
+    tab: Tab,
     unlocked: bool,
     has_pin: bool,
     retries: u8,
@@ -325,6 +496,8 @@ pub fn run(dev: Device, version: Option<String>) -> Result<u8, Error> {
         port,
         version,
         entries: Vec::new(),
+        known: HashMap::new(),
+        tab: Tab::All,
         unlocked: false,
         has_pin: true,
         retries: MAX_ATTEMPTS,
@@ -449,52 +622,19 @@ impl Shell {
         self.frame_rows = 0;
     }
 
-    /// The menu as physical lines: the name column, then the description wrapped to
-    /// what is left of the width, continuation lines indented under it. Nothing is cut
-    /// off; a terminal too short for the whole menu shows a window that scrolls with
-    /// the arrow keys so the selected item is always in it.
+    /// The menu as physical lines: the name column, the login column where there are
+    /// commands wrapped under their names, entries as a table. A terminal too short
+    /// for the whole menu shows a window that scrolls with the arrow keys so the
+    /// selected item is always in it.
     fn menu_lines(&mut self, w: usize) -> Vec<(bool, String)> {
-        let cap = Self::rows().saturating_sub(5 + usize::from(self.tab().is_some()));
+        let cap = Self::rows().saturating_sub(5 + usize::from(self.listing()));
         let Some(m) = self.menu.as_mut() else {
             return Vec::new();
         };
-        let name_w = m
-            .items
-            .iter()
-            .map(|(t, _)| t.chars().count())
-            .max()
-            .unwrap_or(0);
-        let indent = 3 + name_w + 2;
-        let room = w.saturating_sub(indent).max(10);
-        let wrapped: Vec<Vec<String>> = m.items.iter().map(|(_, d)| wrap(d, room)).collect();
-
-        // Scroll the window just enough for the selection to be inside it.
-        if let Some(sel) = m.selected {
-            m.first = m.first.min(sel);
-            let height = |from: usize| wrapped[from..=sel].iter().map(Vec::len).sum::<usize>();
-            while m.first < sel && height(m.first) > cap {
-                m.first += 1;
-            }
-        } else {
-            m.first = 0;
+        match m.kind {
+            MenuKind::Commands => command_lines(m, w, cap),
+            MenuKind::Names | MenuKind::List => table_lines(m, w, cap),
         }
-
-        let mut lines = Vec::new();
-        for (i, (text, _)) in m.items.iter().enumerate().skip(m.first) {
-            let selected = m.selected == Some(i);
-            for (n, chunk) in wrapped[i].iter().enumerate() {
-                let line = if n == 0 {
-                    format!("   {text:<name_w$}  {chunk}")
-                } else {
-                    format!("{:indent$}{chunk}", "")
-                };
-                lines.push((selected, line));
-                if lines.len() >= cap {
-                    return lines;
-                }
-            }
-        }
-        lines
     }
 
     /// Draws the frame at the cursor and leaves the cursor on the caret.
@@ -532,11 +672,13 @@ impl Shell {
         }
         let _ = queue!(so, Print("\r\n"));
 
-        // The list's tabs, one row: the open one in the accent, the rest dim.
-        let tab = self.tab();
-        if let Some(open) = tab {
+        // The list's tabs, one row: the open one in the accent, the rest dim. Only
+        // while the list is showing - a search across everything has no tab.
+        let listing = self.listing();
+        if listing {
+            let open = self.tab;
             let mut parts = vec![(Color::Reset, "   ".to_string())];
-            for (i, t) in TABS.iter().enumerate() {
+            for (i, t) in self.tabs().iter().enumerate() {
                 if i > 0 {
                     parts.push((DIM, " · ".into()));
                 }
@@ -575,7 +717,7 @@ impl Shell {
         // Bottom rule; with the list open it carries the key legend, near the right end
         // like the firmware label above, so the keys show whatever the status row's
         // width leaves.
-        let legend = match (self.letters_act(), tab.is_some()) {
+        let legend = match (self.letters_act(), listing) {
             (true, true) => {
                 " Enter use · type to search · a add · e edit · d delete · i import · ← → tab "
             }
@@ -585,7 +727,7 @@ impl Shell {
         rule(so, w, legend);
         self.draw_status(so, w);
 
-        self.frame_rows = cell(4 + usize::from(tab.is_some()) + menu.len());
+        self.frame_rows = cell(4 + usize::from(listing) + menu.len());
         let caret = 2 + self.input[..self.cursor].chars().count();
         let _ = queue!(
             so,
@@ -690,8 +832,57 @@ impl Shell {
         self.has_pin = st.has_pin;
         self.retries = st.retries_left;
         if relist || flipped {
-            // Names need the PIN too: while locked there is nothing to show or complete.
-            self.entries = dev.list().unwrap_or_default();
+            // Names need the PIN too: while locked there is nothing to show or complete,
+            // and `relist` has already emptied them.
+            let _ = self.relist();
+        }
+    }
+
+    /// Every name and kind, plus the login of every password entry: the list shows the
+    /// login beside the name, and the device gives it up under the PIN with no gesture.
+    /// One request per password entry, which is why this is the only place that lists.
+    /// A failure part-way leaves nothing behind: a half-known vault would be shown as
+    /// the whole of it.
+    fn relist(&mut self) -> Result<(), Error> {
+        self.entries.clear();
+        let entries = self.dev()?.list()?;
+        // One request per item, and what it says changes only when the item is
+        // rewritten - where `forget_logins` drops it. Asking again for what is already
+        // known would put a round trip per item between every command and its answer.
+        self.known
+            .retain(|name, _| entries.iter().any(|e| &e.name == name));
+        for e in &entries {
+            // An auth item refuses to be read at all, and an env one holds a file
+            // rather than a login: neither has a login column or a code.
+            if matches!(e.category, Category::Auth | Category::Env)
+                || self.known.contains_key(&e.name)
+            {
+                continue;
+            }
+            let (open, shape) = self.dev()?.get_with_shape(&e.name, Reach::Open)?;
+            let login = open
+                .by_label("username")
+                .or_else(|| open.by_label("email"))
+                .map(|f| f.text().as_str().to_owned())
+                .unwrap_or_default();
+            self.known.insert(
+                e.name.clone(),
+                Known {
+                    login,
+                    has_seed: shape.has_seed(),
+                },
+            );
+        }
+        self.entries = entries;
+        Ok(())
+    }
+
+    /// What the shell knows about a rewritten entry's login is no longer what the
+    /// device holds: `None` forgets the lot, for the commands that rewrite many.
+    fn forget_logins(&mut self, name: Option<&str>) {
+        match name {
+            Some(n) => drop(self.known.remove(n)),
+            None => self.known.clear(),
         }
     }
 
@@ -903,7 +1094,7 @@ impl Shell {
 
     /// A credential by name or unique prefix - or, given nothing, by asking.
     fn pick(&mut self, arg: &str, verb: &str) -> Result<Option<String>, Error> {
-        self.entries = self.dev()?.list()?;
+        self.relist()?;
         if self.entries.is_empty() {
             self.line(DIM, "  nothing stored yet - Enter lists, a adds");
             return Ok(None);
@@ -915,7 +1106,7 @@ impl Shell {
             let described: Vec<(String, String)> = self
                 .entries
                 .iter()
-                .map(|e| (e.name.clone(), describe(e.kind)))
+                .map(|e| (e.name.clone(), category_name(e.category).to_string()))
                 .collect();
             let options: Vec<(usize, &str, &str)> = described
                 .iter()
@@ -928,13 +1119,13 @@ impl Shell {
         }
         let hits = self.matching_entries(arg);
         match hits.as_slice() {
-            [(only, _)] => return Ok(Some(only.clone())),
-            [(exact, _), ..] if exact == arg.trim() => {
-                return Ok(Some(exact.clone()));
+            [only] => return Ok(Some(only.text.clone())),
+            [first, ..] if first.text == arg.trim() => {
+                return Ok(Some(first.text.clone()));
             }
             _ => {}
         }
-        let names: Vec<&str> = hits.iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<&str> = hits.iter().map(|i| i.text.as_str()).collect();
         self.line(
             Color::Red,
             &if names.is_empty() {
@@ -959,18 +1150,40 @@ impl Shell {
             .find(|e| e.name == name)
             .cloned()
             .ok_or(Error::NotFound)?;
-        match stored.kind {
-            Kind::Totp(p) => self.use_totp(&name, p),
-            Kind::Password => self.use_password(&name),
-            Kind::Env => self.use_env(&name),
-            Kind::Auth => Err(Error::Value(crate::auth::USED_BY_AUTH.into())),
+        // What an item does when used is decided by what it holds, not by a kind it was
+        // filed under: a login with a seed field gives a code, and one without gives
+        // its password. The open fields come first either way; they need no gesture.
+        match stored.category {
+            Category::Auth => return Err(Error::Value(crate::auth::USED_BY_AUTH.into())),
+            Category::Env => return self.use_env(&name),
+            _ => {}
         }
+        // The shape comes back with the open fields and costs no gesture, so the shell
+        // knows whether a code is what this item is for before asking for a tap.
+        let (open, shape) = self.dev()?.get_with_shape(&name, Reach::Open)?;
+        for f in &open.fields {
+            let label = format!("    {:<10}", f.label);
+            self.out(&[(DIM, &label), (Color::Reset, &f.text())]);
+        }
+        if shape.has_seed() {
+            return self.use_totp(&name);
+        }
+        if shape.has_secret() {
+            return self.use_password(&name);
+        }
+        self.line(DIM, "  nothing in this item needs a tap");
+        Ok(())
     }
 
-    fn use_totp(&mut self, name: &str, p: crate::device::Params) -> Result<(), Error> {
+    fn use_totp(&mut self, name: &str) -> Result<(), Error> {
         self.tap_hint("");
         let code = self.dev()?.code(name, None)?;
-        let remaining = totp::seconds_left(p);
+        let params = crate::device::Params {
+            period: std::num::NonZeroU8::new(code.period)
+                .unwrap_or(crate::device::Params::DEFAULT.period),
+            ..crate::device::Params::DEFAULT
+        };
+        let remaining = totp::seconds_left(params);
         let copied = copy_to_clipboard(&code, None);
         self.line(Color::Reset, "");
         let tail = format!(
@@ -986,77 +1199,76 @@ impl Shell {
         Ok(())
     }
 
-    /// The stored entries as the menu under the input, the way `/` lists commands, a
-    /// tab per kind: ← and → switch the tab, ↑ and ↓ walk it, Enter uses one, typing
-    /// narrows across all of them, and on a highlighted row a adds, e edits, d deletes,
-    /// i imports - the legend on the rule below says so, which is why the list holds
-    /// nothing but entries. An empty vault is an empty tab under that legend.
+    /// The stored items as the menu under the input, the way `/` lists commands: ↑ and
+    /// ↓ walk it, Enter uses one, typing narrows it, and on a highlighted row a adds,
+    /// e edits, d deletes, i imports - the legend on the rule below says so, which is
+    /// why the list holds nothing but items. The category is a column, not a tab:
+    /// there are twenty-four of them now, and an item can be a login and a TOTP code
+    /// at once.
     fn cmd_list(&mut self) -> Result<(), Error> {
         self.ensure_unlocked()?;
-        self.entries = self.dev()?.list()?;
+        self.relist()?;
         if self.entries.is_empty() {
             self.line(DIM, "  nothing stored yet - a adds, i imports");
         }
-        self.open_tab(Tab::Totp);
+        self.open_list();
         Ok(())
     }
 
-    /// One tab of the list as the menu, nothing highlighted and the input clean: a
-    /// name highlighted on another tab would be a stale one.
-    fn open_tab(&mut self, tab: Tab) {
+    /// The list as the menu, nothing highlighted and the input clean.
+    fn open_list(&mut self) {
         self.input.clear();
         self.cursor = 0;
         self.menu = Some(Menu {
-            items: self.tab_entries(tab),
+            items: self.tab_entries(),
             selected: None,
             first: 0,
-            kind: MenuKind::List(tab),
+            kind: MenuKind::List,
         });
     }
 
-    /// The tab open under the input, if `/list` is what is showing.
-    fn tab(&self) -> Option<Tab> {
-        match self.menu.as_ref()?.kind {
-            MenuKind::List(t) => Some(t),
-            MenuKind::Commands | MenuKind::Names => None,
-        }
+    /// Whether `/list` is what is showing.
+    fn listing(&self) -> bool {
+        self.menu
+            .as_ref()
+            .is_some_and(|m| matches!(m.kind, MenuKind::List))
     }
 
     /// `/add [name]`: asks what to store, then for it. Secrets are always asked for,
     /// hidden: they must not land in the transcript or the history.
     fn cmd_add(&mut self, arg: &str) -> Result<(), Error> {
-        let Some(tab) = self.choose(
+        let Some(make) = self.choose(
             "what to store?",
             &[
                 (
-                    Tab::Totp,
+                    Make::Totp,
                     "TOTP code",
                     "the second factor a site asks for; a tap per code",
                 ),
                 (
-                    Tab::Password,
+                    Make::Password,
                     "password",
                     "a login and a password; the password after a tap",
                 ),
                 (
-                    Tab::Env,
+                    Make::Env,
                     "env file",
-                    "a project's .env, pasted whole, after a tap; up to 8000 bytes",
+                    "a project's .env, pasted whole, after a tap; up to 8056 bytes",
                 ),
             ],
         ) else {
             return Ok(());
         };
-        self.add_kind(tab, arg)
+        self.add_kind(make, arg)
     }
 
-    /// One kind, known: from its tab of the list, or picked under `/add`.
-    fn add_kind(&mut self, tab: Tab, arg: &str) -> Result<(), Error> {
+    /// One thing, known: picked under `/add`, or `a` on the list.
+    fn add_kind(&mut self, make: Make, arg: &str) -> Result<(), Error> {
         self.ensure_unlocked()?; // PIN first, so a typo there does not cost a pasted secret
-        match tab {
-            Tab::Totp => self.add_totp(arg),
-            Tab::Password => self.add_password(arg),
-            Tab::Env => self.add_env(arg),
+        match make {
+            Make::Totp => self.add_totp(arg),
+            Make::Password => self.add_password(arg),
+            Make::Env => self.add_env(arg),
         }
     }
 
@@ -1078,7 +1290,7 @@ impl Shell {
             Some(n.to_string())
         };
         let r = totp::resolve(&source, name.as_deref(), None, None, false)?;
-        if !self.store(&r.name, &r.secret, Kind::Totp(r.params))? {
+        if !self.store(&r.name, &r.item())? {
             return Ok(());
         }
         let stored = format!("  stored '{}'", r.name);
@@ -1108,8 +1320,8 @@ impl Shell {
             return Ok(());
         };
         let note = self.ask_note("Enter now skips").unwrap_or_default();
-        let blob = password_blob(&name, &login, &pw, &note)?;
-        if !self.store(&name, &blob, Kind::Password)? {
+        let item = login_item(&login, &pw, &note)?;
+        if !self.store(&name, &item)? {
             return Ok(());
         }
         let stored = format!("  stored '{name}'");
@@ -1119,8 +1331,7 @@ impl Shell {
         Ok(())
     }
 
-    /// A `.env`, pasted whole, under a project name. Not through `store`: it is not an
-    /// entry, and the device takes it through its own command.
+    /// A `.env`, pasted whole, under a project name: an item of one secret field.
     fn add_env(&mut self, arg: &str) -> Result<(), Error> {
         let name = if arg.is_empty() {
             let Some(n) = self.ask("project name (e.g. myapp): ", Field::Plain) else {
@@ -1133,9 +1344,7 @@ impl Shell {
         let Some((text, blob)) = self.env_input()? else {
             return Ok(());
         };
-        if !self.store_with(&name, Tab::Env, |d, replace| {
-            d.env_put(&name, &blob, replace)
-        })? {
+        if !self.store(&name, &blob.item())? {
             return Ok(());
         }
         let stored = format!("  stored '{name}'");
@@ -1264,90 +1473,60 @@ impl Shell {
 
     /// Stores an entry, asking before replacing one with the same name. False if the
     /// user kept the old one.
-    fn store(&mut self, name: &str, secret: &[u8], kind: Kind) -> Result<bool, Error> {
-        self.store_with(name, Tab::of(kind), |d, replace| {
-            d.add(name, secret, kind, replace)
-        })
-    }
-
-    /// `put` once without replacing; if the name is taken, asks, and once more with
-    /// replacing. Entries and `.env` blobs go through different device commands but
-    /// the same question.
-    fn store_with(
-        &mut self,
-        name: &str,
-        tab: Tab,
-        put: impl Fn(&mut Device, bool) -> Result<(), Error>,
-    ) -> Result<bool, Error> {
-        match self.after_prompt(|d| put(d, false)) {
+    fn store(&mut self, name: &str, item: &Item) -> Result<bool, Error> {
+        self.forget_logins(Some(name));
+        match self.after_prompt(|d| d.put(name, item, false)) {
             Ok(()) => Ok(true),
             Err(Error::Exists) => {
-                if !self.replace_ok(name, tab)? {
+                // One namespace, one kind of thing: whatever is there, replacing it is
+                // the same question, and the item that arrives is the item that stays.
+                if !self.ask_yes(&format!("'{name}' already exists - replace it?")) {
+                    self.line(DIM, "  kept the old one");
                     return Ok(false);
                 }
-                self.after_prompt(|d| put(d, true))?;
+                self.after_prompt(|d| d.put(name, item, true))?;
                 Ok(true)
             }
             Err(e) => Err(e),
         }
     }
 
-    /// After the device refused a name as taken: whether to store again with replace.
-    /// A replace stays within a kind - a password must not quietly take the place of
-    /// a .env full of secrets, and the device would refuse it anyway - so another kind
-    /// under that name is explained instead of asked about.
-    fn replace_ok(&mut self, name: &str, tab: Tab) -> Result<bool, Error> {
-        self.entries = self.dev()?.list()?;
-        let taken = self
-            .entries
-            .iter()
-            .find(|e| e.name == name)
-            .map(|e| Tab::of(e.kind));
-        if let Some(other) = taken.filter(|t| *t != tab) {
-            let msg = format!(
-                "  '{name}' is already {} - delete it first, or pick another name",
-                other.what()
-            );
-            self.line(Color::Yellow, &msg);
-            return Ok(false);
-        }
-        if !self.ask_yes(&format!("'{name}' already exists - replace it?")) {
-            self.line(DIM, "  kept the old one");
-            return Ok(false);
-        }
-        Ok(true)
-    }
-
-    /// A password entry by name: the login right away, the password after a tap.
+    /// The secrets of an item, after a tap. The open fields are already on screen.
     fn use_password(&mut self, name: &str) -> Result<(), Error> {
-        let login = self.dev()?.login(name)?;
-        if !login.is_empty() {
-            let login = lossy(&login);
-            self.out(&[(DIM, "    login     "), (Color::Reset, &login)]);
-        }
         self.tap_hint("");
-        let entry = self.dev()?.reveal(name)?;
-        let text = lossy(entry.password_bytes().unwrap_or_default());
+        let shown = self.dev()?.get(name, Reach::Secret)?;
+        let secret = shown
+            .first(Class::Secret)
+            .ok_or_else(|| Error::Value("nothing behind the tap in this item".into()))?;
+        let text = secret.text();
         let tail = copy_secret(&text)
             .map(|n| format!("    {n}"))
             .unwrap_or_default();
-        self.out(&[(DIM, "    password  "), (Color::Green, &text), (DIM, &tail)]);
-        // The note stays on screen only: recovery codes are read, not pasted.
-        let note = entry.note().unwrap_or_default();
-        if note.is_empty() {
-            self.line(Color::Reset, "");
-        } else {
-            self.line(DIM, "    note");
-            self.show_text(note);
+        let label = format!("    {:<10}", secret.label);
+        self.out(&[(DIM, &label), (Color::Green, &text), (DIM, &tail)]);
+
+        // Whatever else the tap brought stays on screen only: recovery codes and
+        // security answers are read, not pasted.
+        for f in shown
+            .fields
+            .iter()
+            .filter(|f| f.class == Class::Secret && f.label != secret.label)
+        {
+            self.line(DIM, &format!("    {}", f.label));
+            self.show_text(&f.value);
         }
+        self.line(Color::Reset, "");
         Ok(())
     }
 
     /// A `.env`, whole, after a tap: printed line by line, never into the clipboard.
     fn use_env(&mut self, name: &str) -> Result<(), Error> {
         self.tap_hint("");
-        let blob = self.dev()?.env_get(name)?;
-        self.show_text(&blob);
+        let item = self.dev()?.get(name, Reach::Secret)?;
+        let blob = item
+            .by_label(".env")
+            .ok_or_else(|| Error::Value("this item holds no .env".into()))?;
+        self.show_text(&blob.value);
         Ok(())
     }
 
@@ -1367,93 +1546,42 @@ impl Shell {
         Ok(())
     }
 
-    /// A new name, secret, login or password for an entry; Enter keeps each as it is,
+    /// A new name, secret, login or password for an item; Enter keeps each as it is,
     /// so a rename never asks for the QR code again. No "replace?" question - editing
     /// is the answer. The contents change first, under the old name; the rename is last.
+    ///
+    /// An item is edited field by field, because that is what it is now: whatever the
+    /// tap brings back is offered for editing, and what is not typed over is put back
+    /// as it was. A seed is never among them - it needs the export gesture, and a new
+    /// QR code replaces it whole instead.
     fn cmd_edit(&mut self, arg: &str) -> Result<(), Error> {
         self.ensure_unlocked()?;
         let Some(name) = self.pick(arg, "edit")? else {
             return Ok(());
         };
-        let kind = self
+        let category = self
             .entries
             .iter()
             .find(|e| e.name == name)
-            .map(|e| e.kind)
+            .map(|e| e.category)
             .ok_or(Error::NotFound)?;
         let new_name = self
             .ask(&format!("name (Enter keeps '{name}'): "), Field::Plain)
             .map(|n| n.to_string());
-        match kind {
-            Kind::Totp(_) => {
-                if let Some(source) = self.ask(
-                    "new QR text (otpauth://...) or base32 secret, hidden (Enter keeps it): ",
-                    Field::Hidden,
-                ) {
-                    let r = totp::resolve(&source, Some(&name), None, None, false)?;
-                    self.after_prompt(|d| d.add(&name, &r.secret, Kind::Totp(r.params), true))?;
-                }
-            }
-            Kind::Password => {
-                let current = String::from_utf8_lossy(&self.dev()?.login(&name)?).into_owned();
-                let label = if current.is_empty() {
-                    "login (Enter for none): ".to_string()
-                } else {
-                    format!("login (Enter keeps {current}): ")
-                };
-                let login = self
-                    .ask(&label, Field::Plain)
-                    .map_or_else(|| current.clone(), |l| l.to_string());
-                let typed = match self.field(
-                    "password (Enter keeps it, Ctrl-G generates one): ",
-                    Field::NewPassword,
-                ) {
-                    Some(Answer::Generated(pw)) => Some(pw),
-                    Some(Answer::Typed(pw)) => {
-                        let Some(pw) = self.confirmed(pw, "passwords") else {
-                            return Ok(());
-                        };
-                        Some(pw)
-                    }
-                    None => None,
-                };
-                let note = self.ask_note("Enter now keeps it");
-                if typed.is_some() || note.is_some() || login != current {
-                    // Login, password and note are sealed together, so whatever is
-                    // kept has to come back first - through its usual gesture.
-                    let kept = if typed.is_none() || note.is_none() {
-                        self.tap_hint(" to keep the rest");
-                        Some(self.dev()?.reveal(&name)?)
-                    } else {
-                        None
-                    };
-                    let kept_part = |part: fn(&Entry) -> Option<&[u8]>| {
-                        lossy(kept.as_ref().and_then(part).unwrap_or_default())
-                    };
-                    let pw = typed.unwrap_or_else(|| kept_part(Entry::password_bytes));
-                    let note = note.unwrap_or_else(|| kept_part(Entry::note));
-                    let blob = password_blob(&name, &login, &pw, &note)?;
-                    self.after_prompt(|d| d.add(&name, &blob, Kind::Password, true))?;
-                }
-            }
-            Kind::Env => {
-                // A blob is not renamed on the device: store it under the new name
-                // and delete the old one instead.
-                if new_name.as_deref().is_some_and(|n| n != name) {
-                    return Err(Error::Value(
-                        "a .env keeps its name: add it under the new one, then delete this one"
-                            .into(),
-                    ));
-                }
+
+        match category {
+            // Nothing to edit but the name: the seed was drawn at random and is never
+            // shown.
+            Category::Auth => {}
+            Category::Env => {
                 if let Some((text, blob)) = self.env_input()? {
-                    self.after_prompt(|d| d.env_put(&name, &blob, true))?;
+                    self.after_prompt(|d| d.put(&name, &blob.item(), true))?;
                     self.env_preview(&text);
                 }
             }
-            // Nothing to edit but the name: the secret was drawn at random and is
-            // never shown.
-            Kind::Auth => {}
+            _ => self.edit_fields(&name)?,
         }
+
         let name = match new_name {
             Some(new) if new != name => {
                 self.dev()?.rename(&name, &new)?;
@@ -1465,6 +1593,69 @@ impl Shell {
         self.line(Color::Green, &format!("  updated '{name}'"));
         self.refresh();
         Ok(())
+    }
+
+    /// Every field of an item, offered one at a time. A seed is replaced by a whole new
+    /// QR code rather than edited, and what is not typed over is put back unchanged -
+    /// which is why the tap comes first: the item has to come out before it goes in.
+    fn edit_fields(&mut self, name: &str) -> Result<(), Error> {
+        let (_, shape) = self.dev()?.get_with_shape(name, Reach::Open)?;
+        let reach = if shape.has_seed() {
+            self.tap_hint(" twice to bring the item out for editing");
+            Reach::Seed
+        } else if shape.has_secret() {
+            self.tap_hint(" to bring the item out for editing");
+            Reach::Secret
+        } else {
+            Reach::Open
+        };
+        let mut item = self.dev()?.get(name, reach)?;
+        let mut changed = false;
+
+        if shape.has_seed()
+            && let Some(source) = self.ask(
+                "new QR text (otpauth://...) or base32 secret, hidden (Enter keeps it): ",
+                Field::Hidden,
+            )
+        {
+            let r = totp::resolve(&source, Some(name), None, None, false)?;
+            let new_seed = totp::seed_field(r.params, &r.secret)?;
+            if let Some(seed_f) = item.fields.iter_mut().find(|f| f.class == Class::Seed) {
+                *seed_f = new_seed;
+            } else {
+                item.fields.push(new_seed);
+            }
+            changed = true;
+        }
+
+        for f in &mut item.fields {
+            if f.class == Class::Seed {
+                continue;
+            }
+            let current = f.text();
+            let label = if f.class == Class::Secret {
+                format!("{} (Enter keeps it, hidden): ", f.label)
+            } else if current.is_empty() {
+                format!("{} (Enter for none): ", f.label)
+            } else {
+                format!("{} (Enter keeps {}): ", f.label, current.as_str())
+            };
+            let field = if f.class == Class::Secret {
+                Field::Hidden
+            } else {
+                Field::Plain
+            };
+            if let Some(typed) = self.ask(&label, field) {
+                f.value = Zeroizing::new(typed.as_bytes().to_vec());
+                changed = true;
+            }
+        }
+        if !changed {
+            self.line(DIM, "  nothing changed");
+            return Ok(());
+        }
+        self.forget_logins(Some(name));
+        self.after_prompt(|d| d.put(name, &item, true))
     }
 
     /// A password typed twice, since it is hidden; None when the two differ or on Esc.
@@ -1544,6 +1735,7 @@ impl Shell {
             Color::Green,
             "  wiped - no PIN, no credentials; /pin sets a new one",
         );
+        self.forget_logins(None);
         self.refresh();
         Ok(())
     }
@@ -1650,6 +1842,7 @@ impl Shell {
         self.dev = Some(dev);
         self.line(Color::Yellow, &format!("  {}", import::reminder(&path)));
         self.line(Color::Green, &format!("  {}", done?.line()));
+        self.forget_logins(None);
         self.refresh();
         Ok(())
     }
@@ -1720,6 +1913,7 @@ impl Shell {
         };
         self.dev = Some(dev);
         self.line(Color::Green, &format!("  {}", done?.line()));
+        self.forget_logins(None);
         self.refresh();
         Ok(())
     }
@@ -1953,13 +2147,18 @@ impl Shell {
         };
         passphrase(&pass)?;
         self.ensure_unlocked()?;
-        let n = backup::import(self.dev()?, &path, passphrase(&pass)?)?;
+        let restored = backup::import(self.dev()?, &path, passphrase(&pass)?)?;
         let done = format!(
-            "  {n} item{} restored from {}",
-            if n == 1 { "" } else { "s" },
+            "  {} item{} restored from {}",
+            restored.count,
+            if restored.count == 1 { "" } else { "s" },
             path.display()
         );
         self.line(Color::Green, &done);
+        for line in &restored.skipped {
+            self.line(Color::Yellow, &format!("  left in the file: {line}"));
+        }
+        self.forget_logins(None);
         self.refresh();
         Ok(())
     }
@@ -2060,43 +2259,101 @@ impl Shell {
     /// Entries of any kind whose name contains `text`, case-insensitively: the search,
     /// which is just typing. An exact name comes first, so Enter on it never picks a
     /// longer one that happens to contain it.
-    fn matching_entries(&self, text: &str) -> Vec<(String, String)> {
+    fn matching_entries(&self, text: &str) -> Vec<Row> {
         let text = text.trim().to_lowercase();
-        let mut items: Vec<(String, String)> = self
+        let mut items: Vec<Row> = self
             .entries
             .iter()
             .filter(|e| e.name.to_lowercase().contains(&text))
-            .map(|e| (e.name.clone(), describe(e.kind)))
+            .map(|e| self.row(e))
             .collect();
-        items.sort_by_cached_key(|(n, _)| n.to_lowercase() != text);
+        items.sort_by_cached_key(|i| i.text.to_lowercase() != text);
         items
     }
 
-    /// The entries of one tab, as menu items. The tab already says the kind, so only
-    /// what differs within it is described: TOTP parameters off the defaults.
-    fn tab_entries(&self, tab: Tab) -> Vec<(String, String)> {
+    /// One item as a table row: its login, which the device gave up under the PIN when
+    /// the names were listed, and what kind of thing it is.
+    fn row(&self, e: &Stored) -> Row {
+        let known = self.known.get(&e.name);
+        Row {
+            text: e.name.clone(),
+            login: known.map(|k| k.login.clone()).unwrap_or_default(),
+            // An item can be a login and a one-time password at once, and the list is
+            // where that has to show: the tab says which it is filed under, the column
+            // says what it actually holds.
+            what: if known.is_some_and(|k| k.has_seed) {
+                format!("{} · totp", category_name(e.category))
+            } else {
+                category_name(e.category).to_string()
+            },
+        }
+    }
+
+    /// The items the open tab shows, as table rows.
+    fn tab_entries(&self) -> Vec<Row> {
         self.entries
             .iter()
-            .filter(|e| Tab::of(e.kind) == tab)
-            .map(|e| {
-                let what = if tab == Tab::Totp {
-                    describe(e.kind)
-                } else {
-                    String::new()
-                };
-                (e.name.clone(), what)
-            })
+            .filter(|e| self.in_tab(e))
+            .map(|e| self.row(e))
             .collect()
+    }
+
+    fn in_tab(&self, e: &Stored) -> bool {
+        match self.tab {
+            Tab::All => true,
+            Tab::Totp => self.known.get(&e.name).is_some_and(|k| k.has_seed),
+            Tab::Of(c) => e.category == c,
+        }
+    }
+
+    /// The tabs to show: `all`, `totp` when anything has a seed, then every category
+    /// the key holds, the most crowded first. Built from the vault each time it is
+    /// drawn, so a tab never outlives what put it there.
+    fn tabs(&self) -> Vec<Tab> {
+        let mut tabs = vec![Tab::All];
+        if self.entries.iter().any(|e| self.in_seed_tab(e)) {
+            tabs.push(Tab::Totp);
+        }
+        let mut counts: Vec<(Category, usize)> = Vec::new();
+        for e in &self.entries {
+            match counts.iter_mut().find(|(c, _)| *c == e.category) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((e.category, 1)),
+            }
+        }
+        counts.sort_by_key(|(c, n)| (std::cmp::Reverse(*n), category_name(*c)));
+        tabs.extend(counts.into_iter().map(|(c, _)| Tab::Of(c)));
+        tabs
+    }
+
+    fn in_seed_tab(&self, e: &Stored) -> bool {
+        self.known.get(&e.name).is_some_and(|k| k.has_seed)
+    }
+
+    /// The neighbouring tab, wrapping at either end.
+    fn shift_tab(&mut self, dir: Dir) {
+        let tabs = self.tabs();
+        let at = tabs.iter().position(|t| *t == self.tab).unwrap_or(0);
+        let n = tabs.len();
+        self.tab = match dir {
+            Dir::Next => tabs[(at + 1) % n],
+            Dir::Prev => tabs[(at + n - 1) % n],
+        };
+        self.open_list();
     }
 
     fn update_menu(&mut self) {
         let text = self.input.trim_start();
-        let items: Vec<(String, String)> = if let Some(body) = text.strip_prefix('/') {
+        let items: Vec<Row> = if let Some(body) = text.strip_prefix('/') {
             match body.split_once(' ') {
                 None => COMMANDS
                     .iter()
                     .filter(|(n, _)| n.starts_with(&body.to_ascii_lowercase()))
-                    .map(|(n, d)| (format!("/{n}"), d.to_string()))
+                    .map(|(n, d)| Row {
+                        text: format!("/{n}"),
+                        login: String::new(),
+                        what: (*d).to_string(),
+                    })
                     .collect(),
                 Some(_) => Vec::new(),
             }
@@ -2125,23 +2382,21 @@ impl Shell {
     /// name it held.
     fn letter_action(&mut self, c: char) -> Key {
         let name = self.input.trim().to_string();
-        let tab = self.tab();
         self.input.clear();
         self.cursor = 0;
         self.menu = None;
         self.hist_pos = None;
-        match (c, tab) {
-            ('a', Some(tab)) => Key::Add(tab),
-            ('a', None) => Key::Submit("/add".to_string()),
-            ('i', _) => Key::Submit("/import".to_string()),
-            ('d', _) => Key::Submit(format!("/rm {name}")),
+        match c {
+            'a' => Key::Submit("/add".to_string()),
+            'i' => Key::Submit("/import".to_string()),
+            'd' => Key::Submit(format!("/rm {name}")),
             _ => Key::Submit(format!("/edit {name}")),
         }
     }
 
     fn letters_act(&self) -> bool {
         self.menu.as_ref().is_some_and(|m| match m.kind {
-            MenuKind::List(_) => true,
+            MenuKind::List => true,
             MenuKind::Names => m.selected.is_some(),
             MenuKind::Commands => false,
         })
@@ -2153,7 +2408,7 @@ impl Shell {
         let Some(m) = &self.menu else {
             return false;
         };
-        let texts: Vec<&str> = m.items.iter().map(|(t, _)| t.as_str()).collect();
+        let texts: Vec<&str> = m.items.iter().map(|i| i.text.as_str()).collect();
         let Some(first) = texts.first() else {
             return false; // a search with no match
         };
@@ -2190,7 +2445,7 @@ impl Shell {
             (Dir::Prev, Some(cur)) => (cur + n - 1) % n,
         };
         m.selected = Some(next);
-        self.input = m.items[next].0.clone();
+        self.input = m.items[next].text.clone();
         self.cursor = self.input.len();
     }
 
@@ -2260,14 +2515,10 @@ impl Shell {
             }
             // In the list the arrows turn the tab; a highlighted name there is not
             // something to edit in place.
-            KeyCode::Left => match self.tab() {
-                Some(t) => self.open_tab(t.shift(Dir::Prev)),
-                None => self.cursor = self.prev_char(),
-            },
-            KeyCode::Right => match self.tab() {
-                Some(t) => self.open_tab(t.shift(Dir::Next)),
-                None => self.cursor = self.next_char(),
-            },
+            KeyCode::Left if self.listing() => self.shift_tab(Dir::Prev),
+            KeyCode::Right if self.listing() => self.shift_tab(Dir::Next),
+            KeyCode::Left => self.cursor = self.prev_char(),
+            KeyCode::Right => self.cursor = self.next_char(),
             KeyCode::Home => self.cursor = 0,
             KeyCode::End => self.cursor = self.input.len(),
             KeyCode::Char('a') if ctrl => self.cursor = 0,
@@ -2426,13 +2677,6 @@ impl Shell {
                             let echo = format!("  ❯ {line}");
                             self.line(DIM, &echo);
                             self.dispatch(&line)?;
-                            self.draw_frame(&mut so);
-                        }
-                        Key::Add(tab) => {
-                            self.erase_frame(&mut so);
-                            self.line(DIM, "  ❯ /add");
-                            let r = self.add_kind(tab, "");
-                            self.report(r)?;
                             self.draw_frame(&mut so);
                         }
                     }

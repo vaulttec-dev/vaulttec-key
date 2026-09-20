@@ -27,6 +27,7 @@ mod check;
 mod device;
 mod import;
 mod install;
+mod item;
 mod op;
 mod prompt;
 mod setup;
@@ -41,7 +42,7 @@ use std::process::ExitCode;
 use clap::{CommandFactory, Parser, Subcommand};
 use zeroize::Zeroizing;
 
-use device::{Device, Error, Kind, describe, passphrase, password_blob, pin};
+use device::{Category, Class, Device, Error, Reach, login_item, passphrase, pin};
 use prompt::{
     confirm, copy_secret, copy_to_clipboard, prompt_secret, unlock_interactive, with_unlock,
 };
@@ -78,7 +79,13 @@ enum Cmd {
         copy: bool,
     },
     /// Every stored entry; PIN if locked
-    List,
+    List {
+        /// Tab-separated: name, category, login, what a gesture would bring back
+        /// (secret, seed). One request per item, no gesture - what a script checks a
+        /// sync against.
+        #[arg(long)]
+        long: bool,
+    },
     /// Delete an entry; its secret cannot be recovered
     Rm {
         name: String,
@@ -149,6 +156,16 @@ enum Cmd {
     Backup {
         /// Where to write the backup
         file: PathBuf,
+    },
+    /// One item back into 1Password, as the item it was: every field, its sections and
+    /// its type. An item with a one-time password costs the double tap, because its
+    /// seed leaves the key in the clear - see docs/threat-model.md
+    Export {
+        /// The item on the key
+        name: String,
+        /// Which 1Password vault to write it to
+        #[arg(long)]
+        vault: Option<String>,
     },
     /// Every entry and .env out of a backup file, CSV export, or 1Password API onto this key
     Restore {
@@ -226,7 +243,7 @@ enum TotpCmd {
 #[derive(Subcommand)]
 enum EnvCmd {
     /// Store a .env file - or stdin, when no file is given - under a project name;
-    /// up to 8000 bytes, as is
+    /// up to 8056 bytes, as is
     Add {
         /// Project name
         name: String,
@@ -308,7 +325,7 @@ fn run(cli: Cli) -> Result<u8, Error> {
 
         Cmd::Info => run_info(&mut dev, &version),
 
-        Cmd::List => run_list(&mut dev),
+        Cmd::List { long } => run_list(&mut dev, long),
 
         Cmd::Rm { name, yes } => {
             if !confirm(
@@ -377,6 +394,7 @@ fn run(cli: Cli) -> Result<u8, Error> {
             replace,
         ),
         Cmd::Backup { file } => run_backup(&mut dev, &version, &file),
+        Cmd::Export { name, vault } => run_export(&mut dev, &name, vault.as_deref()),
         Cmd::Restore {
             file,
             op,
@@ -385,17 +403,41 @@ fn run(cli: Cli) -> Result<u8, Error> {
     }
 }
 
-fn run_list(dev: &mut Device) -> Result<u8, Error> {
+fn run_list(dev: &mut Device, long: bool) -> Result<u8, Error> {
     let entries = with_unlock(dev, Device::list)?;
-    if entries.is_empty() {
+    if entries.is_empty() && !long {
         println!("(nothing stored)");
     }
     for e in entries {
-        let what = match e.kind {
-            Kind::Totp(_) => format!("totp {}", describe(e.kind)),
-            Kind::Password | Kind::Env | Kind::Auth => describe(e.kind),
-        };
-        println!("{:<34} {}", e.name, what.trim_end());
+        if !long {
+            println!("{:<34} {}", e.name, item::category_name(e.category));
+            continue;
+        }
+        // The open reach costs the PIN and no gesture, so a whole vault can be listed
+        // this way; an auth item refuses to be read at all and is reported as it lists.
+        if e.category == Category::Auth {
+            println!("{}\t{}\t\t", e.name, item::category_name(e.category));
+            continue;
+        }
+        let (open, shape) = dev.get_with_shape(&e.name, Reach::Open)?;
+        let login = open
+            .by_label("username")
+            .or_else(|| open.by_label("email"))
+            .map(|f| f.text().as_str().to_owned())
+            .unwrap_or_default();
+        let mut holds = Vec::new();
+        if shape.has_secret() {
+            holds.push("secret");
+        }
+        if shape.has_seed() {
+            holds.push("seed");
+        }
+        println!(
+            "{}\t{}\t{login}\t{}",
+            e.name,
+            item::category_name(e.category),
+            holds.join(",")
+        );
     }
     Ok(0)
 }
@@ -418,6 +460,16 @@ fn run_info(dev: &mut Device, version: &str) -> Result<u8, Error> {
             "PIN only"
         }
     );
+    Ok(0)
+}
+
+/// One item back into 1Password. The gesture is the item's own: a seed costs the double
+/// tap, and that is the whole of the secret leaving the key - the same act as a backup,
+/// and the same gesture, so it cannot be mistaken for the tap that reveals a password.
+fn run_export(dev: &mut Device, name: &str, vault: Option<&str>) -> Result<u8, Error> {
+    let mut ui = prompt::CliUi;
+    let id = with_unlock(dev, |d| op::export_item(d, name, vault, &mut ui))?;
+    println!("wrote '{name}' to 1Password as {id}");
     Ok(0)
 }
 
@@ -513,12 +565,16 @@ fn run_restore(
     let file = backup::source(&file)?;
     let pass = prompt_secret("backup passphrase")?;
     passphrase(&pass)?;
-    let n = with_unlock(dev, |d| backup::import(d, &file, passphrase(&pass)?))?;
+    let done = with_unlock(dev, |d| backup::import(d, &file, passphrase(&pass)?))?;
     println!(
-        "{n} item{} restored from {}",
-        if n == 1 { "" } else { "s" },
+        "{} item{} restored from {}",
+        done.count,
+        if done.count == 1 { "" } else { "s" },
         file.display()
     );
+    for line in &done.skipped {
+        eprintln!("  left in the file: {line}");
+    }
     Ok(0)
 }
 
@@ -539,7 +595,8 @@ fn run_env(dev: &mut Device, cmd: EnvCmd) -> Result<u8, Error> {
             device::EnvBlob::new(blob)?
         }
     };
-    with_unlock(dev, |d| d.env_put(&name, &blob, replace))?;
+    let item = blob.item();
+    with_unlock(dev, |d| d.put(&name, &item, replace))?;
     println!("stored '{name}' - it comes back whole after a tap:  vkey get {name}");
     Ok(0)
 }
@@ -695,9 +752,8 @@ fn run_totp(dev: &mut Device, version: &str, cmd: TotpCmd) -> Result<u8, Error> 
         } => {
             let source = prompt_secret("otpauth URI or base32 secret")?;
             let r = totp::resolve(&source, name.as_deref(), digits, period, sha256)?;
-            with_unlock(dev, |d| {
-                d.add(&r.name, &r.secret, Kind::Totp(r.params), replace)
-            })?;
+            let item = r.item();
+            with_unlock(dev, |d| d.put(&r.name, &item, replace))?;
             println!("stored '{}' - codes need a tap on the button", r.name);
         }
         TotpCmd::Selftest => {
@@ -724,15 +780,17 @@ fn run_pass(dev: &mut Device, cmd: PassCmd) -> Result<u8, Error> {
             replace,
         } => {
             let a = twice("password", "passwords")?;
-            let blob = password_blob(&name, login.as_deref().unwrap_or(""), &a, "")?;
-            with_unlock(dev, |d| d.add(&name, &blob, Kind::Password, replace))?;
+            let item = login_item(login.as_deref().unwrap_or(""), &a, "")?;
+            with_unlock(dev, |d| d.put(&name, &item, replace))?;
             println!("stored '{name}' - the password comes out after a tap");
         }
     }
     Ok(0)
 }
 
-/// What an entry does when used: its kind decides.
+/// What an item does when used: what it holds decides. The shape comes back with the
+/// open fields and costs no gesture, so nothing is asked of the person until it is
+/// known what they asked for.
 fn run_get(dev: &mut Device, version: &str, name: &str, copy: bool) -> Result<u8, Error> {
     let button = boards::button(Some(version));
     let stored = with_unlock(dev, |d| {
@@ -741,11 +799,72 @@ fn run_get(dev: &mut Device, version: &str, name: &str, copy: bool) -> Result<u8
             .find(|e| e.name == name)
             .ok_or(Error::NotFound)
     })?;
-    match stored.kind {
-        Kind::Totp(p) => {
-            eprintln!("tap {button} on the board...");
-            let code = dev.code(name, None)?;
-            let remaining = totp::seconds_left(p);
+    if stored.category == Category::Auth {
+        return Err(Error::Value(auth::USED_BY_AUTH.into()));
+    }
+
+    let (open, shape) = dev.get_with_shape(name, Reach::Open)?;
+
+    if stored.category == Category::Env {
+        // Whole and as is, to stdout only: `vkey get myapp > .env`, or
+        // `env $(vkey get myapp) cmd` with nothing on disk at all.
+        if copy {
+            eprintln!("a .env is not copied to the clipboard; redirect stdout instead");
+        }
+        eprintln!("tap {button} on the board...");
+        let item = dev.get(name, Reach::Secret)?;
+        let blob = item
+            .by_label(".env")
+            .ok_or_else(|| Error::Value("this item holds no .env".into()))?;
+        let mut out = std::io::stdout().lock();
+        out.write_all(&blob.value)?;
+        out.flush()?;
+        return Ok(0);
+    }
+
+    for f in &open.fields {
+        eprintln!("{}: {}", f.label, f.text().as_str());
+    }
+
+    if shape.has_secret() {
+        eprintln!("tap {button} on the board...");
+        let shown = dev.get(name, Reach::Secret)?;
+        let secret = shown
+            .first(Class::Secret)
+            .ok_or_else(|| Error::Value("nothing behind the tap in this item".into()))?;
+        let text = secret.text();
+        println!("{}", text.as_str());
+        if copy {
+            match copy_secret(&text) {
+                Some(notice) => eprintln!("{notice}"),
+                None => eprintln!("no clipboard tool found (wl-copy, xclip, pbcopy)"),
+            }
+        }
+        // Whatever else the tap brought - recovery codes, usually - after a blank line, so
+        // the first line of stdout is always the password alone.
+        for f in shown
+            .fields
+            .iter()
+            .filter(|f| f.class == Class::Secret && f.label != secret.label)
+        {
+            println!("\n{}:\n{}", f.label, f.text().as_str());
+        }
+    }
+
+    if shape.has_seed() {
+        eprintln!(
+            "tap {button} on the board{}...",
+            if shape.has_secret() { " for code" } else { "" }
+        );
+        let code = dev.code(name, None)?;
+        let params = device::Params {
+            period: std::num::NonZeroU8::new(code.period).unwrap_or(device::Params::DEFAULT.period),
+            ..device::Params::DEFAULT
+        };
+        let remaining = totp::seconds_left(params);
+        if shape.has_secret() {
+            eprintln!("code: {code}   ({remaining}s left)");
+        } else {
             println!(
                 "{code}   ({remaining}s left){}",
                 if copy_to_clipboard(&code, None) {
@@ -755,42 +874,8 @@ fn run_get(dev: &mut Device, version: &str, name: &str, copy: bool) -> Result<u8
                 }
             );
         }
-        Kind::Password => {
-            let login = dev.login(name)?;
-            if !login.is_empty() {
-                println!("login: {}", String::from_utf8_lossy(&login));
-            }
-            eprintln!("tap {button} on the board...");
-            let entry = dev.reveal(name)?;
-            let text = String::from_utf8_lossy(entry.password_bytes().unwrap_or_default());
-            println!("{text}");
-            if copy {
-                match copy_secret(&text) {
-                    Some(notice) => eprintln!("{notice}"),
-                    None => eprintln!("no clipboard tool found (wl-copy, xclip, pbcopy)"),
-                }
-            }
-            // The note - recovery codes, usually - after a blank line, so the first
-            // line of stdout is always the password alone.
-            let note = entry.note().unwrap_or_default();
-            if !note.is_empty() {
-                println!("\n{}", String::from_utf8_lossy(note));
-            }
-        }
-        Kind::Env => {
-            // Whole and as is, to stdout only: `vkey get myapp > .env`, or
-            // `env $(vkey get myapp) cmd` with nothing on disk at all.
-            if copy {
-                eprintln!("a .env is not copied to the clipboard; redirect stdout instead");
-            }
-            eprintln!("tap {button} on the board...");
-            let blob = dev.env_get(name)?;
-            let mut out = std::io::stdout().lock();
-            out.write_all(&blob)?;
-            out.flush()?;
-        }
-        Kind::Auth => return Err(Error::Value(auth::USED_BY_AUTH.into())),
     }
+
     Ok(0)
 }
 

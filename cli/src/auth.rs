@@ -25,9 +25,10 @@ use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use zeroize::Zeroizing;
 
 use crate::device::{
-    AUTH_CHALLENGE_LEN, AUTH_SECRET_LEN, AUTH_SIGNATURE_LEN, AUTH_SIGNED_PREFIX, Device, Error,
-    Kind,
+    AUTH_CHALLENGE_LEN, AUTH_SECRET_LEN, AUTH_SIGNATURE_LEN, AUTH_SIGNED_PREFIX, Category, Class,
+    Device, Error, FieldKind,
 };
+use crate::item::{Item, OwnedField};
 use crate::prompt::with_unlock;
 
 /// What an auth entry says when someone tries to use it like the others.
@@ -136,7 +137,15 @@ pub fn enable(dev: &mut Device) -> Result<u8, Error> {
     // one already on the key under this name could not be matched to a public key.
     let seed = Zeroizing::new(random()?);
     let key = SigningKey::from_bytes(&seed).verifying_key();
-    with_unlock(dev, |d| d.add(&name, &*seed, Kind::Auth, true))?;
+    // One secret field, and the category is what makes the device seal it under the
+    // chip key rather than the PIN's.
+    let item = Item::new(Category::Auth).with(OwnedField::new(
+        Class::Secret,
+        FieldKind::Concealed,
+        "seed",
+        &*seed,
+    ));
+    with_unlock(dev, |d| d.put(&name, &item, true))?;
     drop(seed);
 
     let challenge = random()?;

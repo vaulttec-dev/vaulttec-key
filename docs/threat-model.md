@@ -14,8 +14,9 @@ A USB key on an ESP32-C6 running its own firmware (`firmware/core` plus a board
 directory). It stores TOTP secrets, passwords and project `.env` files under
 AES-256-GCM, keyed from an 8-digit PIN that is never stored. Every code, password and
 `.env` requires a physical button press; eight wrong PINs in a row wipe every secret.
-The protocol has no "read the TOTP secret" command; passwords and `.env` files do pass
-through the computer. The only other path a secret takes out is the encrypted backup below.
+A TOTP seed leaves the key in the clear only under an explicit double tap (`vkey export`).
+Routine code generation never reveals seeds. Passwords and `.env` files
+do pass through the computer. The only other path a secret takes out is the encrypted backup below.
 
 **This is not a secure element and not a certified device.** It is a general-purpose
 microcontroller. JTAG is disabled by eFuse, the data key passes through an eFuse HMAC
@@ -35,16 +36,14 @@ flowchart TD
   DK --> KEK["KEK"]
   KEK --> DEK["DEK = HMAC(KEK, 'vaultkey/dek/v1')"]
   KEK --> VER["verifier = HMAC(KEK, 'vaultkey/verify/v1')"]
-  DEK --> ENV["env key, random; sealed under DEK<br/>in the image header"]
-  DEK --> ENTRIES["entries, AES-256-GCM<br/>AAD = name + kind"]
-  ENV --> BLOBS[".env blobs, AES-256-GCM"]
+  DEK --> ITEMS["items, AES-256-GCM<br/>AAD = name + category"]
   PASS["backup passphrase<br/>12-128 bytes"] --> BA["Argon2id, fresh salt<br/>NO chip key"]
   BA --> BK["backup key -> .vkb items"]
 
   classDef ram fill:#eef,stroke:#557;
   classDef nvm fill:#efe,stroke:#575;
-  class PIN,PRE,KEK,DEK,VER,ENV,BK,PASS ram
-  class SALT,ENTRIES,BLOBS nvm
+  class PIN,PRE,KEK,DEK,VER,BK,PASS ram
+  class SALT,ITEMS nvm
 ```
 
 Blue exists only in RAM while unlocked and is zeroized on lock; green lives in flash.
@@ -57,32 +56,45 @@ An unlock is checked against the verifier; nothing derived from the PIN is store
 | Not `scrypt`, not `balloon-hash` | `scrypt` needs `alloc`; `balloon-hash` doubles the crypto crates |
 | PIN exactly 8 digits (0.9; was 6–8) | The counter can be erased through download mode, so the real cost of a guess is one firmware unlock, ~1.3 s. That is a fortnight for six digits, five months for seven and four years for eight — the only lever is length, because a slower KDF makes every honest unlock slower too. A PIN of the wrong length is refused before the wire and costs no attempt |
 | Chip key as a trait, `hal::DeviceKey` | The board supplies `esp_hal::hmac` when `KEY_PURPOSE_0 = HMAC_UP` (`ChipKey::detect`), else `Unbound`; the header records the binding, so firmware answering differently returns `Incompatible` instead of burning attempts |
-| Kind in the AAD with the name | The kind sits in flash as plaintext; without it one rewritten byte plus CRC would turn a TOTP secret into a "password" the reveal gesture hands out |
+| Category in the AAD with the name | The category sits in flash as plaintext; putting it in the AAD ensures that rewriting the category byte causes AEAD decryption to fail, so the item opens for nobody |
 
 The eFuse burn of 2026-09-08 put 32 bytes from `/dev/urandom` into `BLOCK_KEY0`, purpose
 `HMAC_UP`, read and write disabled, and set `DIS_USB_JTAG` and `DIS_PAD_JTAG` = 1. No copy
 was kept (`shred`): a key in a file makes a flash dump useful again. The vault written
 before the burn became `Incompatible` and was wiped.
 
-## Gestures and entry kinds
+## Gestures and field classes
 
 | Gesture | Action | LED |
 |---|---|---|
-| Tap | code, password (with note), `.env`, `vkey auth` login | amber |
+| Tap | code, the secret fields of an item, a `.env`, a `vkey auth` login | amber |
 | Hold 5 s | wipe | red |
-| Double tap, 800 ms window | encrypted backup export | blue |
+| Double tap, 800 ms window | encrypted backup, **and an export or seed readout** | blue |
 
 A tap never wipes and never exports; a hold never exports; a double tap never wipes. One
 gesture would defend badly: a hostile host asks for a wipe exactly when the owner expects
 a code, and the same reflex hands it over. A new command with consequences gets a new
 gesture, never an existing one.
 
-| Kind | May ever leave the device | Gesture |
+An item is a list of fields, and it is the **class of the field** - not the category of
+the item - that decides what may leave. This replaced the entry kinds on 2026-09-19,
+when the key became a mirror of a whole 1Password vault: a credit card carries a number
+anyone with the PIN may read and a CVV that needs a tap, and one kind per item could not
+say that.
+
+| Class | May ever leave the device | Gesture |
 |---|---|---|
-| `Totp` | The code only — the secret has no path to `respond` under any gesture | tap |
-| `Password` | Login without a gesture, under PIN (not a secret; the site asks for it first), then password and note | tap |
-| `Env` | The whole blob, up to `ENV_MAX` = 8000 bytes | tap |
-| `Auth` | Ed25519 signatures of a host's challenges, **without the PIN** — the seed has no path out | tap |
+| `Open` | The value, under the PIN alone: a login, a URL, an account number, an issuer | none |
+| `Secret` | The value: a password, a note, a CVV, a private key, a whole `.env` | tap |
+| `Seed` | A **code** computed from it on a tap; the seed itself only under the export gesture | tap / double tap |
+
+The host names a reach with every request and the device hands back only the fields of
+that reach - the rest are not in the answer at all. An unknown reach byte is refused
+rather than rounded down. A host that writes a seed marked `Open` gains nothing: it holds
+that seed already; the class guards the next read, not this write. The class lives inside
+the sealed item, so there is no plaintext class byte in flash to rewrite; the category
+beside it is plaintext, and it is under the AEAD tag, so rewriting it - even with the CRC
+repaired - leaves an item that opens for nobody.
 
 A password comes out on the same tap as a code (2026-09-08): for a single owner a separate
 2 s hold cost more than it protected, and it is **not coming back**. The price: a hostile
@@ -92,17 +104,32 @@ and the most expensive on the key, releasing every secret of a project at once; 
 file on disk that is the only way to launch the project, and a separate gesture would add
 nothing beyond PIN plus tap.
 
-Rejected as confirmation: `sudo` (the device cannot see host privileges — the same bytes
-arrive over the wire, and anything with port access can send them), BOOT+RESET (a reset
-with BOOT held hands the chip to the ROM loader, invisible to firmware),
-`USB_JTAG_BRIDGE_EN` via the PAC (needs `unsafe`; an eFuse closes it better). `--no-touch`
-was removed: without the button a hostile host would harvest codes for future windows.
+### A seed can now leave in the clear
+
+This is the maintainer's decision of 2026-09-19, and it costs something real. Until then
+this document said a TOTP seed had no path out of the device at all: a backup carried one
+only sealed under a passphrase, so the host saw ciphertext and nothing else.
+
+`vkey export` ends that. Writing an item back into 1Password means writing the item that
+was taken - one-time password included - and `op item create` takes a plaintext
+`otpauth://` URI. So a seed leaves in the clear, under the double tap, the same gesture a
+backup costs, because it is the same act: a whole secret leaving the key.
+
+What that buys the owner is a mirror that runs both ways. What it costs is the hardware
+boundary itself: **a key that can write its secrets back into a cloud manager protects
+them only as well as that manager does.** After an export, the seed's security is
+1Password's, the host's, and whatever else can read that process - not this device's. The
+gesture keeps it from happening behind the owner's back; it does not make it safe.
+
+Unchanged: a tap never exports a seed, an auth secret is never exported at all (`vkey
+auth` is this machine's login and 1Password has no use for it), and an item without a
+seed costs no double tap to export - only the tap its secrets already cost.
 
 ## What it protects against
 
 | Threat | Verdict |
 |---|---|
-| Malware copying the secret database off the host | Yes — a secret goes in once and never comes back out; there is no export like an authenticator app's |
+| Malware copying the secret database off the host | Yes, while the owner does not export: a secret comes back out only under a gesture - a tap for a password, two for a seed - one item per press, never in bulk without the button |
 | Silent code generation in the background | No code without a **new** press: a held or taped-down button does not count — confirmation is a press with a release, after the request |
 | A wipe disguised as a code request | Yes — different gesture, different LED |
 | A password request disguised as a code request | No — same tap, deliberately (above) |
@@ -343,11 +370,11 @@ Listed openly so nobody has to discover them.
 
 | | This key | Phone authenticator app | YubiKey 5 (OATH) |
 |---|---|---|---|
-| Secret never leaves the device in the clear | **Yes**; backup is encrypted on the device itself, behind a separate gesture | No: cloud backup, plaintext export | Yes |
+| Secret never leaves the device in the clear | **Only until the owner exports one**: a backup is encrypted on the device itself, but `vkey export` writes an item back to 1Password in the clear, under the double tap | No: cloud backup, plaintext export | Yes |
 | Button press per code | **Yes** | No | Yes (touch) |
 | PIN with wipe | **Yes**, 8 digits, Argon2id | Phone passcode | OATH password |
 | Passwords and their notes (recovery codes) | **Yes**, shown only after a press | Separate app | No (OATH) |
-| Project `.env` files | **Yes**, whole, after a press; up to 16 files of 8000 bytes | 1Password Environments, in the cloud | No |
+| Project `.env` files | **Yes**, whole, after a press; each up to 8056 bytes, as many as the vault holds | 1Password Environments, in the cloud | No |
 | Resistance to physical attacks | Partial: flash dump useless without the chip, foreign firmware will not run (Secure Boot v2); with the chip — PIN brute force through the real firmware with the counter erased, power glitching | No | Secure element, not absolute |
 | Backup | One file under a backup passphrase, restorable to any vkey | Yes, in the cloud | None |
 | Phishing resistance | No | No | No (OATH) |

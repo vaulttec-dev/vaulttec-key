@@ -15,7 +15,7 @@ use aes_gcm::{Aes256Gcm, KeyInit, Nonce, Tag};
 pub use argon2::Block;
 use argon2::{Algorithm, Argon2, Params, Version};
 use hmac::{Hmac, Mac};
-use rand_core::{CryptoRng, RngCore};
+pub use rand_core::{self, CryptoRng, RngCore};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};

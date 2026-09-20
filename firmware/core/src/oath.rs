@@ -1,28 +1,20 @@
-//! What the key stores and what it computes from it. HOTP (RFC 4226) and TOTP
-//! (RFC 6238): the device has no clock, the host sends the time with each request,
-//! exactly as a `YubiKey` does; a lying host gets a code for the wrong moment, never
-//! the secret. Passwords are stored the same way and come back out only through the
-//! reveal gesture.
+//! What a code is computed from. HOTP (RFC 4226) and TOTP (RFC 6238): the device has no
+//! clock, the host sends the time with each request, exactly as a `YubiKey` does; a lying
+//! host gets a code for the wrong moment, never the seed.
 //!
-//! Everything a code depends on is a type that can only hold a valid value: the wire
-//! and the flash are checked once, at the edge, and nothing downstream checks again.
+//! What the key *stores* is in [`crate::item`]; what may leave it is a field's class.
+//! Everything a code depends on is a type that can only hold a valid value: the wire and
+//! the flash are checked once, at the edge, and nothing downstream checks again.
 
 use core::num::NonZeroU8;
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::vault::OVERHEAD;
 
 pub const NAME_MAX: usize = 32;
-/// Long enough for any TOTP seed, and for a login, a password and a note of recovery
-/// codes together (sixteen GitHub codes with room to spare). Not more: every add
-/// rewrites the whole image, and its sectors are what an add costs in time.
-pub const SECRET_MAX: usize = 256;
-/// The most an env blob (a project's `.env`) may hold. It lives outside the record
-/// table, in its own flash region, and comes back whole after a tap.
-pub const ENV_MAX: usize = 8000;
 /// An auth secret is an Ed25519 seed, exactly this long: the host draws it, keeps the
 /// public key and forgets the seed.
 pub const AUTH_SECRET_LEN: usize = 32;
@@ -129,56 +121,6 @@ impl Params {
     }
 }
 
-/// What an entry is, which decides what may ever leave the device: a TOTP seed only
-/// ever yields codes; a password comes back as itself, through the reveal gesture;
-/// an env blob comes back whole the same way, but is never an [`Entry`] - it is too
-/// big for the table and lives in its own region. An auth secret only ever yields
-/// signatures of a host's challenges, and is the one kind sealed under the chip key
-/// alone, so it answers a tap while the device is locked.
-/// Four bytes on the wire and in flash: kind, then the TOTP parameters or zeros.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Kind {
-    Totp(Params),
-    Password,
-    Env,
-    Auth,
-}
-
-impl Kind {
-    pub const WIRE_LEN: usize = 4;
-    const TOTP: u8 = 1;
-    const PASSWORD: u8 = 2;
-    const ENV: u8 = 3;
-    const AUTH: u8 = 4;
-
-    #[must_use]
-    pub const fn from_wire(b: [u8; Self::WIRE_LEN]) -> Option<Self> {
-        match b {
-            [Self::TOTP, algo, digits, period] => match Params::from_wire([algo, digits, period]) {
-                Some(p) => Some(Kind::Totp(p)),
-                None => None,
-            },
-            [Self::PASSWORD, 0, 0, 0] => Some(Kind::Password),
-            [Self::ENV, 0, 0, 0] => Some(Kind::Env),
-            [Self::AUTH, 0, 0, 0] => Some(Kind::Auth),
-            _ => None,
-        }
-    }
-
-    #[must_use]
-    pub const fn wire(self) -> [u8; Self::WIRE_LEN] {
-        match self {
-            Kind::Totp(p) => {
-                let [algo, digits, period] = p.wire();
-                [Self::TOTP, algo, digits, period]
-            }
-            Kind::Password => [Self::PASSWORD, 0, 0, 0],
-            Kind::Env => [Self::ENV, 0, 0, 0],
-            Kind::Auth => [Self::AUTH, 0, 0, 0],
-        }
-    }
-}
-
 /// A credential name: 1..=`NAME_MAX` bytes. The device compares bytes, never text.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Name<'a>(&'a [u8]);
@@ -220,138 +162,6 @@ impl<'a> Name<'a> {
     }
 }
 
-/// Decrypted credential, in RAM only. Valid by construction; zeroized when dropped,
-/// so no early return can leave a secret behind on the stack.
-pub struct Entry {
-    name: [u8; NAME_MAX],
-    name_len: u8,
-    pub kind: Kind,
-    secret: [u8; SECRET_MAX],
-    secret_len: u16,
-}
-
-impl Zeroize for Entry {
-    fn zeroize(&mut self) {
-        self.secret.zeroize();
-        self.secret_len = 0;
-        self.name.zeroize();
-        self.name_len = 0;
-    }
-}
-
-impl Drop for Entry {
-    fn drop(&mut self) {
-        self.zeroize();
-    }
-}
-
-impl Entry {
-    /// None if the secret is empty or longer than `SECRET_MAX`, or - for a password -
-    /// not `login_len | login | password_len | password | note` with a printable login
-    /// and password (the password not empty) and a note of text; for an auth secret,
-    /// not exactly `AUTH_SECRET_LEN` bytes. An env blob is never an entry: a wire `Add`
-    /// of kind env must not smuggle one into the table.
-    #[must_use]
-    pub fn new(name: Name<'_>, kind: Kind, secret: &[u8]) -> Option<Entry> {
-        if secret.is_empty() || secret.len() > SECRET_MAX || kind == Kind::Env {
-            return None;
-        }
-        if kind == Kind::Password && !password_packed(secret) {
-            return None;
-        }
-        if kind == Kind::Auth && secret.len() != AUTH_SECRET_LEN {
-            return None;
-        }
-        let name = name.as_bytes();
-        let mut e = Entry {
-            name: [0; NAME_MAX],
-            name_len: len_u8(name.len()),
-            kind,
-            secret: [0; SECRET_MAX],
-            secret_len: len_u16(secret.len()),
-        };
-        e.name[..name.len()].copy_from_slice(name);
-        e.secret[..secret.len()].copy_from_slice(secret);
-        Some(e)
-    }
-
-    #[must_use]
-    pub fn name(&self) -> Name<'_> {
-        Name::trusted(&self.name[..usize::from(self.name_len)])
-    }
-
-    #[must_use]
-    pub fn secret(&self) -> &[u8] {
-        &self.secret[..usize::from(self.secret_len)]
-    }
-
-    /// A password entry: `login_len | login | password_len | password | note`, sealed
-    /// as one. The login comes first so it can be handed out without the gesture the
-    /// rest needs; the note (recovery codes, a security answer) is whatever is left,
-    /// possibly nothing.
-    #[must_use]
-    pub fn password(name: Name<'_>, login: &[u8], password: &[u8], note: &[u8]) -> Option<Entry> {
-        let byte = usize::from(u8::MAX);
-        if login.len() > byte || password.len() > byte {
-            return None;
-        }
-        let total = 2 + login.len() + password.len() + note.len();
-        if total > SECRET_MAX {
-            return None;
-        }
-        let mut packed = Zeroizing::new([0u8; SECRET_MAX]);
-        let mut at = 0;
-        for part in [login, password] {
-            packed[at] = len_u8(part.len());
-            packed[at + 1..at + 1 + part.len()].copy_from_slice(part);
-            at += 1 + part.len();
-        }
-        packed[at..total].copy_from_slice(note);
-        Entry::new(name, Kind::Password, &packed[..total])
-    }
-
-    /// The login of a password entry; None for a TOTP seed.
-    #[must_use]
-    pub fn login(&self) -> Option<&[u8]> {
-        Some(self.split()?.0)
-    }
-
-    /// The password of a password entry; None for a TOTP seed, which never comes out.
-    #[must_use]
-    pub fn password_bytes(&self) -> Option<&[u8]> {
-        Some(self.split()?.1)
-    }
-
-    /// The note of a password entry, empty when there is none; None for a TOTP seed.
-    #[must_use]
-    pub fn note(&self) -> Option<&[u8]> {
-        Some(self.split()?.2)
-    }
-
-    fn split(&self) -> Option<(&[u8], &[u8], &[u8])> {
-        if self.kind != Kind::Password {
-            return None;
-        }
-        let (login, rest) = take_len_prefixed(self.secret())?;
-        let (password, note) = take_len_prefixed(rest)?;
-        Some((login, password, note))
-    }
-}
-
-/// Whether `secret` is a well-formed password pack: both length prefixes in bounds,
-/// login and password printable, the password not empty, the note text (printable
-/// plus newlines). What [`Entry::split`] relies on afterwards - and the one check for
-/// bytes off the wire, so a host cannot store a login with a newline in it.
-fn password_packed(secret: &[u8]) -> bool {
-    let Some((login, rest)) = take_len_prefixed(secret) else {
-        return false;
-    };
-    let Some((password, note)) = take_len_prefixed(rest) else {
-        return false;
-    };
-    printable(login) && !password.is_empty() && printable(password) && text(note)
-}
-
 /// No control characters: what a name, a login, a password or a backup passphrase
 /// may hold.
 pub(crate) const fn printable(bytes: &[u8]) -> bool {
@@ -365,20 +175,8 @@ pub(crate) const fn printable(bytes: &[u8]) -> bool {
     true
 }
 
-/// `printable`, plus newlines: what a note may hold.
-const fn text(bytes: &[u8]) -> bool {
-    let mut i = 0;
-    while i < bytes.len() {
-        if (bytes[i] < 0x20 && bytes[i] != b'\n') || bytes[i] == 0x7f {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
-
 /// `len u8 | bytes` off the front, None if the prefix runs past the end.
-fn take_len_prefixed(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+pub(crate) fn take_len_prefixed(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
     let (len, rest) = bytes.split_first()?;
     rest.split_at_checked(usize::from(*len))
 }
@@ -396,11 +194,11 @@ pub(crate) const fn len_u8(n: usize) -> u8 {
     }
 }
 
-/// A secret, sealed record or sealed blob length: fits two bytes by construction. The
-/// longest of them is an env blob with its AEAD overhead.
+/// A field's or a sealed item's length: fits two bytes by construction. The longest of
+/// them is a whole item with its AEAD overhead.
 pub(crate) const fn len_u16(n: usize) -> u16 {
     const _: () = assert!(
-        ENV_MAX + OVERHEAD <= u16::MAX as usize && SECRET_MAX <= ENV_MAX,
+        crate::item::ITEM_MAX + OVERHEAD <= u16::MAX as usize,
         "lengths are stored in two bytes"
     );
     #[expect(clippy::cast_possible_truncation, reason = "asserted above")]

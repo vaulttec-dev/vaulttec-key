@@ -7,12 +7,71 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 use zeroize::Zeroizing;
 
-use crate::device::{Algo, Device, Digits, Error, Kind, NAME_MAX, Params};
+use crate::device::{Algo, Category, Class, Device, Digits, Error, FieldKind, NAME_MAX, Params};
+use crate::item::{Item, OwnedField};
+
+/// The label a seed field carries, which is 1Password's own name for it.
+pub const OTP_LABEL: &str = "one-time password";
 
 pub struct Resolved {
     pub name: String,
     pub secret: Zeroizing<Vec<u8>>,
     pub params: Params,
+}
+
+impl Resolved {
+    /// The item a TOTP credential is stored as: one seed field whose value is the
+    /// parameters and then the secret, which is the shape the firmware computes codes
+    /// from. Nothing else in the item, unless the caller adds it.
+    #[must_use]
+    pub fn item(&self) -> Item {
+        Item::new(Category::Login)
+            .with(seed_field(self.params, &self.secret).expect("secret is verified non-empty"))
+    }
+}
+
+/// A seed field: `algo | digits | period | secret`. The parameters travel with the
+/// secret because the device has no other place to keep them, and they are not a
+/// secret themselves - a code's shape is public.
+pub fn seed_field(params: Params, secret: &[u8]) -> Result<OwnedField, Error> {
+    if secret.is_empty() {
+        return Err(Error::Value("OTP secret cannot be empty".into()));
+    }
+    let mut value = Zeroizing::new(params.wire().to_vec());
+    value.extend_from_slice(secret);
+    Ok(OwnedField::new(
+        Class::Seed,
+        FieldKind::Otp,
+        OTP_LABEL,
+        &value,
+    ))
+}
+
+/// The parameters and the secret back out of a seed field's value.
+pub fn seed_parts(value: &[u8]) -> Result<(Params, Zeroizing<Vec<u8>>), Error> {
+    let (wire, secret) = value
+        .split_first_chunk::<{ Params::WIRE_LEN }>()
+        .ok_or_else(|| Error::Value("the seed is too short to hold its parameters".into()))?;
+    let params = Params::from_wire(*wire)
+        .ok_or_else(|| Error::Value("the seed carries parameters this build cannot use".into()))?;
+    Ok((params, Zeroizing::new(secret.to_vec())))
+}
+
+/// A seed field as the `otpauth://` URI 1Password stores, for an item written back.
+pub fn seed_uri(name: &str, value: &[u8]) -> Result<Zeroizing<String>, Error> {
+    let (params, secret) = seed_parts(value)?;
+    let secret = Zeroizing::new(data_encoding::BASE32_NOPAD.encode(&secret));
+    let label = percent_encoding::utf8_percent_encode(name, percent_encoding::NON_ALPHANUMERIC);
+    let algo = match params.algo {
+        Algo::Sha1 => "SHA1",
+        Algo::Sha256 => "SHA256",
+    };
+    Ok(Zeroizing::new(format!(
+        "otpauth://totp/{label}?secret={}&algorithm={algo}&digits={}&period={}",
+        secret.as_str(),
+        params.digits.wire(),
+        params.period
+    )))
 }
 
 /// The parameters a URI may carry, before they are checked.
@@ -30,6 +89,9 @@ pub fn decode_base32(s: &str) -> Result<Zeroizing<Vec<u8>>, Error> {
             .map(|c| c.to_ascii_uppercase())
             .collect(),
     );
+    if clean.is_empty() {
+        return Err(Error::Value("secret cannot be empty".into()));
+    }
     data_encoding::BASE32_NOPAD
         .decode(clean.as_bytes())
         .map(Zeroizing::new)
@@ -170,7 +232,8 @@ pub fn selftest(
 ) -> Result<bool, Error> {
     let name = "_selftest";
     let secret = decode_base32(TEST_SECRET)?;
-    dev.add(name, &secret, Kind::Totp(Params::DEFAULT), true)?;
+    let item = Item::new(Category::Login).with(seed_field(Params::DEFAULT, &secret)?);
+    dev.put(name, &item, true)?;
     report(&format!("  press {button} when the light turns amber"));
     let now = crate::device::now();
     let got = dev.code(name, Some(now));
