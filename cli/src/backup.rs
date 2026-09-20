@@ -187,11 +187,14 @@ fn convert_legacy_item(
             let Some((password, note)) = note.split_at_checked(usize::from(pw_len)) else {
                 return Ok(None);
             };
-            let Ok(login_item) = crate::device::login_item(
-                std::str::from_utf8(login).unwrap_or(""),
-                std::str::from_utf8(password).unwrap_or(""),
-                std::str::from_utf8(note).unwrap_or(""),
+            let (Ok(login), Ok(password), Ok(note)) = (
+                std::str::from_utf8(login),
+                std::str::from_utf8(password),
+                std::str::from_utf8(note),
             ) else {
+                return Ok(None);
+            };
+            let Ok(login_item) = crate::device::login_item(login, password, note) else {
                 return Ok(None);
             };
             login_item
@@ -302,4 +305,81 @@ fn read(path: &Path) -> Result<(BackupHead, Vec<Vec<u8>>), Error> {
         return Err(bad());
     }
     Ok((head, items))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_login_with_invalid_utf8_fails_conversion() {
+        let key = [42u8; vault::KEY_LEN];
+        let item_idx = 0u32;
+        let mut aad = [0u8; BACKUP_AAD.len() + 4];
+        aad[..BACKUP_AAD.len()].copy_from_slice(BACKUP_AAD);
+        aad[BACKUP_AAD.len()..].copy_from_slice(&item_idx.to_le_bytes());
+
+        // Kind [2, 0, 0, 0], name "test", login [0xFF, 0xFF] (invalid utf8), password "pw", note "n"
+        let name = b"test";
+        let name_len = u8::try_from(name.len()).expect("fits");
+        let mut plain = vec![2u8, 0, 0, 0];
+        plain.push(name_len);
+        plain.extend_from_slice(name);
+        plain.push(2); // login len
+        plain.extend_from_slice(&[0xFF, 0xFF]); // invalid UTF-8 login
+        plain.push(2); // pw len
+        plain.extend_from_slice(b"pw");
+        plain.extend_from_slice(b"n"); // note
+
+        let total = plain.len();
+        let mut sealed = vec![0u8; NONCE_LEN + total + TAG_LEN];
+        sealed[NONCE_LEN..NONCE_LEN + total].copy_from_slice(&plain);
+        let mut rng = BackupRng::new();
+        let sealed_len =
+            vault::seal_in_place(&key, &mut rng, &aad, &mut sealed, total).expect("seals");
+        sealed.truncate(sealed_len);
+
+        let res = convert_legacy_item(&key, item_idx, &sealed).expect("no error");
+        assert!(res.is_none(), "invalid UTF-8 in login must fail conversion");
+
+        // Invalid UTF-8 in note
+        let mut plain2 = vec![2u8, 0, 0, 0];
+        plain2.push(name_len);
+        plain2.extend_from_slice(name);
+        plain2.push(4); // login len
+        plain2.extend_from_slice(b"user");
+        plain2.push(2); // pw len
+        plain2.extend_from_slice(b"pw");
+        plain2.extend_from_slice(&[0xFE, 0xFE]); // invalid UTF-8 note
+
+        let total2 = plain2.len();
+        let mut sealed2 = vec![0u8; NONCE_LEN + total2 + TAG_LEN];
+        sealed2[NONCE_LEN..NONCE_LEN + total2].copy_from_slice(&plain2);
+        let sealed_len2 =
+            vault::seal_in_place(&key, &mut rng, &aad, &mut sealed2, total2).expect("seals");
+        sealed2.truncate(sealed_len2);
+
+        let res2 = convert_legacy_item(&key, item_idx, &sealed2).expect("no error");
+        assert!(res2.is_none(), "invalid UTF-8 in note must fail conversion");
+
+        // Valid legacy login
+        let mut plain3 = vec![2u8, 0, 0, 0];
+        plain3.push(name_len);
+        plain3.extend_from_slice(name);
+        plain3.push(4); // login len
+        plain3.extend_from_slice(b"user");
+        plain3.push(2); // pw len
+        plain3.extend_from_slice(b"pw");
+        plain3.extend_from_slice(b"note");
+
+        let total3 = plain3.len();
+        let mut sealed3 = vec![0u8; NONCE_LEN + total3 + TAG_LEN];
+        sealed3[NONCE_LEN..NONCE_LEN + total3].copy_from_slice(&plain3);
+        let sealed_len3 =
+            vault::seal_in_place(&key, &mut rng, &aad, &mut sealed3, total3).expect("seals");
+        sealed3.truncate(sealed_len3);
+
+        let res3 = convert_legacy_item(&key, item_idx, &sealed3).expect("no error");
+        assert!(res3.is_some(), "valid legacy login must convert");
+    }
 }

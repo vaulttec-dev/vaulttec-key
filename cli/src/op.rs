@@ -1188,7 +1188,7 @@ fn item_json(name: &str, category: &str, item: &Item) -> Result<Zeroizing<String
         } else {
             f.try_text()?
         };
-        let is_notes = f.label == "notesPlain";
+        let is_notes = f.class == Class::Secret && f.label == "notesPlain" && f.section.is_empty();
         let kind = if f.class == Class::Secret && f.kind == FieldKind::String && !is_notes {
             FieldKind::Concealed
         } else {
@@ -1453,5 +1453,29 @@ mod tests {
         assert_eq!(parse_env_spec("doc2pay-production"), None);
         assert_eq!(parse_env_spec(""), None);
         assert_eq!(parse_env_spec(" : "), None);
+    }
+
+    #[test]
+    fn open_field_named_notesplain_preserves_open_class_across_export_and_import() {
+        let item = Item::new(Category::Login).with(OwnedField::new(
+            Class::Open,
+            FieldKind::String,
+            "notesPlain",
+            b"not a secret note",
+        ));
+        let json = item_json("test-login", "Login", &item).expect("builds");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let field = &v["fields"][0];
+        assert_eq!(field["label"], "notesPlain");
+        assert!(
+            field.get("purpose").is_none(),
+            "open field should not receive NOTES purpose"
+        );
+        assert_eq!(field["type"], "STRING");
+
+        let detail: OpItemDetail = serde_json::from_str(&json).expect("valid JSON");
+        let (imported, _) = item_of(&detail).expect("parses");
+        let f = imported.by_label("notesPlain").expect("field present");
+        assert_eq!(f.class, Class::Open, "open class must be preserved");
     }
 }
