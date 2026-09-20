@@ -1,0 +1,16 @@
+cli/src/backup.rs
+  h_9403ed1ade5c24 190-193,197-199,309-385
+cli/src/op.rs
+  h_9403ed1ade5c24 1191,1457-1480
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "611306ee4ac4ceef7f85054561a0faa703c091ea",
+  "prompts": {},
+  "humans": {
+    "h_9403ed1ade5c24": {
+      "author": "VaultTec-Dev <vaulttec-dev@proton.me>"
+    }
+  }
+}
