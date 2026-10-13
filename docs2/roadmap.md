@@ -201,7 +201,28 @@ Milestones, one commit each:
    - The bytes differ from the factory's (another compiler), so "equivalent" means the
      same configuration, not the same binary.
 2. The removals (serial DFU, BLE OTA, the read-back generator, single-tap and double-reset
-   entry) and the write window.
+   entry) and the write window. **Built and checked statically 2026-10-14; not run on a
+   board** (that is milestone 4). Three patches:
+   - `0002-drive-only`: no CDC interface, and with it no serial DFU. No BLE OTA, no
+     SoftDevice update path, no double reset, single-tap flag or skip magic. DFU mode is
+     entered only with the button held at reset, with no valid application, or on the
+     application's GPREGRET `0x57`.
+   - `0003-no-readback`: the drive holds `INFO_UF2.TXT` and `INDEX.HTM` and reads as
+     zeros everywhere else; `CURRENT.UF2` and its generator are gone.
+   - `0004-write-window`: app blocks are written only to 0x1000..0x97000
+     (`BOARD_APP_FLASH_END` in `board.h`); the disassembly compiles it to
+     `addr - 0x1000 < 0x96000`. A self-update stages at 0x8D000, inside the window.
+
+   Code: 31 312 → 18 096 B, leaving about 20 KiB for the signature check. `check.py` now
+   also reads the disassembly for UICR addresses built as immediates or movw/movt pairs.
+   The fork's revision is in its version string (`0.9.2-vkey.2`, shown in
+   `INFO_UF2.TXT`), the only way to tell builds apart on a board with no probe.
+   Reproducible: `bootloader.bin` sha256 `76c90d5b…6064`. **Not installable yet**:
+   - the self-update is unsigned, so once installed it would accept upstream's
+     connect-kit UF2s (same board ID) and the stock bootloader;
+   - a partial app UF2 still boots under the old "valid" flag.
+
+   Milestone 3 closes both.
 3. The signed trailer, with length and version inside the signed bytes, checked on every
    boot; the host signing tool. The signature scheme is chosen by measuring the code size
    and boot time of each verify-only candidate.

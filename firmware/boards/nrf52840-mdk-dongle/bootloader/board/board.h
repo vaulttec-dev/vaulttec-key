@@ -63,6 +63,13 @@
 #define USB_DESC_UF2_PID       0xF00F
 #define USB_DESC_CDC_ONLY_PID  0xF00F
 
+/*------------------------------------------------------------------*/
+/* Flash: the drive writes 0x1000..BOARD_APP_FLASH_END and nothing else. Above it lie
+ * the vault (0x97000..0xD8000) and the filesystem a firmware keeps (0xD8000..0xEC000).
+ * The same boundary as FLASH in the firmware's memory.x and VAULT_BASE in its main.rs.
+ *------------------------------------------------------------------*/
+#define BOARD_APP_FLASH_END   0x97000
+
 #define UF2_PRODUCT_NAME   "Makerdiary nRF52840 MDK USB Dongle"
 #define UF2_VOLUME_LABEL   "UF2BOOT    "
 #define UF2_BOARD_ID       "nRF52840-MDK-USB-DONGLE"

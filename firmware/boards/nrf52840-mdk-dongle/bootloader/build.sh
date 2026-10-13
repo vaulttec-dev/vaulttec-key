@@ -6,6 +6,7 @@
 #   bootloader.hex          the bootloader, with Nordic's MBR (what a probe would write)
 #   update-bootloader.uf2   the same as a self-update UF2 (family 0xD663823C)
 #   bootloader.bin          the bootloader region alone, from 0xF4000, for check.py
+#   bootloader.dis          its disassembly, for check.py
 #   systeminit.txt          SystemInit disassembled, read before any install
 #
 # The tree is the image's pristine upstream checkout, so every run starts from the same
@@ -15,7 +16,10 @@
 set -eu
 
 BOARD=nrf52840_mdk_usb_dongle
-VERSION=0.9.2-vkey
+# Upstream's version, then the fork's revision, bumped with every change to this folder:
+# with no probe, INFO_UF2.TXT on the drive is the only way to tell which build a board
+# runs. The Makefile takes the bootloader version number from the part before "-".
+VERSION=0.9.2-vkey.2
 # What `git submodule status` reports for the pinned commits today, as the factory
 # 0.7.1 bootloader reports it too. Fixed here because the uf2 part names an upstream
 # branch, and a fresh clone after that branch moves would change the INFO text.
@@ -51,5 +55,6 @@ cp "_build/build-$BOARD/update-${BOARD}_bootloader-${VERSION}_nosd.uf2" /work/ou
 arm-none-eabi-objcopy -O binary -R .uicrBootStartAddress -R .uicrMbrParamsPageAddress \
     "$out.out" /work/out/bootloader.bin
 arm-none-eabi-objdump -d --disassemble=SystemInit "$out.out" > /work/out/systeminit.txt
+arm-none-eabi-objdump -d --no-show-raw-insn "$out.out" > /work/out/bootloader.dis
 arm-none-eabi-size "$out.out"
-python3 /work/in/check.py /work/out/bootloader.bin
+python3 /work/in/check.py /work/out/bootloader.bin /work/out/bootloader.dis

@@ -1,14 +1,18 @@
 """Fail closed on a bootloader that would be dangerous to install on a board with no
 SWD probe. Takes bootloader.bin, the region from 0xF4000 (code, then the CF2 page at
-0xFD800). Run by build.sh after every build.
+0xFD800), and bootloader.dis, its disassembly. Run by build.sh after every build.
 
-- No UICR address anywhere in the code: the bootloader must never write UICR. A write
-  there (PSELRESET, NFCPINS, APPROTECT) is permanent without a probe.
+- No UICR address the code could write through: the bootloader must never write UICR.
+  A write there (PSELRESET, NFCPINS, APPROTECT) is permanent without a probe. Searched
+  three ways: as a word anywhere in the code, as an immediate in any instruction but a
+  comparison, and as a movw/movt pair. Like the radio search in build-vaultkey.sh, it
+  catches direct addressing, not an address computed from another base plus an offset.
 - The CF2 block is the factory one, word for word. Its board ID is what the factory
   bootloader checks before it accepts this one as a self-update, and what a later
   self-update of this one is checked against.
 """
 
+import re
 import struct
 import sys
 
@@ -28,19 +32,54 @@ CF2 = [
     0, 0, 0, 0, 0, 0, 0, 0,
 ]
 
+# objdump --no-show-raw-insn: "   f5f2a:\tcmp.w\tr3, #268439552\t@ 0x10001000"
+INSN = re.compile(r"^\s*([0-9a-f]+):\s+(\S+)\s*(.*)$")
+NUMBER = re.compile(r"(?<![\w])(?:#|@ )?(0x[0-9a-f]+|\d+)\b")
+MOVW = re.compile(r"^movw\S*\s+(r\d+|ip|lr|sl|fp), #(\d+)")
+MOVT = re.compile(r"^movt\S*\s+(r\d+|ip|lr|sl|fp), #(\d+)")
 
-def main() -> int:
-    data = open(sys.argv[1], "rb").read()
-    code = data[: CF2_AT - BASE]
-    # Halfword steps: Thumb literal pools are word-aligned, but a constant built from
-    # two halves or packed in data need not be.
-    hits = [
-        BASE + i
+
+def words_in_code(code: bytes) -> list[str]:
+    # Halfword steps: Thumb literal pools are word-aligned, but a constant packed in
+    # data need not be.
+    return [
+        hex(BASE + i)
         for i in range(0, len(code) - 3, 2)
         if struct.unpack_from("<I", code, i)[0] in UICR
     ]
+
+
+def immediates_and_pairs(dis: str) -> list[str]:
+    hits = []
+    last_movw: dict[str, int] = {}
+    for line in dis.splitlines():
+        m = INSN.match(line)
+        if not m:
+            continue
+        addr, op, args = m.group(1), m.group(2), m.group(3)
+        text = f"{op} {args}"
+        if not op.startswith(("cmp", "cmn")):
+            for n in NUMBER.findall(args):
+                if int(n, 0) in UICR:
+                    hits.append(f"{addr}: {text}")
+                    break
+        if w := MOVW.match(text):
+            last_movw[w.group(1)] = int(w.group(2))
+        elif t := MOVT.match(text):
+            low = last_movw.get(t.group(1))
+            if low is not None and (int(t.group(2)) << 16 | low) in UICR:
+                hits.append(f"{addr}: {text} (with movw #{low:#x})")
+    return hits
+
+
+def main() -> int:
+    data = open(sys.argv[1], "rb").read()
+    dis = open(sys.argv[2]).read()
+    code = data[: CF2_AT - BASE]
+
+    hits = words_in_code(code) + immediates_and_pairs(dis)
     if hits:
-        print("UICR addresses in the code at " + ", ".join(hex(h) for h in hits))
+        print("UICR addresses the code could write through:\n  " + "\n  ".join(hits))
         return 1
 
     cf2 = list(struct.unpack_from(f"<{len(CF2)}I", data, CF2_AT - BASE))

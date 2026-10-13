@@ -1,0 +1,912 @@
+diff --git a/Makefile b/Makefile
+index edaedf9..625a1c8 100644
+--- a/Makefile
++++ b/Makefile
+@@ -129,8 +129,6 @@ endif
+ 
+ # all files in src
+ C_SRC += \
+-  src/dfu_ble_svc.c \
+-  src/dfu_init.c \
+   src/flash_nrf5x.c \
+   src/main.c \
+   src/screen.c \
+@@ -144,15 +142,11 @@ C_SRC += $(NRFX_PATH)/drivers/src/nrfx_power.c
+ C_SRC += $(NRFX_PATH)/drivers/src/nrfx_nvmc.c
+ C_SRC += $(NRFX_PATH)/mdk/system_$(MCU_SUB_VARIANT).c
+ 
+-# SDK 11 files: serial + OTA DFU
++# SDK 11 files: the bootloader core. Serial and BLE OTA DFU are removed: the drive is
++# the only way to write flash.
+ C_SRC += $(SDK11_PATH)/libraries/bootloader_dfu/bootloader.c
+ C_SRC += $(SDK11_PATH)/libraries/bootloader_dfu/bootloader_settings.c
+ C_SRC += $(SDK11_PATH)/libraries/bootloader_dfu/bootloader_util.c
+-C_SRC += $(SDK11_PATH)/libraries/bootloader_dfu/dfu_transport_serial.c
+-C_SRC += $(SDK11_PATH)/libraries/bootloader_dfu/dfu_transport_ble.c
+-C_SRC += $(SDK11_PATH)/libraries/bootloader_dfu/dfu_single_bank.c
+-C_SRC += $(SDK11_PATH)/ble/ble_services/ble_dfu/ble_dfu.c
+-C_SRC += $(SDK11_PATH)/ble/ble_services/ble_dis/ble_dis.c
+ C_SRC += $(SDK11_PATH)/drivers_nrf/pstorage/pstorage_raw.c
+ 
+ # Latest SDK files: peripheral drivers
+@@ -161,9 +155,6 @@ C_SRC += $(SDK_PATH)/libraries/scheduler/app_scheduler.c
+ C_SRC += $(SDK_PATH)/libraries/util/app_error.c
+ C_SRC += $(SDK_PATH)/libraries/util/app_util_platform.c
+ C_SRC += $(SDK_PATH)/libraries/crc16/crc16.c
+-C_SRC += $(SDK_PATH)/libraries/hci/hci_mem_pool.c
+-C_SRC += $(SDK_PATH)/libraries/hci/hci_slip.c
+-C_SRC += $(SDK_PATH)/libraries/hci/hci_transport.c
+ C_SRC += $(SDK_PATH)/libraries/util/nrf_assert.c
+ 
+ # UART or USB Serial
+@@ -195,7 +186,6 @@ C_SRC += \
+ 	$(TUSB_PATH)/common/tusb_fifo.c \
+ 	$(TUSB_PATH)/device/usbd.c \
+ 	$(TUSB_PATH)/device/usbd_control.c \
+-	$(TUSB_PATH)/class/cdc/cdc_device.c \
+ 	$(TUSB_PATH)/class/msc/msc_device.c \
+ 	$(TUSB_PATH)/tusb.c
+ 
+diff --git a/lib/sdk11/components/libraries/bootloader_dfu/bootloader.c b/lib/sdk11/components/libraries/bootloader_dfu/bootloader.c
+index 749347d..fe321ce 100644
+--- a/lib/sdk11/components/libraries/bootloader_dfu/bootloader.c
++++ b/lib/sdk11/components/libraries/bootloader_dfu/bootloader.c
+@@ -52,7 +52,6 @@ static bootloader_status_t      m_update_status;        /**< Current update stat
+ static bool m_cancel_timeout_on_usb; /**< If set the timeout is cancelled when USB is enumerated. Otherwise, the timeout is only cancelled when DFU update is started. */
+ 
+ APP_TIMER_DEF( _dfu_startup_timer );
+-volatile bool dfu_startup_packet_received = false;
+ 
+ /**@brief   Function for handling callbacks from pstorage module.
+  *
+@@ -87,16 +86,11 @@ static void dfu_startup_timer_handler(void * p_context)
+   }
+ #endif
+ 
+-  // nRF52832 forced DFU on startup
+-  // No packets are received within timeout, exit DFU mode
+-  // dfu_startup_packet_received is set by process_dfu_packet() in dfu_transport_serial.c
+-  if (!dfu_startup_packet_received)
+-  {
+-    dfu_update_status_t update_status;
+-    update_status.status_code = DFU_TIMEOUT;
++  // Not mounted within the timeout: exit DFU mode
++  dfu_update_status_t update_status;
++  update_status.status_code = DFU_TIMEOUT;
+ 
+-    bootloader_dfu_update_process(update_status);
+-  }
++  bootloader_dfu_update_process(update_status);
+ }
+ 
+ /**@brief   Function for waiting for events.
+@@ -130,7 +124,6 @@ static void wait_for_events(void)
+     if ( tusb_inited() )
+     {
+       tud_task();
+-      tud_cdc_write_flush();
+     }
+ #endif
+ 
+@@ -184,21 +177,10 @@ bool bootloader_app_is_valid(void)
+ 
+ static void bootloader_settings_save(bootloader_settings_t * p_settings)
+ {
+-  if ( is_ota() )
+-  {
+-    uint32_t err_code = pstorage_clear(&m_bootsettings_handle, sizeof(bootloader_settings_t));
+-    APP_ERROR_CHECK(err_code);
+-
+-    err_code = pstorage_store(&m_bootsettings_handle, (uint8_t *) p_settings, sizeof(bootloader_settings_t), 0);
+-    APP_ERROR_CHECK(err_code);
+-  }
+-  else
+-  {
+-    nrfx_nvmc_page_erase(BOOTLOADER_SETTINGS_ADDRESS);
+-    nrfx_nvmc_words_write(BOOTLOADER_SETTINGS_ADDRESS, (uint32_t *) p_settings, sizeof(bootloader_settings_t) / 4);
++  nrfx_nvmc_page_erase(BOOTLOADER_SETTINGS_ADDRESS);
++  nrfx_nvmc_words_write(BOOTLOADER_SETTINGS_ADDRESS, (uint32_t *) p_settings, sizeof(bootloader_settings_t) / 4);
+ 
+-    pstorage_callback_handler(&m_bootsettings_handle, PSTORAGE_STORE_OP_CODE, NRF_SUCCESS, (uint8_t *) p_settings, sizeof(bootloader_settings_t));
+-  }
++  pstorage_callback_handler(&m_bootsettings_handle, PSTORAGE_STORE_OP_CODE, NRF_SUCCESS, (uint8_t *) p_settings, sizeof(bootloader_settings_t));
+ }
+ 
+ 
+@@ -219,81 +201,10 @@ void bootloader_dfu_update_process(dfu_update_status_t update_status)
+     m_update_status      = BOOTLOADER_SETTINGS_SAVING;
+     bootloader_settings_save(&settings);
+   }
+-  else if (update_status.status_code == DFU_UPDATE_SD_COMPLETE)
+-  {
+-    settings.bank_0_crc     = update_status.app_crc;
+-    settings.bank_0_size    = update_status.sd_size + update_status.bl_size + update_status.app_size;
+-    settings.bank_0         = BANK_VALID_SD;
+-    settings.bank_1         = BANK_INVALID_APP;
+-    settings.sd_image_size  = update_status.sd_size;
+-    settings.bl_image_size  = update_status.bl_size;
+-    settings.app_image_size = update_status.app_size;
+-    settings.sd_image_start = update_status.sd_image_start;
+-
+-    m_update_status         = BOOTLOADER_SETTINGS_SAVING;
+-    bootloader_settings_save(&settings);
+-  }
+-  else if (update_status.status_code == DFU_UPDATE_BOOT_COMPLETE)
+-  {
+-    settings.bank_0         = p_bootloader_settings->bank_0;
+-    settings.bank_0_crc     = p_bootloader_settings->bank_0_crc;
+-    settings.bank_0_size    = p_bootloader_settings->bank_0_size;
+-    settings.bank_1         = BANK_VALID_BOOT;
+-    settings.sd_image_size  = update_status.sd_size;
+-    settings.bl_image_size  = update_status.bl_size;
+-    settings.app_image_size = update_status.app_size;
+-
+-    m_update_status         = BOOTLOADER_SETTINGS_SAVING;
+-    bootloader_settings_save(&settings);
+-  }
+-  else if (update_status.status_code == DFU_UPDATE_SD_SWAPPED)
+-  {
+-    if (p_bootloader_settings->bank_0 == BANK_VALID_SD)
+-    {
+-      settings.bank_0_crc     = 0;
+-      settings.bank_0_size    = 0;
+-      settings.bank_0         = BANK_INVALID_APP;
+-    }
+-    // This handles cases where SoftDevice was not updated, hence bank0 keeps its settings.
+-    else
+-    {
+-      settings.bank_0         = p_bootloader_settings->bank_0;
+-      settings.bank_0_crc     = p_bootloader_settings->bank_0_crc;
+-      settings.bank_0_size    = p_bootloader_settings->bank_0_size;
+-    }
+-
+-    settings.bank_1         = BANK_INVALID_APP;
+-    settings.sd_image_size  = 0;
+-    settings.bl_image_size  = 0;
+-    settings.app_image_size = 0;
+-
+-    m_update_status         = BOOTLOADER_SETTINGS_SAVING;
+-    bootloader_settings_save(&settings);
+-  }
+   else if (update_status.status_code == DFU_TIMEOUT)
+   {
+-    // Timeout has occurred. Close the connection with the DFU Controller.
+-    uint32_t err_code;
+-    if ( is_ota() )
+-    {
+-      err_code = dfu_transport_ble_close();
+-    }else
+-    {
+-      err_code = dfu_transport_serial_close();
+-    }
+-    APP_ERROR_CHECK(err_code);
+-
+     m_update_status = BOOTLOADER_TIMEOUT;
+   }
+-  else if (update_status.status_code == DFU_BANK_0_ERASED)
+-  {
+-    settings.bank_0_crc  = 0;
+-    settings.bank_0_size = 0;
+-    settings.bank_0      = BANK_INVALID_APP;
+-    settings.bank_1      = p_bootloader_settings->bank_1;
+-
+-    bootloader_settings_save(&settings);
+-  }
+   else if (update_status.status_code == DFU_RESET)
+   {
+     m_update_status = BOOTLOADER_RESET;
+@@ -320,38 +231,19 @@ uint32_t bootloader_init(void)
+ }
+ 
+ 
+-uint32_t bootloader_dfu_start(bool ota, uint32_t timeout_ms, bool cancel_timeout_on_usb)
++void bootloader_dfu_start(uint32_t timeout_ms, bool cancel_timeout_on_usb)
+ {
+-  uint32_t err_code;
++  m_cancel_timeout_on_usb = cancel_timeout_on_usb;
+ 
+-  m_cancel_timeout_on_usb = cancel_timeout_on_usb && !ota;
+-
+-  // Clear swap if banked update is used.
+-  err_code = dfu_init();
+-  VERIFY_SUCCESS(err_code);
+-
+-  if ( ota )
+-  {
+-    err_code = dfu_transport_ble_update_start();
+-  }else
++  // DFU mode with a timeout: entered on the application's request, but USB never
++  // enumerated (battery power)
++  if ( timeout_ms )
+   {
+-    // DFU mode with timeout can be
+-    // - Forced startup DFU for nRF52832 or
+-    // - Makecode single tap reset but no enumerated (battery power)
+-    if ( timeout_ms )
+-    {
+-      dfu_startup_packet_received = false;
+-
+-      app_timer_create(&_dfu_startup_timer, APP_TIMER_MODE_SINGLE_SHOT, dfu_startup_timer_handler);
+-      app_timer_start(_dfu_startup_timer, APP_TIMER_TICKS(timeout_ms), NULL);
+-    }
+-
+-    err_code = dfu_transport_serial_update_start();
++    app_timer_create(&_dfu_startup_timer, APP_TIMER_MODE_SINGLE_SHOT, dfu_startup_timer_handler);
++    app_timer_start(_dfu_startup_timer, APP_TIMER_TICKS(timeout_ms), NULL);
+   }
+ 
+   wait_for_events();
+-
+-  return err_code;
+ }
+ 
+ void bootloader_app_start(void)
+@@ -402,62 +294,6 @@ void bootloader_app_start(void)
+ }
+ 
+ 
+-bool bootloader_dfu_sd_in_progress(void)
+-{
+-  bootloader_settings_t const * p_bootloader_settings;
+-
+-  bootloader_util_settings_get(&p_bootloader_settings);
+-
+-  if (p_bootloader_settings->bank_0 == BANK_VALID_SD ||
+-      p_bootloader_settings->bank_1 == BANK_VALID_BOOT)
+-  {
+-    return true;
+-  }
+-
+-  return false;
+-}
+-
+-
+-uint32_t bootloader_dfu_sd_update_continue(void)
+-{
+-  uint32_t err_code;
+-
+-  if ((dfu_sd_image_validate() == NRF_SUCCESS) &&
+-      (dfu_bl_image_validate() == NRF_SUCCESS))
+-  {
+-      return NRF_SUCCESS;
+-  }
+-
+-  // Ensure that flash operations are not executed within the first 100 ms seconds to allow
+-  // a debugger to be attached.
+-  NRFX_DELAY_MS(100);
+-
+-  err_code = dfu_sd_image_swap();
+-  APP_ERROR_CHECK(err_code);
+-
+-  err_code = dfu_sd_image_validate();
+-  APP_ERROR_CHECK(err_code);
+-
+-  err_code = dfu_bl_image_swap();
+-  APP_ERROR_CHECK(err_code);
+-
+-  return err_code;
+-}
+-
+-
+-uint32_t bootloader_dfu_sd_update_finalize(void)
+-{
+-  dfu_update_status_t update_status = { 0 };
+-  update_status.status_code = DFU_UPDATE_SD_SWAPPED;
+-
+-  bootloader_dfu_update_process(update_status);
+-
+-  wait_for_events();
+-
+-  return NRF_SUCCESS;
+-}
+-
+-
+ void bootloader_settings_get(bootloader_settings_t * const p_settings)
+ {
+   bootloader_settings_t const * p_bootloader_settings;
+diff --git a/lib/sdk11/components/libraries/bootloader_dfu/bootloader.h b/lib/sdk11/components/libraries/bootloader_dfu/bootloader.h
+index 132df8d..2175786 100644
+--- a/lib/sdk11/components/libraries/bootloader_dfu/bootloader.h
++++ b/lib/sdk11/components/libraries/bootloader_dfu/bootloader.h
+@@ -38,11 +38,10 @@ uint32_t bootloader_init(void);
+  */
+ bool bootloader_app_is_valid(void);
+ 
+-/**@brief Function for starting the Device Firmware Update.
+- * 
+- * @retval     NRF_SUCCESS If new application image was successfully transferred.
++/**@brief Function for running the Device Firmware Update over the drive, until it
++ *        completes, is reset, or times out (timeout_ms 0: never).
+  */
+-uint32_t bootloader_dfu_start(bool ota, uint32_t timeout_ms, bool cancel_timeout_on_usb);
++void bootloader_dfu_start(uint32_t timeout_ms, bool cancel_timeout_on_usb);
+ 
+ /**@brief Function for exiting bootloader and booting into application.
+  *
+@@ -67,28 +66,6 @@ void bootloader_settings_get(bootloader_settings_t * const p_settings);
+  */
+ void bootloader_dfu_update_process(dfu_update_status_t update_status);
+ 
+-/**@brief Function getting state of SoftDevice update in progress.
+- *        After a successfull SoftDevice transfer the system restarts in orderto disable SoftDevice
+- *        and complete the update.
+- *
+- * @retval     true          A SoftDevice update is in progress. This indicates that second stage 
+- *                           of a SoftDevice update procedure can be initiated.
+- * @retval     false         No SoftDevice update is in progress.
+- */
+-bool bootloader_dfu_sd_in_progress(void);
+-
+-/**@brief Function for continuing the Device Firmware Update of a SoftDevice.
+- * 
+- * @retval     NRF_SUCCESS If the final stage of SoftDevice update was successful. 
+- */
+-uint32_t bootloader_dfu_sd_update_continue(void);
+-
+-/**@brief Function for finalizing the Device Firmware Update of a SoftDevice.
+- * 
+- * @retval     NRF_SUCCESS If the final stage of SoftDevice update was successful. 
+- */
+-uint32_t bootloader_dfu_sd_update_finalize(void);
+-
+ 
+ void bootloader_mbr_addrs_populate(void);
+ 
+diff --git a/src/boards/boards.h b/src/boards/boards.h
+index e60b822..e8496b4 100644
+--- a/src/boards/boards.h
++++ b/src/boards/boards.h
+@@ -112,7 +112,6 @@ void led_tick(void);
+ void button_init(uint32_t pin);
+ bool button_pressed(uint32_t pin);
+ 
+-bool is_ota(void);
+ 
+ //--------------------------------------------------------------------+
+ // Display
+diff --git a/src/main.c b/src/main.c
+index 92ad020..c72cf43 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -73,7 +73,7 @@
+ #include "nrf_usbd.h"
+ #include "tusb.h"
+ 
+-void usb_init(bool cdc_only);
++void usb_init(void);
+ void usb_teardown(void);
+ 
+ // tinyusb function that handles power event (detected, ready, removed)
+@@ -81,7 +81,7 @@ void usb_teardown(void);
+ extern void tusb_hal_nrf_power_event(uint32_t event);
+ 
+ #else
+-#define usb_init(x)       led_state(STATE_USB_MOUNTED) // mark nrf52832 as mounted
++#define usb_init()        led_state(STATE_USB_MOUNTED) // mark nrf52832 as mounted
+ #define usb_teardown()
+ 
+ #endif
+@@ -95,59 +95,20 @@ extern void tusb_hal_nrf_power_event(uint32_t event);
+  * - Fatal Error    : LED Status & Conn blink one after another
+  */
+ 
+-/* Magic that written to NRF_POWER->GPREGRET by application when it wish to go into DFU
+- * - DFU_MAGIC_OTA_APPJUM        : used by BLEDfu service, SD is already inited
+- * - DFU_MAGIC_OTA_RESET         : entered by soft reset, SD is not inited yet
+- * - DFU_MAGIC_SERIAL_ONLY_RESET : with CDC interface only
+- * - DFU_MAGIC_UF2_RESET         : with CDC and MSC interfaces
+- * - DFU_MAGIC_SKIP              : skip DFU entirely including double reset delay,
+- *                                 Can be used with systemoff or quick reset to app
+- *
+- * Note: for DFU_MAGIC_OTA_APPJUM Softdevice must not initialized.
+- * since it is already in application. In all other case of OTA SD must be initialized
++/* The ways into DFU mode: the button held at reset, no valid application, or the
++ * application writing DFU_MAGIC_UF2_RESET to NRF_POWER->GPREGRET before a reset. The
++ * rest upstream offers - BLE OTA, serial DFU, double reset, the single-tap flag, the
++ * skip magic - is removed: each was another way to write flash, or into the mode
++ * that does.
+  */
+-#define DFU_MAGIC_OTA_APPJUM            BOOTLOADER_DFU_START  // 0xB1
+-#define DFU_MAGIC_OTA_RESET             0xA8
+-#define DFU_MAGIC_SERIAL_ONLY_RESET     0x4e
+ #define DFU_MAGIC_UF2_RESET             0x57
+-#define DFU_MAGIC_SKIP                  0x6d
+-
+-#define DFU_DBL_RESET_MAGIC             0x5A1AD5      // SALADS
+-#define DFU_DBL_RESET_APP               0x4ee5677e
+-#define DFU_DBL_RESET_DELAY             500
+-#define DFU_DBL_RESET_MEM               0x20007F7C
+ 
+ #define BOOTLOADER_VERSION_REGISTER     NRF_TIMER2->CC[0]
+-#define DFU_SERIAL_STARTUP_INTERVAL     1000
+-
+-// Allow for using reset button essentially to swap between application and bootloader.
+-// This is controlled by a flag in the app and is the behavior of CPX and all Arcade boards when using MakeCode.
+-// DFU_DBL_RESET magic is used to determined which mode is entered
+-#define APP_ASKS_FOR_SINGLE_TAP_RESET() (*((uint32_t*)(DFU_BANK_0_REGION_START + 0x200)) == 0x87eeb07c)
+-
+-// These value must be the same with one in dfu_transport_ble.c
+-#define BLEGAP_EVENT_LENGTH             6
+-#define BLEGATT_ATT_MTU_MAX             23
+-enum {
+-  BLE_CONN_CFG_HIGH_BANDWIDTH = 1
+-};
+ 
+ //--------------------------------------------------------------------+
+ //
+ //--------------------------------------------------------------------+
+-uint32_t* dbl_reset_mem = ((uint32_t*) DFU_DBL_RESET_MEM);
+-
+-// true if ble, false if serial
+-bool _ota_dfu = false;
+-bool _ota_connected = false;
+-bool _sd_inited = false;
+-
+-bool is_ota(void) {
+-  return _ota_dfu;
+-}
+-
+ static void check_dfu_mode(void);
+-static uint32_t ble_stack_init(void);
+ 
+ // The SoftDevice must only be initialized if a chip reset has occurred.
+ // Soft reset (jump ) from application must not reinitialize the SoftDevice.
+@@ -175,16 +136,6 @@ int main(void) {
+   PRINTF("Bootloader Start\r\n");
+   led_state(STATE_BOOTLOADER_STARTED);
+ 
+-  // When updating SoftDevice, bootloader will reset before swapping SD
+-  if (bootloader_dfu_sd_in_progress()) {
+-    led_state(STATE_WRITING_STARTED);
+-
+-    bootloader_dfu_sd_update_continue();
+-    bootloader_dfu_sd_update_finalize();
+-
+-    led_state(STATE_WRITING_FINISHED);
+-  }
+-
+   // Check all inputs and enter DFU if needed
+   // Return when DFU process is complete (or not entered at all)
+   check_dfu_mode();
+@@ -199,19 +150,16 @@ int main(void) {
+    * - sd_softdevice_vector_table_base_set(APP_ADDR)
+    * - jump to App reset
+    */
+-  if (bootloader_app_is_valid() && !bootloader_dfu_sd_in_progress()) {
++  if (bootloader_app_is_valid()) {
+     PRINTF("App is valid\r\n");
+     if (is_sd_existed()) {
+-      // MBR forward IRQ to SD (if not already)
+-      if (!_sd_inited) mbr_init_sd();
++      // MBR forward IRQ to SD
++      mbr_init_sd();
+ 
+       // Make sure SD is disabled
+       sd_softdevice_disable();
+     }
+ 
+-    // clear in case we kept DFU_DBL_RESET_APP there
+-    (*dbl_reset_mem) = 0;
+-
+     // start application
+     bootloader_app_start();
+   }
+@@ -220,161 +168,29 @@ int main(void) {
+ }
+ 
+ static void check_dfu_mode(void) {
+-  uint32_t const gpregret = NRF_POWER->GPREGRET;
+-
+-  // SD is already Initialized in case of BOOTLOADER_DFU_OTA_MAGIC
+-  _sd_inited = (gpregret == DFU_MAGIC_OTA_APPJUM);
+-
+-  // Start Bootloader in BLE OTA mode
+-  _ota_dfu = (gpregret == DFU_MAGIC_OTA_APPJUM) || (gpregret == DFU_MAGIC_OTA_RESET);
+-
+-  // Serial only mode
+-  bool const serial_only_dfu = (gpregret == DFU_MAGIC_SERIAL_ONLY_RESET);
+-  bool const uf2_dfu         = (gpregret == DFU_MAGIC_UF2_RESET);
+-  bool const dfu_skip        = (gpregret == DFU_MAGIC_SKIP);
+-
+-  bool const reason_reset_pin = (NRF_POWER->RESETREAS & POWER_RESETREAS_RESETPIN_Msk) ? true : false;
+-
+-  // start either serial, uf2 or ble
+-  bool dfu_start = _ota_dfu || serial_only_dfu || uf2_dfu ||
+-                   (((*dbl_reset_mem) == DFU_DBL_RESET_MAGIC) && reason_reset_pin);
+-
+-  // Clear GPREGRET if it is our values
+-  if (dfu_start || dfu_skip) NRF_POWER->GPREGRET = 0;
+-
+-  // skip dfu entirely
+-  if (dfu_skip) return;
+-
+-  /*------------- Determine DFU mode (Serial, OTA, FRESET or normal) -------------*/
+-  // DFU button pressed
+-  dfu_start = dfu_start || button_pressed(BUTTON_DFU);
+-
+-  // DFU + FRESET are pressed --> OTA
+-  _ota_dfu = _ota_dfu || (button_pressed(BUTTON_DFU) && button_pressed(BUTTON_FRESET));
++  // The application asked for DFU mode: clear the request, so the next reset boots it
++  bool const uf2_dfu = (NRF_POWER->GPREGRET == DFU_MAGIC_UF2_RESET);
++  if (uf2_dfu) NRF_POWER->GPREGRET = 0;
+ 
++  bool const dfu_start = uf2_dfu || button_pressed(BUTTON_DFU);
+   bool const valid_app = bootloader_app_is_valid();
+-  bool const just_start_app = valid_app && !dfu_start && (*dbl_reset_mem) == DFU_DBL_RESET_APP;
+-
+-  if (!just_start_app && APP_ASKS_FOR_SINGLE_TAP_RESET()) dfu_start = 1;
+-
+-  // App mode: Double Reset detection or DFU startup for nrf52832
+-  if (!(just_start_app || dfu_start || !valid_app)) {
+-#ifdef NRF52832_XXAA
+-    /* Even DFU is not active, we still force an 1000 ms dfu serial mode when startup
+-     * to support auto programming from Arduino IDE
+-     *
+-     * Note: Double Reset WONT work with nrf52832 since all its SRAM got cleared with GPIO reset.
+-     */
+-    bootloader_dfu_start(false, DFU_SERIAL_STARTUP_INTERVAL, false);
+-#else
+-    // Note: RESETREAS is not clear by bootloader, it should be cleared by application upon init()
+-    if (reason_reset_pin) {
+-      // Register our first reset for double reset detection
+-      (*dbl_reset_mem) = DFU_DBL_RESET_MAGIC;
+ 
+-      // if RST is pressed during this delay (double reset)--> if will enter dfu
+-      NRFX_DELAY_MS(DFU_DBL_RESET_DELAY);
+-    }
+-#endif
+-  }
+-
+-  if (APP_ASKS_FOR_SINGLE_TAP_RESET()) {
+-    (*dbl_reset_mem) = DFU_DBL_RESET_APP;
+-  } else {
+-    (*dbl_reset_mem) = 0;
+-  }
+-
+-  // Enter DFU mode accordingly to input
+   if (dfu_start || !valid_app) {
+-    if (_ota_dfu) {
+-      led_state(STATE_BLE_DISCONNECTED);
+-      if (!_sd_inited) mbr_init_sd();
+-      _sd_inited = true;
+-      ble_stack_init();
+-    } else {
+-      led_state(STATE_USB_UNMOUNTED);
+-      usb_init(serial_only_dfu);
+-    }
++    led_state(STATE_USB_UNMOUNTED);
++    usb_init();
+ 
+-    // Initiate an update of the firmware.
+-    if (APP_ASKS_FOR_SINGLE_TAP_RESET() || uf2_dfu || serial_only_dfu) {
++    if (uf2_dfu) {
+       // If USB is not enumerated in 3s (eg. because we're running on battery), we restart into app.
+-      bootloader_dfu_start(_ota_dfu, 3000, true);
++      bootloader_dfu_start(3000, true);
+     } else {
+-      // No timeout if bootloader requires user action (double-reset).
+-      bootloader_dfu_start(_ota_dfu, 0, false);
++      // No timeout when a person asked (the button) or there is nothing valid to boot.
++      bootloader_dfu_start(0, false);
+     }
+ 
+-    if (_ota_dfu) {
+-      sd_softdevice_disable();
+-    } else {
+-      usb_teardown();
+-    }
++    usb_teardown();
+   }
+ }
+ 
+-// Initializes the SotdDevice by following SD specs section
+-// "Master Boot Record and SoftDevice initializaton procedure"
+-static uint32_t ble_stack_init(void) {
+-  // Forward vector table to bootloader address so that we can handle BLE events
+-  sd_softdevice_vector_table_base_set(BOOTLOADER_REGION_START);
+-
+-  // Enable Softdevice, Use Internal OSC to compatible with all boards
+-  nrf_clock_lf_cfg_t clock_cfg = {
+-      .source       = NRF_CLOCK_LF_SRC_RC,
+-      .rc_ctiv      = 16,
+-      .rc_temp_ctiv = 2,
+-      .accuracy     = NRF_CLOCK_LF_ACCURACY_250_PPM
+-  };
+-  sd_softdevice_enable(&clock_cfg, app_error_fault_handler);
+-  sd_nvic_EnableIRQ(SD_EVT_IRQn);
+-
+-  /*------------- Configure BLE params  -------------*/
+-  extern uint32_t __data_start__[]; // defined in linker
+-  uint32_t ram_start = (uint32_t) __data_start__;
+-
+-  ble_cfg_t blecfg;
+-
+-  // Configure the maximum number of connections.
+-  varclr(&blecfg);
+-  blecfg.gap_cfg.role_count_cfg.adv_set_count = 1;
+-  blecfg.gap_cfg.role_count_cfg.periph_role_count = 1;
+-  blecfg.gap_cfg.role_count_cfg.central_role_count = 0;
+-  blecfg.gap_cfg.role_count_cfg.central_sec_count = 0;
+-  sd_ble_cfg_set(BLE_GAP_CFG_ROLE_COUNT, &blecfg, ram_start);
+-
+-  // NRF_DFU_BLE_REQUIRES_BONDS
+-  varclr(&blecfg);
+-  blecfg.gatts_cfg.service_changed.service_changed = 1;
+-  sd_ble_cfg_set(BLE_GATTS_CFG_SERVICE_CHANGED, &blecfg, ram_start);
+-
+-  // ATT MTU
+-  varclr(&blecfg);
+-  blecfg.conn_cfg.conn_cfg_tag = BLE_CONN_CFG_HIGH_BANDWIDTH;
+-  blecfg.conn_cfg.params.gatt_conn_cfg.att_mtu = BLEGATT_ATT_MTU_MAX;
+-  sd_ble_cfg_set(BLE_CONN_CFG_GATT, &blecfg, ram_start);
+-
+-  // Event Length + HVN queue + WRITE CMD queue setting affecting bandwidth
+-  varclr(&blecfg);
+-  blecfg.conn_cfg.conn_cfg_tag = BLE_CONN_CFG_HIGH_BANDWIDTH;
+-  blecfg.conn_cfg.params.gap_conn_cfg.conn_count = 1;
+-  blecfg.conn_cfg.params.gap_conn_cfg.event_length = BLEGAP_EVENT_LENGTH;
+-  sd_ble_cfg_set(BLE_CONN_CFG_GAP, &blecfg, ram_start);
+-
+-  // Enable BLE stack.
+-  // Note: Interrupt state (enabled, forwarding) is not work properly if not enable ble
+-  sd_ble_enable(&ram_start);
+-
+-#if 0
+-  ble_opt_t  opt;
+-  varclr(&opt);
+-  opt.common_opt.conn_evt_ext.enable = 1; // enable Data Length Extension
+-  sd_ble_opt_set(BLE_COMMON_OPT_CONN_EVT_EXT, &opt);
+-#endif
+-
+-  return NRF_SUCCESS;
+-}
+-
+ //--------------------------------------------------------------------+
+ // Error Handler
+ //--------------------------------------------------------------------+
+@@ -388,83 +204,6 @@ void assert_nrf_callback(uint16_t line_num, uint8_t const* p_file_name) {
+   app_error_fault_handler(0xDEADBEEF, 0, 0);
+ }
+ 
+-/*------------------------------------------------------------------*/
+-/* SoftDevice Event handler
+- *------------------------------------------------------------------*/
+-
+-// Process BLE event from SD
+-uint32_t proc_ble(void) {
+-  __ALIGN(4) uint8_t ev_buf[BLE_EVT_LEN_MAX(BLEGATT_ATT_MTU_MAX)];
+-  uint16_t ev_len = BLE_EVT_LEN_MAX(BLEGATT_ATT_MTU_MAX);
+-
+-  // Init header
+-  ble_evt_t* evt = (ble_evt_t*) ev_buf;
+-  evt->header.evt_id = BLE_EVT_INVALID;
+-
+-  // Get BLE Event
+-  uint32_t err = sd_ble_evt_get(ev_buf, &ev_len);
+-
+-  // Handle valid event, ignore error
+-  if (NRF_SUCCESS == err) {
+-    switch (evt->header.evt_id) {
+-      case BLE_GAP_EVT_CONNECTED:
+-        _ota_connected = true;
+-        led_state(STATE_BLE_CONNECTED);
+-        break;
+-
+-      case BLE_GAP_EVT_DISCONNECTED:
+-        _ota_connected = false;
+-        led_state(STATE_BLE_DISCONNECTED);
+-        break;
+-
+-      default:
+-        break;
+-    }
+-
+-    // from dfu_transport_ble
+-    extern void ble_evt_dispatch(ble_evt_t* p_ble_evt);
+-    ble_evt_dispatch(evt);
+-  }
+-
+-  return err;
+-}
+-
+-// process SOC event from SD
+-uint32_t proc_soc(void) {
+-  uint32_t soc_evt = 0;
+-  uint32_t err = sd_evt_get(&soc_evt);
+-
+-  if (NRF_SUCCESS == err) {
+-    pstorage_sys_event_handler(soc_evt);
+-
+-#ifdef NRF_USBD
+-    /*------------- usb power event handler -------------*/
+-    int32_t usbevt = (soc_evt == NRF_EVT_POWER_USB_DETECTED) ? NRFX_POWER_USB_EVT_DETECTED :
+-                     (soc_evt == NRF_EVT_POWER_USB_POWER_READY) ? NRFX_POWER_USB_EVT_READY :
+-                     (soc_evt == NRF_EVT_POWER_USB_REMOVED) ? NRFX_POWER_USB_EVT_REMOVED : -1;
+-
+-    if (usbevt >= 0) tusb_hal_nrf_power_event((uint32_t) usbevt);
+-#endif
+-  }
+-
+-  return err;
+-}
+-
+-void proc_sd_task(void* evt_data, uint16_t evt_size) {
+-  (void) evt_data;
+-  (void) evt_size;
+-
+-  // process BLE and SOC until there is no more events
+-  while ((NRF_ERROR_NOT_FOUND != proc_ble()) || (NRF_ERROR_NOT_FOUND != proc_soc())) {
+-    // nothing
+-  }
+-}
+-
+-void SD_EVT_IRQHandler(void) {
+-  // Use App Scheduler to defer handling code in non-isr context
+-  app_sched_event_put(NULL, 0, proc_sd_task);
+-}
+-
+ //--------------------------------------------------------------------+
+ // RTT printf retarget for Debug
+ //--------------------------------------------------------------------+
+diff --git a/src/usb/tusb_config.h b/src/usb/tusb_config.h
+index b7c93a4..0f7094d 100644
+--- a/src/usb/tusb_config.h
++++ b/src/usb/tusb_config.h
+@@ -52,17 +52,15 @@
+ #define CFG_TUD_ENDOINT0_SIZE       64
+ 
+ //------------- Class enabled -------------//
+-#define CFG_TUD_CDC                 1
++// No CDC: the serial port carried legacy serial DFU, which writes the app, the
++// bootloader and the SoftDevice with no signature. The drive (MSC) is the only interface.
++#define CFG_TUD_CDC                 0
+ #define CFG_TUD_MSC                 1
+ 
+ /*------------------------------------------------------------------*/
+ /* CLASS DRIVER
+  *------------------------------------------------------------------*/
+ 
+-// FIFO size of CDC TX and RX
+-#define CFG_TUD_CDC_RX_BUFSIZE      1024
+-#define CFG_TUD_CDC_TX_BUFSIZE      1024
+-
+ // Buffer size for each read/write transfer, the more the better
+ #define CFG_TUD_MSC_BUFSIZE         (4*1024)
+ 
+diff --git a/src/usb/usb.c b/src/usb/usb.c
+index 30d91c0..c4f6f5c 100644
+--- a/src/usb/usb.c
++++ b/src/usb/usb.c
+@@ -53,7 +53,7 @@ void USBD_IRQHandler(void) {
+ }
+ 
+ //------------- IMPLEMENTATION -------------//
+-void usb_init(bool cdc_only) {
++void usb_init(void) {
+   // 0, 1 is reserved for SD
+   NVIC_SetPriority(USBD_IRQn, 2);
+ 
+@@ -93,7 +93,7 @@ void usb_init(bool cdc_only) {
+     tusb_hal_nrf_power_event(NRFX_POWER_USB_EVT_READY);
+   }
+ 
+-  usb_desc_init(cdc_only);
++  usb_desc_init();
+   uf2_init();
+   tusb_init();
+ 
+diff --git a/src/usb/usb_desc.c b/src/usb/usb_desc.c
+index 535bb52..3c6aa51 100644
+--- a/src/usb/usb_desc.c
++++ b/src/usb/usb_desc.c
+@@ -29,13 +29,9 @@ enum {
+     STRID_MANUFACTURER ,
+     STRID_PRODUCT      ,
+     STRID_SERIAL       ,
+-    STRID_CDC          ,
+     STRID_MSC
+ };
+ 
+-// CDC + MSC or CDC only mode
+-static bool _cdc_only = false;
+-
+ // Serial is 64-bit DeviceID -> 16 chars len
+ static char desc_str_serial[1+16];
+ 
+@@ -48,11 +44,10 @@ tusb_desc_device_t desc_device =
+     .bDescriptorType    = TUSB_DESC_DEVICE,
+     .bcdUSB             = 0x0200,
+ 
+-    // Use Interface Association Descriptor (IAD) for CDC
+-    // As required by USB Specs IAD's subclass must be common class (2) and protocol must be IAD (1)
+-    .bDeviceClass       = TUSB_CLASS_MISC,
+-    .bDeviceSubClass    = MISC_SUBCLASS_COMMON,
+-    .bDeviceProtocol    = MISC_PROTOCOL_IAD,
++    // One interface, so its class is the device's: no IAD
++    .bDeviceClass       = TUSB_CLASS_UNSPECIFIED,
++    .bDeviceSubClass    = 0,
++    .bDeviceProtocol    = 0,
+     .bMaxPacketSize0    = CFG_TUD_ENDOINT0_SIZE,
+ 
+     .idVendor           = USB_DESC_VID,
+@@ -78,31 +73,17 @@ uint8_t const * tud_descriptor_device_cb(void)
+ //--------------------------------------------------------------------+
+ 
+ enum {
+-    ITF_NUM_CDC = 0  ,
+-    ITF_NUM_CDC_DATA ,
+-    ITF_NUM_MSC      ,
++    ITF_NUM_MSC = 0  ,
+     ITF_NUM_TOTAL
+ };
+ 
+-uint8_t desc_configuration_cdc_msc[] =
++uint8_t const desc_configuration_msc[] =
+ {
+   // Interface count, string index, total length, attribute, power in mA
+-  TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_MSC_DESC_LEN, 0, 100),
+-
+-  // Interface number, string index, EP notification address and size, EP data address (out, in) and size.
+-  TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, STRID_CDC, 0x81, 8, 0x02, 0x82, 64),
++  TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, TUD_CONFIG_DESC_LEN + TUD_MSC_DESC_LEN, 0, 100),
+ 
+   // Interface number, string index, EP Out & EP In address, EP size
+-  TUD_MSC_DESCRIPTOR(ITF_NUM_MSC, STRID_MSC, 0x03, 0x83, 64),
+-};
+-
+-uint8_t desc_configuration_cdc_only[] =
+-{
+-  // Interface count, string index, total length, attribute, power in mA
+-  TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL-1, 0, TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN, 0, 100),
+-
+-  // Interface number, string index, EP notification address and size, EP data address (out, in) and size.
+-  TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, STRID_CDC, 0x81, 8, 0x02, 0x82, 64),
++  TUD_MSC_DESCRIPTOR(ITF_NUM_MSC, STRID_MSC, 0x01, 0x81, 64),
+ };
+ 
+ 
+@@ -112,20 +93,11 @@ uint8_t desc_configuration_cdc_only[] =
+ uint8_t const * tud_descriptor_configuration_cb(uint8_t index)
+ {
+   (void) index; // for multiple configurations
+-  return _cdc_only ? desc_configuration_cdc_only : desc_configuration_cdc_msc;
++  return desc_configuration_msc;
+ }
+ 
+-// Enumerate as CDC + MSC or CDC only
+-void usb_desc_init(bool cdc_only)
++void usb_desc_init(void)
+ {
+-  _cdc_only = cdc_only;
+-
+-  if ( cdc_only )
+-  {
+-    // Change PID to CDC only
+-    desc_device.idProduct = USB_DESC_CDC_ONLY_PID;
+-  }
+-
+   // Create Serial string descriptor
+   uint8_t const* device_id = (uint8_t const*) &NRF_FICR->DEVICEID;
+ 
+@@ -153,8 +125,7 @@ char const* string_desc_arr [] =
+   BLEDIS_MANUFACTURER,           // 1: Manufacturer
+   BLEDIS_MODEL,                  // 2: Product
+   desc_str_serial,               // 3: Serials, should use chip ID
+-  "nRF Serial",                  // 4: CDC Interface
+-  "nRF UF2",                     // 5: MSC Interface
++  "nRF UF2",                     // 4: MSC Interface
+ };
+ 
+ // up to 64 unicode characters
+diff --git a/src/usb/usb_desc.h b/src/usb/usb_desc.h
+index 3b318c2..df4d070 100644
+--- a/src/usb/usb_desc.h
++++ b/src/usb/usb_desc.h
+@@ -28,6 +28,6 @@
+ #include "tusb.h"
+ #include "boards.h"
+ 
+-void usb_desc_init(bool cdc_only);
++void usb_desc_init(void);
+ 
+ #endif /* USB_DESC_H_ */
