@@ -125,6 +125,103 @@ Nordic's MBR offers a power-safe copy, but whether this updater uses it is not c
 
 **`vkey setup` for the nRF** writes the signed UF2 to the bootloader drive.
 
+**What reading the source found (2026-10-14; desk research, nothing flashed).** Base:
+upstream `Adafruit_nRF52_Bootloader`. The factory 0.7.1 source is unpublished, but its
+binary is in `makerdiary/nrf52840-mdk-usb-dongle` and its submodules match upstream 0.6.4-0.9.2.
+The board definition is Makerdiary's, not upstream's: `UF2BOOT`, `2886:F00F`, the button on
+P0.18 as a pull-up GPIO, LEDs 23/22/24. Before anything is built:
+
+- **PSELRESET trap.** Upstream's Makefile defines `CONFIG_GPIO_AS_PINRESET` and
+  `CONFIG_NFCT_PINS_AS_GPIOS`. nrfx 2.0.0's `SystemInit` then writes UICR `PSELRESET` = P0.18
+  on first boot, which turns the only button into a reset pin for good. The factory build
+  has neither define (its `SystemInit` was disassembled). The fork drops both, and its
+  `SystemInit` is disassembled before install.
+- **Board ID.** The factory bootloader takes a self-update UF2 only with board ID
+  `0x2886F00F`, or with none. Upstream's dongle builds carry `0x239A0029` and are refused.
+  Upstream's "connect-kit" update UF2s carry `0x2886F00F` and would be accepted, with wrong
+  pins and the PSELRESET write, so they must never be used.
+- **Every write path has to go or be signed.**
+  - The UF2 self-update (family `0xD663823C`) is unauthenticated: anyone holding the
+    button can put the stock bootloader back.
+  - Serial DFU over CDC writes the app, the bootloader and the SoftDevice. Its pre-erase
+    reaches the vault, and its only check is public constants plus a CRC16.
+  - BLE OTA.
+
+  Removing serial DFU and BLE OTA is also what frees room for the signature check.
+- **Read-back is more than `CURRENT.UF2`.** The generator behind it serves any address
+  under 1 MiB, so a raw read past the file's end returns the bootloader and the settings
+  too. The generator branch goes, not just the directory entry.
+- **A partial UF2 boots.** The settings change only when the transfer completes, so a torn
+  upload followed by a replug runs half-new code as valid. The fork verifies the signature
+  on every boot in `bootloader_app_is_valid()` and fails closed.
+- **Size.** The factory image is 33 044 B, leaving 5 868 B before 0xFD800. Signature check
+  code sizes are not measured yet.
+- **Install.** A self-update UF2 is the bootloader hex itself. The running bootloader stages
+  it at 0xE0000 and has the MBR copy it with `SD_MBR_COMMAND_COPY_BL`, which Nordic calls
+  power-fail safe; that claim is not tested here. The update is padded to the whole region.
+- **Before installing,** the fork's USB and UF2 logic runs as an ordinary application at
+  0x1000 under the factory bootloader, which stays in place and makes this step
+  reversible.
+- **Self-update in the fork: signed** (maintainer's choice, 2026-10-14). Removing it would
+  leave a bug in the bootloader unfixable forever. The update is signed with the same key as
+  the app images. A signed image can still be downgraded to an older signed one: a known
+  limitation, deferred.
+
+Constraints that come with it:
+
+- **Staging must avoid the vault and Trussed.** Upstream stages a self-update at
+  0xE0000..0xEA000, inside the 0xD8000..0xEC000 kept for Trussed in phase 6, so a later
+  self-update would erase the passkeys. The fork stages inside the application region, and
+  the app is flashed again after a bootloader update.
+- **The signing key must exist in two places.** Once everything moves here, a broken app
+  leaves the board in the bootloader waiting for a signed image. If the only copy of the key
+  is on this board, nothing can sign it. Before the key is generated, decide its second home:
+  the wiped C6 as the signing device, or a `.vkb` that restores onto it.
+- ~~**The page at 0xFD800**~~ is the CF2 config page (`.bootloaderConfig`, 88 B: board ID,
+  family, flash and RAM size), part of the bootloader image inside the 40 KiB that `COPY_BL`
+  copies. `check.py` pins it to the factory's words. The code region is 0xF4000..0xFD800.
+- **A verify bug is the brick.** If the check rejects valid images, no app boots and no fixed
+  bootloader is accepted. So the test build at 0x1000 runs the exact same verify code against
+  images from the real signing pipeline, altered ones and a self-update image, with
+  `COPY_BL` compiled out and its write window on a scratch area.
+
+Milestones, one commit each:
+
+1. A Docker build that reproduces a factory-equivalent binary: same `SystemInit`, no UICR
+   writes, the same board ID. **Done 2026-10-14**:
+   - `BOARD=nrf52840-mdk-dongle ./tools/build-bootloader.sh` builds upstream 0.9.2 with
+     arm-gnu-toolchain 12.3.rel1, the board definition read back from the factory binary
+     and `patches/0001-no-uicr-writes.patch`.
+   - The code is 31 312 B, the factory's size, with the same INFO string format and
+     submodule versions.
+   - `SystemInit` stores only to peripherals, and FICR is only read.
+   - `check.py` finds no UICR address in the code and the CF2 block equal to the
+     factory's.
+   - Two builds are byte-identical: `bootloader.bin` sha256 `61aec000…9d73`.
+   - The bytes differ from the factory's (another compiler), so "equivalent" means the
+     same configuration, not the same binary.
+2. The removals (serial DFU, BLE OTA, the read-back generator, single-tap and double-reset
+   entry) and the write window.
+3. The signed trailer, with length and version inside the signed bytes, checked on every
+   boot; the host signing tool. The signature scheme is chosen by measuring the code size
+   and boot time of each verify-only candidate.
+4. The on-device test as an application.
+
+Install needs its own go and a checklist:
+
+- no UICR address (0x10001xxx) and no NVMC `CONFIG` write in the binary;
+- `SystemInit` disassembled;
+- the board ID confirmed;
+- the update padded to the whole region;
+- the UF2 actually installed is checked block by block. Every target address falls in the
+  MBR, 0xF4000..0xFE000, the settings page at 0xFF000 or the two UICR words, and its
+  0xF4000.. payload equals the checked `bootloader.bin`;
+- the MBR: the update carries Nordic's MBR 2.4.1 and a whole settings page. Read in the
+  update handler what happens to those blocks, and compare the chip's own MBR (the app can
+  read 0x0..0xB00) with 2.4.1;
+- a signed app already on the board;
+- the key reachable from two places.
+
 **The risk, stated plainly.** A bug in the new bootloader leaves a board no USB tool can
 reach. Without a probe that is a new dongle. That is acceptable only because the board
 holds nothing yet.

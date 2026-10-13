@@ -387,6 +387,14 @@ button is held at reset. The second run passed the same step, and an untapped am
 while the button was down, and USB going unserviced for up to 30 s while a tap is awaited.
 - **ModemManager** is active on the maintainer's machine and may probe a new CDC-ACM port.
 
+With the board cost and the `chip:` line (2026-10-14), run 4 passed 48 checks with
+Argon2 at 1126 ms. The one failure, "backup refused for one tap", was the operator: they
+double-tapped where the step wants one tap, and confirmed it. Run 3 stopped earlier
+because the tap reached the board too late (the prompts were relayed through chat).
+Both runs tripped on the same trap. The "no code from" steps for a password, an env and
+`auth` light amber with no `>>>` prompt, and they expect a tap: untapped, the key answers
+`Refused` instead of `BadArg`.
+
 ## First steps when it arrives
 
 > Superseded 2026-10-13 by `docs2/roadmap.md`. The board ran over UF2 without a probe,

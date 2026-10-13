@@ -312,6 +312,13 @@ signed image is the unsigned one plus a signature under `firmware/secure-boot/pu
 The partition table sits at 0xC000, because the Secure Boot bootloader does not fit below
 0x8000.
 
+The nRF52840's UF2 bootloader fork is built by the same script from its `bootloader/`
+folder: upstream Adafruit_nRF52_Bootloader at a pinned commit, the board definition read
+back from the factory binary, a patch series, a pinned Arm toolchain, all in Docker.
+`bootloader/check.py` fails the build on any UICR address in the code. Until the fork is
+complete the outputs stay in a temporary directory, and installing it is never part of a
+build (`docs2/roadmap.md`, phase 3).
+
 Compilation is the **only** exception to the check rule. Linters, formatters, tests and
 static analysers are not run without a direct request: git hooks in `.githooks/`
 (`tools/checks.sh`) run them on pre-commit and pre-push. When the maintainer sends the
