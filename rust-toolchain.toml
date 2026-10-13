@@ -5,7 +5,10 @@
 # rustc emits different code, so a floating `stable` would make the image reproducible
 # for nobody. Bumping this line is a deliberate change - it rewrites the image, and the
 # signed images then have to be produced again (tools/sign-vaultkey.sh, PIN and a tap).
+#
+# `llvm-tools` brings the llvm-objcopy that turns an ELF into a raw image for boards
+# whose image is plain flash contents, pinned with the compiler for the same reason.
 [toolchain]
 channel = "1.97.1"
-targets = ["riscv32imac-unknown-none-elf"]
-components = ["rustfmt", "clippy"]
+targets = ["riscv32imac-unknown-none-elf", "thumbv7em-none-eabihf"]
+components = ["rustfmt", "clippy", "llvm-tools"]

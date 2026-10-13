@@ -9,6 +9,13 @@ single-binary host CLI, and a press of the board's button for every secret that 
 > batch, no certification. Read [docs/threat-model.md](docs/threat-model.md) before relying on it,
 > and keep the recovery codes your services give you.
 
+> **Two boards** (2026-10-13). Development now targets the Makerdiary nRF52840 MDK USB Dongle
+> (`firmware/boards/nrf52840-mdk-dongle`), the board passkeys will come to. It runs the same
+> core and passes the full lifecycle test. It has no chip key yet, though, and its bootloader
+> flashes anything and reads the flash back. So it is **not for real secrets** until the steps
+> in [docs2/roadmap.md](docs2/roadmap.md) are done, and `vkey setup` does not flash it yet.
+> Everything below describes the ESP32-C6-Zero, the key in use today.
+
 ## In ten seconds
 
 ```console
@@ -231,6 +238,8 @@ that is not in it exists on neither side. The device has no clock — the host s
 |---|---|
 | [docs/threat-model.md](docs/threat-model.md) | what it protects against and what it does not. **Read first** |
 | [docs/hardware.md](docs/hardware.md) | the C6-Zero board: measured pins, traps, bringing up a new one |
+| [docs2/roadmap.md](docs2/roadmap.md) | the nRF52840 board, from bring-up to daily use |
+| [docs2/makerdiary.md](docs2/makerdiary.md) | the nRF52840 board: why this one, its factory state, what was measured |
 
 ## Security and licence
 

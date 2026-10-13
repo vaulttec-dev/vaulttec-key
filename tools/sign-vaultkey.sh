@@ -2,7 +2,7 @@
 #
 # Sign a board's firmware images for Secure Boot v2 with the key that lives on the vkey.
 #
-#   ./tools/sign-vaultkey.sh                 every board folder
+#   ./tools/sign-vaultkey.sh                 every board whose board.toml has Secure Boot images
 #   BOARD=esp32c6-zero ./tools/sign-vaultkey.sh
 #
 # Reads images/vaultkey.bin and images/bootloader-sb.bin, writes vaultkey.signed.bin
@@ -31,7 +31,13 @@ done
 if [[ -n "${BOARD:-}" ]]; then
     dirs=("$BOARDS/$BOARD")
 else
-    dirs=("$BOARDS"/*/)
+    # Only boards that boot through ESP Secure Boot have anything to sign here: their
+    # board.toml lists an image for a chip with it burned.
+    dirs=()
+    for d in "$BOARDS"/*/; do
+        grep -q '^secure_boot = true' "$d/board.toml" 2>/dev/null && dirs+=("$d")
+    done
+    ((${#dirs[@]})) || { echo "no board with Secure Boot images" >&2; exit 1; }
 fi
 
 tmp="$(mktemp -d /dev/shm/vkey-sign.XXXXXX)"

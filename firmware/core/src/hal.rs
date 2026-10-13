@@ -29,12 +29,12 @@ pub trait Ui {
 }
 
 /// A secret only this chip has, mixed into the key derivation so that a copy of the
-/// flash is worthless without the chip: on ESP32 boards, HMAC-SHA256 under a key burned
-/// into an eFuse block that software can use but never read.
+/// flash is worthless without the chip: HMAC-SHA256 under a key the chip can use but
+/// software never reads, such as one burned into its fuses.
 pub trait DeviceKey {
     /// Whether `mac` really mixes in a chip-only key. Recorded in the vault so that a
     /// firmware with the other answer refuses the vault instead of burning attempts.
-    /// A board answers false until its eFuse key is burned: the PIN alone, and said so.
+    /// A board answers false until it has such a key: the PIN alone, and said so.
     fn bound(&self) -> bool;
     /// HMAC-SHA256 of `msg` under the device key into `out` - or `msg` itself when
     /// not bound. False when the chip should have a key and cannot use it: an error,

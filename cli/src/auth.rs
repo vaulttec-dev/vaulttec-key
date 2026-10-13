@@ -15,9 +15,8 @@
 //! the tap on this board is the whole proof. Anything that goes wrong is a refusal, and
 //! PAM asks for the password as it always did.
 
-use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::fs::{self, DirBuilder};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 use data_encoding::HEXLOWER;
@@ -28,6 +27,7 @@ use crate::device::{
     AUTH_CHALLENGE_LEN, AUTH_SECRET_LEN, AUTH_SIGNATURE_LEN, AUTH_SIGNED_PREFIX, Category, Class,
     Device, Error, FieldKind,
 };
+use crate::file;
 use crate::item::{Item, OwnedField};
 use crate::prompt::with_unlock;
 
@@ -94,7 +94,7 @@ impl Enrolled {
             .mode(0o755)
             .create(KEY_DIR)?;
         let text = format!("{}\n{}\n", self.name, HEXLOWER.encode(self.key.as_bytes()));
-        replace_file(&Self::path(user), text.as_bytes(), 0o644)
+        file::replace(&Self::path(user), text.as_bytes(), 0o644)
     }
 }
 
@@ -130,6 +130,15 @@ pub fn enable(dev: &mut Device) -> Result<u8, Error> {
     let user = sudo_user()?;
     let name = format!("{user}@{}", hostname()?);
     crate::device::name(&name)?;
+    // The login secret is sealed under the chip key alone. A board without one refuses
+    // it as `Incompatible`, which reads as "wipe it" - asked first, before anything on
+    // this host is written.
+    if !dev.pin_status()?.chip_bound {
+        return Err(Error::Value(
+            "this key has no chip key, so it cannot hold a login secret; nothing was enabled"
+                .into(),
+        ));
+    }
 
     install_self()?;
 
@@ -250,7 +259,7 @@ fn add_line(path: &Path) -> Result<bool, Error> {
         if !Path::new(&before).exists() {
             fs::copy(path, &before)?;
         }
-        replace_file(path, out.as_bytes(), 0o644)?;
+        file::replace(path, out.as_bytes(), 0o644)?;
     }
     Ok(true)
 }
@@ -265,7 +274,7 @@ fn remove_line(path: &Path) -> Result<(), Error> {
         out.push_str(line);
         out.push('\n');
     }
-    replace_file(path, out.as_bytes(), 0o644)
+    file::replace(path, out.as_bytes(), 0o644)
 }
 
 /// This binary copied to where PAM runs it, unless it already is that copy.
@@ -274,27 +283,7 @@ fn install_self() -> Result<(), Error> {
     if fs::canonicalize(&me)? == Path::new(INSTALLED) {
         return Ok(());
     }
-    replace_file(Path::new(INSTALLED), &fs::read(&me)?, 0o755)
-}
-
-/// `path` replaced whole: written beside it and renamed over it, so a crash leaves the
-/// old file or the new one - for a PAM file, never half of `sudo`'s configuration.
-/// The source map in `sources.rs` is written the same way, for the same reason.
-pub(crate) fn replace_file(path: &Path, contents: &[u8], mode: u32) -> Result<(), Error> {
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".vkey-new");
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(mode)
-        .open(&tmp)?;
-    f.write_all(contents)?;
-    f.sync_all()?;
-    // The mode given at creation is narrowed by the umask; this is the mode meant.
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
-    fs::rename(&tmp, path)?;
-    Ok(())
+    file::replace(Path::new(INSTALLED), &fs::read(&me)?, 0o755)
 }
 
 /// The user who ran sudo: the one whose logins the key will answer.

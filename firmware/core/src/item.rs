@@ -10,7 +10,7 @@
 //! class guards the next read, not this write.
 //!
 //! An item is never a struct in RAM: at 32 fields of 4 KiB a struct would be 128 KiB,
-//! and the chip has 512 KiB for everything. It lives packed in a buffer, and [`Item`]
+//! and a board has a few hundred KiB of RAM for everything. It lives packed in a buffer, and [`Item`]
 //! is a view over those bytes - parsed once, at the edge, and trusted afterwards, the
 //! way `Name` and `Entry` already are.
 

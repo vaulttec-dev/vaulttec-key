@@ -82,7 +82,11 @@ pub fn run(d: &mut Device) -> Result<u8, Error> {
         failures: 0,
         button: boards::button(Some(&version)),
     };
-    println!("device: {version}\n");
+    println!("device: {version}");
+    for line in d.chip_report()? {
+        println!("chip:   {line}");
+    }
+    println!();
 
     clean_start(d, &mut rep)?;
     println!("\n=== no PIN yet ===");
@@ -199,7 +203,7 @@ fn provisioning(d: &mut Device, rep: &mut Report) -> Result<(), Error> {
     d.pin_unlock(pin(PIN)?)?;
     let took = started.elapsed();
     rep.check(
-        "key derivation under 2 s (1.2 s of Argon2 plus the round trip)",
+        "key derivation under 2 s (the board's ~1 s of Argon2 plus the round trip)",
         took.as_millis() < 2000,
         &format!("{} ms", took.as_millis()),
     );

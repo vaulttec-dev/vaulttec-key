@@ -1,0 +1,12 @@
+# Advisories cargo audit skips for cli/Cargo.lock. Every entry says why it cannot reach
+# vkey and when it goes; docs/threat-model.md lists the same ones.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0344, ruzstd 0.8 <- object 0.39 <- espflash 4.x: a malformed zstd
+    # section in an ELF. vkey never parses an ELF - it hands espflash finished images
+    # through Connection, Flasher and Segment - so the decoder is linked but never fed.
+    # Goes when `cargo tree -i ruzstd` shows 0.9.1 or later, or when espflash leaves
+    # the CLI (docs2/roadmap.md, phase 5).
+    "RUSTSEC-2026-0344",
+]

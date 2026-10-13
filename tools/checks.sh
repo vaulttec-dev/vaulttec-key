@@ -67,11 +67,20 @@ check_scripts() {
 }
 
 check_lint_tables() {
-    step "the [lints] tables of firmware/ and cli/ are identical"
-    local a b
+    step "the [lints] tables of firmware/, cli/ and every board with its own are identical"
+    local a b d
     a=$(sed -n '/^\[workspace\.lints\.rust\]/,$p' "$ROOT/firmware/Cargo.toml" | sed 's/^\[workspace\.lints\./[lints./')
     b=$(sed -n '/^\[lints\.rust\]/,$p' "$ROOT/cli/Cargo.toml")
     diff <(echo "$a") <(echo "$b") || fail "the [lints] tables differ - one strictness for both crates"
+    # A board whose flash driver needs memory-mapped flash as a slice carries its own
+    # copy, identical but for `unsafe_code = "deny"`, so that one place can say why
+    # with #[expect]. Nothing else may differ.
+    for d in $(boards); do
+        grep -q '^\[lints\.rust\]' "$d/Cargo.toml" || continue
+        b=$(sed -n '/^\[lints\.rust\]/,$p' "$d/Cargo.toml")
+        diff <(echo "${a//unsafe_code = \"forbid\"/unsafe_code = \"deny\"}") <(echo "$b") \
+            || fail "$(basename "$d"): its [lints] table differs from the workspace's in more than unsafe_code"
+    done
 }
 
 check_no_radio() {

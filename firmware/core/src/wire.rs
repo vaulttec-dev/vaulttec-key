@@ -72,6 +72,8 @@ const _: () = assert!(
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum Cmd {
+    /// Text, no PIN: the version line, which ends with the board's folder name, then
+    /// whatever lines the board adds about its own chip.
     Info = 0x01,
     /// A whole item in; the PIN is enough - nothing comes out.
     ItemPut = 0x10,

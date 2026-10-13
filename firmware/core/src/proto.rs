@@ -1,6 +1,6 @@
-//! Host protocol over whatever byte stream the board provides (on the C6-Zero: the
-//! built-in USB-Serial/JTAG port). The byte layout is in [`crate::wire`], which the
-//! host CLI compiles too.
+//! Host protocol over whatever byte stream the board provides (a USB serial port on
+//! every board so far). The byte layout is in [`crate::wire`], which the host CLI
+//! compiles too.
 //!
 //! The port may also carry log output, so frames start with a magic word the host
 //! scans for. Log lines are plain ASCII and never contain it. USB already guarantees
@@ -43,7 +43,8 @@ pub struct Proto<P: Port, C: Clock> {
 }
 
 impl<P: Port, C: Clock> Proto<P, C> {
-    /// `version` is what INFO answers - build it with `vaultkey_core::version!`.
+    /// `version` is what INFO answers. Its first line is `vaultkey_core::version!`; a
+    /// board may add lines about its chip after it.
     pub fn new(port: P, clock: C, version: &'static str) -> Self {
         Proto {
             port,

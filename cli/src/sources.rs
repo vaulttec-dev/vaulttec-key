@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::auth::replace_file;
 use crate::device::{Category, Device, Error, Reach, Stored};
+use crate::file;
 use crate::import::Summary;
 use crate::prompt::SyncUi;
 
@@ -78,7 +78,7 @@ impl Manifest {
         }
         let json = serde_json::to_vec_pretty(self)
             .map_err(|e| Error::Value(format!("cannot write the source map: {e}")))?;
-        replace_file(&path, &json, 0o600)
+        file::replace(&path, &json, 0o600)
     }
 
     /// This name now belongs to this bucket. The last sync to write a name owns it.

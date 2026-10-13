@@ -1,7 +1,7 @@
 //! Persistent state in raw flash, power-cut safe, no filesystem.
 //!
-//! The board says where (a [`Layout`]: three regions the bootloader will never touch);
-//! this module says how:
+//! The board says where and how big (a [`Layout`]: three regions the bootloader will
+//! never touch); this module says how:
 //!
 //!   attempts   one word per failed PIN, cleared 1->0 without an erase
 //!   state A  \ salt, KDF cost, verifier and every item, packed, as ONE image,
@@ -29,6 +29,10 @@
 //! does read-erase-rewrite of the sector would turn the attempt counter's "one word,
 //! no erase" into "erase first" - and a power cut between that erase and the write
 //! would hand every attempt back.
+//!
+//! Every word is written once between erases. Some flash controllers allow a word two
+//! writes before an erase and promise nothing after that, so the test flash refuses a
+//! third.
 
 use crc::{CRC_32_ISO_HDLC, Crc};
 use embedded_storage::nor_flash::NorFlash;
@@ -39,10 +43,8 @@ use crate::vault::{Cost, KEY_LEN, SALT_LEN};
 
 pub const MAX_ENTRIES: usize = 256;
 pub const MAX_ATTEMPTS: u8 = 8;
-/// Every region below is this many bytes; flash erases in these units.
+/// Every region below is a whole number of these; flash erases in these units.
 pub const SECTOR: u32 = 4096;
-/// One image copy. Two of these and the attempt counter are the whole store.
-pub const STATE_SECTORS: u32 = 53;
 /// A sealed item with room for the AEAD overhead: what the board's buffer holds.
 pub const ITEM_BUF_LEN: usize = (crate::wire::BACKUP_ITEM_MAX + 3) & !3;
 const _: () = assert!(
@@ -50,13 +52,61 @@ const _: () = assert!(
     "item bodies are written in words and hold the longest backup item"
 );
 
-/// Where the three regions live. Each must start on a sector boundary; `state_a` and
-/// `state_b` are `STATE_SECTORS` long, `attempts` one sector.
+/// Where the three regions live and how big an image copy is: `attempts` is one
+/// sector, `state_a` and `state_b` are `state_sectors` each. How much flash a board can
+/// spare differs, so the board says; [`Layout::fits`] says whether what it said works.
 #[derive(Clone, Copy, Debug)]
 pub struct Layout {
     pub attempts: u32,
     pub state_a: u32,
     pub state_b: u32,
+    pub state_sectors: u32,
+}
+
+impl Layout {
+    /// Whether every region starts on a sector, none overlaps another, and one copy
+    /// holds the largest item. A board asserts it at compile time; `Store::new` checks
+    /// it again, so a layout that does not fit never reaches the flash.
+    #[must_use]
+    pub const fn fits(&self) -> bool {
+        const fn apart(a: u32, a_end: u32, b: u32, b_end: u32) -> bool {
+            a_end <= b || b_end <= a
+        }
+        let Some(copy) = self.state_sectors.checked_mul(SECTOR) else {
+            return false;
+        };
+        let (Some(a_end), Some(b_end)) = (
+            self.state_a.checked_add(copy),
+            self.state_b.checked_add(copy),
+        ) else {
+            return false;
+        };
+        let Some(attempts_end) = self.attempts.checked_add(SECTOR) else {
+            return false;
+        };
+        self.attempts.is_multiple_of(SECTOR)
+            && self.state_a.is_multiple_of(SECTOR)
+            && self.state_b.is_multiple_of(SECTOR)
+            && Image::HEAD + Image::item_len(NAME_MAX, ITEM_BUF_LEN) + 4 <= copy as usize
+            && apart(self.state_a, a_end, self.state_b, b_end)
+            && apart(self.attempts, attempts_end, self.state_a, a_end)
+            && apart(self.attempts, attempts_end, self.state_b, b_end)
+    }
+
+    /// Bytes in one copy. A `u32` because `fits` proved the product is one.
+    const fn capacity(&self) -> u32 {
+        self.state_sectors * SECTOR
+    }
+
+    /// Sectors that hold `bytes`, never more than a copy has.
+    const fn sectors_of(&self, bytes: u32) -> u32 {
+        let n = bytes.div_ceil(SECTOR);
+        if n < self.state_sectors {
+            n
+        } else {
+            self.state_sectors
+        }
+    }
 }
 
 const CRC: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
@@ -215,16 +265,22 @@ impl Index {
         self.slots[..self.count].iter()
     }
 
-    /// Whether one more item of this size would fit, counting the item it replaces -
-    /// `replacing` - as room that comes back.
+    /// Whether one more item of this size would fit a copy of `capacity` bytes,
+    /// counting the item it replaces - `replacing` - as room that comes back.
     #[must_use]
-    pub fn room_for(&self, name: Name<'_>, sealed_len: usize, replacing: Option<usize>) -> bool {
+    pub fn room_for(
+        &self,
+        name: Name<'_>,
+        sealed_len: usize,
+        replacing: Option<usize>,
+        capacity: usize,
+    ) -> bool {
         let freed = replacing.and_then(|i| self.get(i)).map_or(0, Slot::packed);
         if replacing.is_none() && self.count >= MAX_ENTRIES {
             return false;
         }
         let want = Image::item_len(name.as_bytes().len(), sealed_len);
-        self.bytes_used() + want - freed + 4 <= (SECTOR * STATE_SECTORS) as usize
+        self.bytes_used() + want - freed + 4 <= capacity
     }
 
     /// The image's length as the slots describe it, CRC excluded.
@@ -295,21 +351,16 @@ const _: () = assert!(
     "images are written in whole words, one piece at a time"
 );
 const _: () = assert!(
-    Image::HEAD + Image::item_len(NAME_MAX, ITEM_BUF_LEN) + 4 <= (SECTOR * STATE_SECTORS) as usize,
-    "one item of the largest size must fit an image"
-);
-const _: () = assert!(
     ITEM_BUF_LEN <= u16::MAX as usize,
     "an item's length is a u16 in the image"
 );
 
 /// An offset within a region, as a flash address needs it.
 fn off32(off: usize) -> u32 {
-    const _: () = assert!(
-        (SECTOR * STATE_SECTORS) as usize <= u32::MAX as usize,
-        "every offset into a region is cast to a flash address"
-    );
-    #[expect(clippy::cast_possible_truncation, reason = "asserted above")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "offsets stay inside a copy, and Layout::fits keeps a copy's size a u32"
+    )]
     {
         off as u32
     }
@@ -321,11 +372,6 @@ type Newest = (u32, u32, u32);
 /// A flash address `off` bytes into a region.
 fn at(base: u32, off: usize) -> u32 {
     base + off32(off)
-}
-
-/// Sectors that hold `bytes`, never more than a copy has.
-fn sectors_of(bytes: u32) -> u32 {
-    bytes.div_ceil(SECTOR).min(STATE_SECTORS)
 }
 
 pub struct Store<F: NorFlash> {
@@ -369,18 +415,22 @@ impl<F: NorFlash> Store<F> {
             4_usize.is_multiple_of(F::WRITE_SIZE) && 4_usize.is_multiple_of(F::READ_SIZE),
             "store reads and writes in 4-byte words"
         );
-        for region in [at.attempts, at.state_a, at.state_b] {
-            assert!(
-                region.is_multiple_of(SECTOR),
-                "regions start on sector boundaries"
-            );
-        }
+        assert!(
+            at.fits(),
+            "regions on sector boundaries, apart, each copy big enough"
+        );
         Store {
             flash,
             at,
             current: None,
             saving: None,
         }
+    }
+
+    /// Bytes one image copy holds: what [`Index::room_for`] measures against.
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        self.at.capacity() as usize
     }
 
     fn read(&mut self, addr: u32, buf: &mut [u8]) -> Result<(), Error<F::Error>> {
@@ -429,7 +479,7 @@ impl<F: NorFlash> Store<F> {
         }
         let seq = u32::from_le_bytes(word(&head[4..8]));
         let used = u32::from_le_bytes(word(&head[8..12]));
-        if (used as usize) < Image::HEAD + 4 || used > SECTOR * STATE_SECTORS {
+        if (used as usize) < Image::HEAD + 4 || used > self.at.capacity() {
             return Err(Error::Corrupt);
         }
         Ok(Some((seq, used)))
@@ -612,9 +662,9 @@ impl<F: NorFlash> Store<F> {
         // even if the new image is shorter, so no tail of the old one stays readable.
         // Unreadable contents mean erasing the copy whole - it is not ours to trust.
         let stale = match self.image_head(target) {
-            Ok(Some((_, used))) => sectors_of(used),
+            Ok(Some((_, used))) => self.at.sectors_of(used),
             Ok(None) => 0,
-            Err(_) => STATE_SECTORS,
+            Err(_) => self.at.state_sectors,
         };
         let source = current.map(|(_, addr)| addr);
         self.current = None; // nothing is newest until this write is whole
@@ -662,10 +712,10 @@ impl<F: NorFlash> Store<F> {
     fn room(&mut self, bytes: usize) -> Result<(), Error<F::Error>> {
         let s = self.saving.as_ref().ok_or(Error::Corrupt)?;
         let (mut erased, target, end) = (s.erased, s.target, s.at + bytes + 4);
-        if end > (SECTOR * STATE_SECTORS) as usize {
+        if end > self.capacity() {
             return Err(Error::Full);
         }
-        let want = sectors_of(off32(end));
+        let want = self.at.sectors_of(off32(end));
         while erased < want {
             self.erase(target + erased * SECTOR, 1)?;
             erased += 1;
@@ -771,7 +821,7 @@ impl<F: NorFlash> Store<F> {
         chunk.zeroize();
         self.write(at(target, body_end), &digest.finalize().to_le_bytes())?;
 
-        let full = sectors_of(used);
+        let full = self.at.sectors_of(used);
         if stale > full {
             self.erase(target + full * SECTOR, stale - full)?;
         }
@@ -816,8 +866,8 @@ impl<F: NorFlash> Store<F> {
         self.current = None;
         let mut first = Ok(());
         for (from, sectors) in [
-            (self.at.state_a, STATE_SECTORS),
-            (self.at.state_b, STATE_SECTORS),
+            (self.at.state_a, self.at.state_sectors),
+            (self.at.state_b, self.at.state_sectors),
             (self.at.attempts, 1),
         ] {
             if let Err(e) = self.erase(from, sectors) {

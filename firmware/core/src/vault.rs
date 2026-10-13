@@ -28,11 +28,13 @@ pub const SALT_LEN: usize = 16;
 pub const NONCE_LEN: usize = 12;
 pub const TAG_LEN: usize = 16;
 pub const OVERHEAD: usize = NONCE_LEN + TAG_LEN;
-/// Eight digits, no fewer and no more. Whoever holds the board erases the attempt
-/// counter through ROM download mode and guesses through the real firmware at about
-/// 1.3 s a try: six digits fall in a fortnight, seven in five months, eight in four
-/// years. No key derivation rescues a shorter PIN - a second per unlock is already as
-/// slow as the device may be, so length is the only lever left.
+/// Eight digits, no fewer and no more. Whoever holds a board with a chip key can still
+/// erase the attempt counter - every board so far can be rewritten by whoever holds it -
+/// and guess through the real firmware. At the 1.3 s a try measured on the first board,
+/// six digits fall in a fortnight, seven in five months, eight in four years. No key
+/// derivation rescues a shorter PIN - a second per unlock is already as slow as the
+/// device may be, so length is the only lever left. Without a chip key a copy of the
+/// flash is guessed offline instead, and no length rescues that (docs/threat-model.md).
 pub const PIN_LEN: usize = 8;
 /// A backup file has no attempt counter: whoever holds it guesses forever, at the speed
 /// of their own hardware, and 128 KiB of Argon2id is not much of a brake. Twelve is a
@@ -50,15 +52,18 @@ pub const ENV_KEY_AAD: &[u8] = b"vaultkey/env-key/v1";
 /// moved, repeated or dropped from the middle fails to open on the way back in.
 pub const BACKUP_AAD: &[u8] = b"vaultkey/backup/v1";
 
-/// Argon2id cost: memory in KiB and passes over it. Stored per vault, so it can be
-/// raised later without breaking existing ones.
+/// Argon2id cost: memory in KiB and passes over it. Stored per vault and per backup, so
+/// a board can change its own without breaking either.
 ///
-/// The memory is what the board can spare beside an 80 KiB vault and a 300 KiB stack,
-/// not what a passphrase would like: 128 KiB fits in the cache of any desktop core, so
-/// it costs an attacker time, not the memory bandwidth Argon2 is meant to cost them.
-/// Against the PIN that changes nothing - eight digits behind the attempt counter and
-/// the eFuse key is what protects it. Against a stolen `.vkb` it is the whole defence,
-/// which is why the passphrase must carry the entropy itself.
+/// The board decides what a new vault and a new backup get - as many passes as fit in
+/// about a second on its core - and hands it to `Device::new`.
+///
+/// The memory is what a small board can spare, not what a passphrase would like: 128 KiB
+/// fits in the cache of any desktop core, so it costs an attacker time, not the memory
+/// bandwidth Argon2 is meant to cost them. Against the PIN that changes nothing where a
+/// chip key is mixed in; without one, a copy of the flash is guessed at the speed of
+/// this cost alone. Against a stolen `.vkb` it is the whole defence, which is why the
+/// passphrase must carry the entropy itself.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Cost {
     pub m_kib: u32,
@@ -66,9 +71,6 @@ pub struct Cost {
 }
 
 impl Cost {
-    /// What a new vault gets: all the memory the board offers, and as many passes as
-    /// fit in about a second on the ESP32-C6 - 48 passes measured at 1.2 s there.
-    pub const CURRENT: Cost = Cost { m_kib: 128, t: 48 };
     /// The most this firmware will run whatever flash says: a tampered header must not
     /// be able to park the key for hours.
     pub const MAX: Cost = Cost { m_kib: 128, t: 256 };

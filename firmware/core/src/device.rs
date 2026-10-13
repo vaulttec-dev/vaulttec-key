@@ -90,6 +90,9 @@ pub struct Device<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: D
     key: K,
     /// The Argon2 working memory, owned by the board for the life of the program.
     mem: &'m mut [Block],
+    /// What a new vault and a new backup are derived at: the board's measure of about a
+    /// second. An existing vault opens at the cost its header records.
+    cost: Cost,
     /// Where every item is, as last read from flash. The bodies stay in flash; this is
     /// ~10 KiB and the board owns it. Every operation reloads it before looking at it.
     index: &'m mut Index,
@@ -132,9 +135,14 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         clock: C,
         key: K,
         mem: &'m mut [Block],
+        cost: Cost,
         index: &'m mut Index,
         buf: &'m mut [u8; BUF_LEN],
     ) -> Self {
+        assert!(
+            mem.len() >= cost.m_kib as usize,
+            "the Argon2 memory holds the board's own cost"
+        );
         let now = clock.now_ms();
         Device {
             store,
@@ -143,6 +151,7 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
             clock,
             key,
             mem,
+            cost,
             index,
             buf,
             dek: None,
@@ -229,10 +238,10 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
     fn install_pin(&mut self, pin: Pin<'_>) -> Result<Header, Fail> {
         let mut salt = [0u8; SALT_LEN];
         self.rng.fill_bytes(&mut salt);
-        let keys = self.derive(pin, &salt, Cost::CURRENT)?;
+        let keys = self.derive(pin, &salt, self.cost)?;
         let header = Header {
             salt,
-            cost: Cost::CURRENT,
+            cost: self.cost,
             bound: self.key.bound(),
             verifier: vault::verifier_of(&keys.kek),
         };
@@ -429,7 +438,11 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         if at.is_some() && !replace {
             return Err(Fail::Exists);
         }
-        if !self.index.room_for(name, plain.len() + vault::OVERHEAD, at) {
+        let capacity = self.store.capacity();
+        if !self
+            .index
+            .room_for(name, plain.len() + vault::OVERHEAD, at, capacity)
+        {
             return Err(Fail::Full);
         }
         let key = self.item_key(&dek, category.wire())?;
@@ -784,7 +797,7 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         }
         let mut salt = [0u8; SALT_LEN];
         self.rng.fill_bytes(&mut salt);
-        let cost = Cost::CURRENT;
+        let cost = self.cost;
         let key = vault::backup_key(pass, &salt, cost, self.mem).ok_or(Fail::Internal)?;
         self.backup = Some(Session::Export {
             key,

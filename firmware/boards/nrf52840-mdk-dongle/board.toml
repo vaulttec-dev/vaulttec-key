@@ -1,0 +1,29 @@
+# One board = one folder. This file is the board's identity for everything outside the
+# firmware: the CLI reads it at build time and embeds the images listed here, and
+# tools/build-vaultkey.sh reads `chip`, `target` and `image_tool` to build.
+
+name = "nrf52840-mdk-dongle"
+chip = "nrf52840"
+target = "thumbv7em-none-eabihf"   # rustup target the firmware is built for
+# How the ELF becomes images/vaultkey.bin: a raw image of the flash from 0x1000, which
+# is what an SWD probe writes and what the bootloader's update package wraps.
+image_tool = "objcopy"
+
+# How the CLI recognises the board on the USB bus: pid.codes' test pair, for a key
+# nobody else gets. src/main.rs announces the same pair.
+usb_vid = 0x1209
+usb_pid = 0x0001
+
+# What is printed on the button the user is asked to press.
+button = "USER"
+
+# The radio peripheral's 4 KiB slot. Its driver ships inside the HAL crate, so the lock
+# file cannot show it is absent. tools/build-vaultkey.sh fails if anything in the image
+# reaches this address.
+radio_base = 0x40001000
+
+# Flashed through the factory UF2 bootloader for now (docs2/makerdiary.md). `vkey setup`
+# talks only to the ESP ROM loader, so it never picks this board.
+[[image]]
+offset = 0x1000
+file = "images/vaultkey.bin"

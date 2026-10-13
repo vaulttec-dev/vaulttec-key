@@ -12,8 +12,8 @@ use std::time::Instant;
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
-use crate::auth::replace_file;
 use crate::device::{Category, Class, Device, EnvBlob, Error, FieldKind, Reach};
+use crate::file;
 use crate::import::{Summary, entry_name, truncate, unique_name};
 use crate::item::{Item, OwnedField, class_of, field_kind_name, field_kind_of, op_category};
 use crate::prompt::SyncUi;
@@ -421,7 +421,7 @@ pub fn save_saved_env(name: &str, id: &str) {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(json) = serde_json::to_vec_pretty(&map) {
-        let _ = replace_file(&path, &json, 0o600);
+        let _ = file::replace(&path, &json, 0o600);
     }
 }
 

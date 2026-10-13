@@ -25,6 +25,7 @@ mod backup;
 mod boards;
 mod check;
 mod device;
+mod file;
 mod import;
 mod install;
 mod item;
@@ -446,6 +447,9 @@ fn run_info(dev: &mut Device, version: &str) -> Result<u8, Error> {
     let st = dev.pin_status()?;
     println!("port:    {}", dev.path);
     println!("device:  {version}");
+    for line in dev.chip_report()? {
+        println!("chip:    {line}");
+    }
     println!(
         "pin:     {}, {}, {} attempts left",
         if st.has_pin { "set" } else { "NOT SET" },

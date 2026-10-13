@@ -121,6 +121,9 @@ impl PartialEq<Code> for String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     NoBoard,
+    /// More than one key answers to a known USB identity: picking one would be a guess,
+    /// and a PIN or a wipe sent to the wrong key is not undone.
+    ManyBoards(Vec<String>),
     Permission(String),
     /// Another program holds the port exclusively.
     Busy(String),
@@ -148,6 +151,11 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::NoBoard => write!(f, "no board found - is it plugged in?"),
+            Error::ManyBoards(ports) => write!(
+                f,
+                "more than one key is plugged in ({}) - unplug the others or name one with --port",
+                ports.join(", ")
+            ),
             Error::Permission(p) => write!(
                 f,
                 "cannot open {p}: no permission.\n  sudo usermod -aG dialout $USER    # then log out and back in"
@@ -265,30 +273,35 @@ pub struct Stored {
     pub category: Category,
 }
 
-/// The board's serial port, or None. Never hardcoded: the number changes after a reset.
+/// The board's serial port. Never hardcoded: the number changes after a reset.
 /// Matching on the USB identity each board folder declares, rather than "first
 /// ttyACM", keeps a second serial gadget - a Pico, a modem - from being mistaken for
-/// the key.
-pub fn find_port() -> Option<String> {
-    if let Ok(ports) = serialport::available_ports() {
-        for p in &ports {
-            if let SerialPortType::UsbPort(u) = &p.port_type
-                && crate::boards::BOARDS
+/// the key. Two matches are an error, not a pick: the other one may be a key holding
+/// secrets, and `check` wipes whatever it reaches.
+pub fn find_port() -> Result<String, Error> {
+    let mut found: Vec<String> = serialport::available_ports()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| {
+            matches!(&p.port_type, SerialPortType::UsbPort(u)
+                if crate::boards::BOARDS
                     .iter()
-                    .any(|b| b.usb_vid == u.vid && b.usb_pid == u.pid)
-            {
-                return Some(p.port_name.clone());
-            }
-        }
+                    .any(|b| b.usb_vid == u.vid && b.usb_pid == u.pid))
+        })
+        .map(|p| p.port_name)
+        .collect();
+    match found.len() {
+        0 => Err(Error::NoBoard),
+        1 => Ok(found.remove(0)),
+        _ => Err(Error::ManyBoards(found)),
     }
-    None
 }
 
 /// `path` as given, or the board's port by USB identity.
 pub fn port_or_find(path: Option<&str>) -> Result<String, Error> {
     match path {
         Some(p) => Ok(p.to_string()),
-        None => find_port().ok_or(Error::NoBoard),
+        None => find_port(),
     }
 }
 
@@ -525,7 +538,19 @@ impl Device {
         Ok(b[0])
     }
 
+    /// INFO's first line: the version, ending with the board's folder name.
     pub fn info(&mut self) -> Result<String, Error> {
+        let text = self.info_text()?;
+        Ok(text.lines().next().unwrap_or_default().to_string())
+    }
+
+    /// INFO's further lines: what the board says about its own chip, if anything.
+    pub fn chip_report(&mut self) -> Result<Vec<String>, Error> {
+        let text = self.info_text()?;
+        Ok(text.lines().skip(1).map(str::to_string).collect())
+    }
+
+    fn info_text(&mut self) -> Result<String, Error> {
         Ok(String::from_utf8_lossy(&self.request(Cmd::Info, &[])?).into_owned())
     }
 

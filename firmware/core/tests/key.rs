@@ -29,17 +29,29 @@ use vaultkey_core::wire::{
 
 // --- the hardware, faked -------------------------------------------------------------
 
+/// Few passes: these tests are about what the key does, not how long it takes, and a
+/// board's own cost is its measure, not theirs.
+const COST: Cost = Cost::from_wire(128, 2).expect("a cost Argon2 runs");
+
 const LAYOUT: Layout = Layout {
     attempts: 0x0000,
     state_a: 0x1000,
     state_b: 0x36000,
+    state_sectors: 53,
 };
+const _: () = assert!(LAYOUT.fits(), "the test layout is one a board could use");
 const FLASH_BYTES: usize = 0x6B000;
+/// How many times a word may be written between erases: the strictest flash
+/// controller a board has. A third write is a fault here, so it cannot pass on the
+/// host and corrupt a word on the chip.
+const WRITES_PER_WORD: u8 = 2;
 
-/// A flash chip with NOR semantics: erase sets 0xFF, a write can only clear bits.
-/// Shared by reference so a "power cycle" is just a second `Device` on the same chip.
+/// A flash chip with NOR semantics: erase sets 0xFF, a write can only clear bits, and a
+/// word takes `WRITES_PER_WORD` writes between erases. The bytes, then the writes each
+/// word has taken since its last erase. Shared by reference so a "power cycle" is just a
+/// second `Device` on the same chip.
 #[derive(Clone)]
-struct MemFlash(Rc<RefCell<Vec<u8>>>);
+struct MemFlash(Rc<RefCell<Vec<u8>>>, Rc<RefCell<Vec<u8>>>);
 
 #[derive(Debug)]
 struct Fault;
@@ -83,12 +95,21 @@ impl NorFlash for MemFlash {
 
     fn erase(&mut self, from: u32, to: u32) -> Result<(), Fault> {
         self.0.borrow_mut()[at(from)..at(to)].fill(0xFF);
+        self.1.borrow_mut()[at(from) / 4..at(to) / 4].fill(0);
         Ok(())
     }
 
     fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Fault> {
         if !offset.is_multiple_of(4) || !bytes.len().is_multiple_of(4) {
             return Err(Fault);
+        }
+        let words = at(offset) / 4..(at(offset) + bytes.len()) / 4;
+        let mut writes = self.1.borrow_mut();
+        if writes[words.clone()].iter().any(|w| *w >= WRITES_PER_WORD) {
+            return Err(Fault);
+        }
+        for w in &mut writes[words] {
+            *w += 1;
         }
         let mut chip = self.0.borrow_mut();
         for (cell, b) in chip[at(offset)..].iter_mut().zip(bytes) {
@@ -100,7 +121,10 @@ impl NorFlash for MemFlash {
 
 impl MemFlash {
     fn blank() -> Self {
-        MemFlash(Rc::new(RefCell::new(vec![0xFF; FLASH_BYTES])))
+        MemFlash(
+            Rc::new(RefCell::new(vec![0xFF; FLASH_BYTES])),
+            Rc::new(RefCell::new(vec![0; FLASH_BYTES / 4])),
+        )
     }
 
     fn word(&self, offset: u32) -> u32 {
@@ -179,6 +203,7 @@ impl MemFlash {
             clock,
             key,
             mem,
+            COST,
             index,
             buf,
         )
@@ -561,10 +586,9 @@ fn the_chip_key_changes_every_derived_key() {
     let mem = &mut vec![Block::new(); KDF_BLOCKS];
     let salt = [1u8; vault::SALT_LEN];
 
-    let a = vault::derive(pin("12345678"), &salt, Cost::CURRENT, &mut plain, mem)
+    let a = vault::derive(pin("12345678"), &salt, COST, &mut plain, mem)
         .expect("derives without a chip key");
-    let b = vault::derive(pin("12345678"), &salt, Cost::CURRENT, &mut chip, mem)
-        .expect("derives with one");
+    let b = vault::derive(pin("12345678"), &salt, COST, &mut chip, mem).expect("derives with one");
     assert_ne!(a.dek, b.dek, "the same PIN and salt, a different data key");
     assert_ne!(a.kek, b.kek, "and a different verifier key");
     assert!(
@@ -573,14 +597,7 @@ fn the_chip_key_changes_every_derived_key() {
     );
     let mut short = vec![Block::new(); 8];
     assert!(
-        vault::derive(
-            pin("12345678"),
-            &salt,
-            Cost::CURRENT,
-            &mut plain,
-            &mut short
-        )
-        .is_none(),
+        vault::derive(pin("12345678"), &salt, COST, &mut plain, &mut short).is_none(),
         "too little memory is an error, not a cheaper derivation"
     );
 }

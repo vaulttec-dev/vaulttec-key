@@ -1,0 +1,3 @@
+# Build from inside this folder so this file applies: `cargo build --release`.
+[build]
+target = "thumbv7em-none-eabihf"

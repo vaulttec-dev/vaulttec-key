@@ -29,7 +29,7 @@ use vaultkey_core::hal::{Clock, DeviceKey, Port, Ui};
 use vaultkey_core::proto::Proto;
 use vaultkey_core::store::{self, Layout, Store};
 use vaultkey_core::ui::State;
-use vaultkey_core::vault::{Block, KDF_BLOCKS};
+use vaultkey_core::vault::{Block, Cost, KDF_BLOCKS};
 
 // The ESP-IDF second-stage bootloader wants an application descriptor in the image.
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -44,12 +44,20 @@ const LAYOUT: Layout = Layout {
     attempts: 0x11_0000,
     state_a: 0x11_1000,
     state_b: 0x14_6000,
+    state_sectors: 53,
 };
 const _: () = assert!(
-    LAYOUT.state_b - LAYOUT.state_a == store::SECTOR * store::STATE_SECTORS
-        && LAYOUT.state_b + store::SECTOR * store::STATE_SECTORS == 0x17_B000,
+    LAYOUT.fits()
+        && LAYOUT.state_b - LAYOUT.state_a == store::SECTOR * LAYOUT.state_sectors
+        && LAYOUT.state_b + store::SECTOR * LAYOUT.state_sectors == 0x17_B000,
     "the two copies fill the region exactly, and neither runs past its end"
 );
+
+/// Argon2 over all 128 KiB, with as many passes as fit in about a second on this core:
+/// 48 passes measured at 1.2 s. The vault on this board was derived at it, and its
+/// header says so.
+const KDF_COST: Cost =
+    Cost::from_wire(128, 48).expect("128 KiB and 48 passes is a cost Argon2 runs");
 
 /// Argon2 working memory, in RAM for the life of the program: the key derivation has
 /// no allocator, and 128 KiB does not belong on the stack.
@@ -189,6 +197,7 @@ fn main() -> ! {
         Uptime,
         ChipKey::detect(p.HMAC),
         KDF_MEM.take(),
+        KDF_COST,
         VAULT.init_with(store::Index::empty),
         BUF.take(),
     );

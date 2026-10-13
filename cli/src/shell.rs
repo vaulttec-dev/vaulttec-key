@@ -930,7 +930,7 @@ impl Shell {
     /// whatever port it has now.
     fn reconnect(&mut self) -> bool {
         self.dev = None;
-        let Some(port) = find_port() else {
+        let Ok(port) = find_port() else {
             return false;
         };
         let Ok(mut d) = Device::open(Some(&port)) else {

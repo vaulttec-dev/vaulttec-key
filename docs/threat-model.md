@@ -5,8 +5,50 @@
 > There is no sale today, and the document holds all the same: the owner must not rely
 > on guarantees the device does not give.
 
-Last reviewed 2026-09-12. Revisited on every hardware or firmware change. Reporting
-policy: [`SECURITY.md`](../SECURITY.md). Board details: [`docs/hardware.md`](hardware.md).
+Last reviewed 2026-09-12; the nRF52840 board section added 2026-10-13. Revisited on every
+hardware or firmware change. Reporting policy: [`SECURITY.md`](../SECURITY.md). Board
+details: [`docs/hardware.md`](hardware.md).
+
+## The nRF52840 board: not for real secrets yet
+
+The rest of this document describes the ESP32-C6 key. The second board,
+`firmware/boards/nrf52840-mdk-dongle` (Makerdiary MDK USB Dongle), runs the same core and
+passed `vkey check --wipe-everything` on 2026-10-13. Its protection is much weaker today,
+and every guarantee below that rests on the eFuse key, JTAG being off or Secure Boot does
+**not** hold on it:
+
+- **No chip key.** `DeviceKey` is unbound, so the data key comes from the PIN and Argon2
+  alone (128 KiB, 20 passes - about a second on this 64 MHz core). The eight-attempt wipe
+  only guards the device's own PIN check. Whoever copies the flash can try every PIN on
+  their own hardware. Measured 2026-10-13 with the same `argon2` crate on one laptop core:
+  0.97 ms per guess at 20 passes (2.4 ms at the C6's 48). All 10^8 PINs then take about
+  28 core-hours, a few hours on an ordinary laptop, and less on a GPU. The "years for
+  eight digits" figure is for the C6 with the counter erased; it does not apply here.
+- **The flash can be copied.** The factory UF2 bootloader serves `CURRENT.UF2`, the whole
+  application area, to anyone who holds the button while plugging the key in. Verified
+  2026-10-13: the vault's region came back with its contents. SWD reads it too: the chip
+  reports revision 2 (build code `AAD0`) with UICR `APPROTECT` erased, which on revision 2
+  leaves the debug port open. Revision 2 also predates Nordic's fix for the published
+  APPROTECT voltage glitch (IN-133), so even with the port closed in UICR, someone with
+  glitching gear can open it and read the flash, a chip key in it included.
+- **Any firmware is accepted.** UF2 flashes whatever it is given, with no signature.
+  Firmware that records the PIN on its next use is one file copy away.
+- **`vkey auth` does not exist here.** Its secret is sealed under the chip key, and the
+  CLI refuses to enable it.
+- **A backup made on this board uses its own cost** (20 passes). It is still guarded by
+  the passphrase's entropy, at less than half the C6's work per guess.
+
+**Accepted, not fixed** (maintainer's decision, 2026-10-13): this revision-2 chip will hold
+everything once the steps below are done. The glitch above stays open after them. Someone
+who takes the key and has the gear reads the flash and finds the PIN offline in hours. For
+a personal key, that risk is accepted rather than paid for with a revision-3 dongle.
+
+Before this board holds a real secret, all three are required: our own fork of the UF2
+bootloader (signed images only, no read-back, writes only to the application region),
+APPROTECT, and a chip-bound key (a secret in a flash page locked by the ACL until reset).
+The plan is in `docs2/roadmap.md`. Nordic's secure bootloader was dropped from it: there is
+no SWD probe, and installing it moves the bootloader address in UICR, a one-shot change
+with no way back.
 
 ## What the device is
 
@@ -365,6 +407,9 @@ Listed openly so nobody has to discover them.
 7. **No display** — the device cannot show what it is confirming.
 8. **No recovery mechanism** beyond the encrypted backup (`vkey backup` / `vkey restore`).
    Lose both the key and the backup and access is gone. Keep a second key.
+9. **One known advisory is ignored** (`cli/.cargo/audit.toml`): RUSTSEC-2026-0344, a zstd
+   decoder bug in `ruzstd` pulled in by `espflash`. vkey never parses an ELF, so the decoder
+   is never fed. It goes when a fixed `ruzstd` arrives or `espflash` leaves the CLI.
 
 ## Honest comparison
 
@@ -426,3 +471,4 @@ A link to this document belongs on the product page, not buried in the repositor
 - [Espressif Security Advisory AR2023-007](https://www.espressif.com/en/news/ESP32_FIA_Analysis)
 - [EUCLEAK Side-Channel Attack on the YubiKey 5 Series — NinjaLab](https://ninjalab.io/wp-content/uploads/2024/09/20240903_eucleak.pdf)
 - [Security Overview — ESP32-C6, ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/latest/esp32c6/security/security.html)
+- [Nordic IN-133 — APPROTECT bypass by fault injection](https://infocenter.nordicsemi.com/pdf/in_133_v1.0.pdf) · [CVE-2020-27211](https://nvd.nist.gov/vuln/detail/CVE-2020-27211) · [IN-141 — nRF52840 revision 3](https://infocenter.nordicsemi.com/pdf/in_141_v1.1.pdf)
