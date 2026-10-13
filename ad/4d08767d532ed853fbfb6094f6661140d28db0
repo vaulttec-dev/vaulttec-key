@@ -1,0 +1,50 @@
+docs2/makerdiary.md
+  s_211416f9294557::t_60a96d2de0c017 390-397
+firmware/boards/nrf52840-mdk-dongle/bootloader/board/board.h
+  s_211416f9294557::t_a19e5bf5f9ce92 1-71
+firmware/boards/nrf52840-mdk-dongle/bootloader/board/board.mk
+  s_211416f9294557::t_40bdfa5af7b755 1
+firmware/boards/nrf52840-mdk-dongle/bootloader/patches/0001-no-uicr-writes.patch
+  s_211416f9294557::t_22d63f04876d2a 1-20
+firmware/boards/nrf52840-mdk-dongle/bootloader/check.py
+  s_211416f9294557::t_da9bdb65d4a01a 1-56
+firmware/boards/nrf52840-mdk-dongle/bootloader/build.sh
+  s_211416f9294557::t_a19628f175c4cf 35
+  s_211416f9294557::t_13a1904a9ca536 49-52
+  s_211416f9294557::t_d50ccb66197b9e 44
+  s_211416f9294557::t_66616728f8c33d 19-22
+  s_211416f9294557::t_b88e33ef2befbe 1-18,23-29,34,39-43,45-48,53-55
+  s_211416f9294557::t_687a168bf63c8a 30,38
+  s_211416f9294557::t_a0cac658d144a6 31-33,36-37
+CLAUDE.md
+  s_211416f9294557::t_925f1b5785ed99 315-321
+firmware/boards/nrf52840-mdk-dongle/bootloader/Dockerfile
+  s_211416f9294557::t_b698459ac262d5 28-32
+  s_211416f9294557::t_07c4f80fc3cfb3 1-15,17-27
+  s_211416f9294557::t_595d711a173465 16
+tools/build-bootloader.sh
+  s_211416f9294557::t_3eb8fd4f661f6c 3-4,9-10,12-31,37,42-43,48,86-101,103-123
+  s_211416f9294557::t_b1a8bbd850fea0 102
+docs2/roadmap.md
+  s_211416f9294557::t_102e2bc4869bb7 165-179,183-190,203-215,222-223
+  s_211416f9294557::t_b5dd7a4e1ae037 180-182
+  s_211416f9294557::t_2513a1eb134f4c 216-221
+  s_211416f9294557::t_c045cb4860f6a7 128-164,224
+  s_211416f9294557::t_c506382bd92ced 191-202
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ad4d08767d532ed853fbfb6094f6661140d28db0",
+  "prompts": {},
+  "sessions": {
+    "s_211416f9294557": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "676596db-a983-4b94-8e19-40dad5711989",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "VaultTec-Dev <vaulttec-dev@proton.me>"
+    }
+  }
+}
