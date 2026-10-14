@@ -1,0 +1,27 @@
+docs2/makerdiary.md
+  s_211416f9294557::t_f9977bbf30e27c 346-347
+docs/threat-model.md
+  s_211416f9294557::t_da1b1780111fb1 55-56
+  s_211416f9294557::t_3711999c97c423 69-77
+  s_211416f9294557::t_6fe3ae912b8364 28-33
+docs2/roadmap.md
+  s_211416f9294557::t_81e41fe804e47a 530-538
+README.md
+  s_211416f9294557::t_0b9d5699a4b66f 15-17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b68930302cb70c1bc859de86cf4b93032eacfb30",
+  "prompts": {},
+  "sessions": {
+    "s_211416f9294557": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "676596db-a983-4b94-8e19-40dad5711989",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "VaultTec-Dev <vaulttec-dev@proton.me>"
+    }
+  }
+}
