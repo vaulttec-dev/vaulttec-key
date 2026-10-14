@@ -343,7 +343,8 @@ Open questions only the board answers:
   `APPROTECT` means the debug port is open: anyone with an SWD probe reads the whole flash
   today. Revision 2 also lacks the fix for the published APPROTECT glitch (IN-133), so
   closing the port in UICR stops a probe but not someone with glitching gear. The bootloader
-  reports nrfx 2.0.0 in `INFO_UF2.TXT`.
+  reports nrfx 2.0.0 in `INFO_UF2.TXT`. Since 2026-10-15 the firmware has written
+  `APPROTECT` to `0xffffff00` (roadmap phase 4), and the port is closed from the next reset on.
 
 ### Reading the `chip:` line of `vkey info`
 

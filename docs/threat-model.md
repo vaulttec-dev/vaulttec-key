@@ -25,11 +25,12 @@ and every guarantee below that rests on the eFuse key, JTAG being off or Secure 
   0.97 ms per guess at 20 passes (2.4 ms at the C6's 48). All 10^8 PINs then take about
   28 core-hours, a few hours on an ordinary laptop, and less on a GPU. The "years for
   eight digits" figure is for the C6 with the counter erased; it does not apply here.
-- **The flash can be copied over SWD.** The chip reports revision 2 (build code `AAD0`)
-  with UICR `APPROTECT` erased, which on revision 2 leaves the debug port open. Revision 2
-  also predates Nordic's fix for the published APPROTECT voltage glitch (IN-133), so even
-  with the port closed in UICR, someone with glitching gear can open it and read the
-  flash, a chip key in it included.
+- **The flash can be copied only with a glitch.** The chip is revision 2 (build code
+  `AAD0`). Since 2026-10-15 its firmware has written UICR `APPROTECT` to Enabled
+  (`0xffffff00`, phase 4), which closes the debug port from the next reset on, for good.
+  Revision 2 predates Nordic's fix for the published APPROTECT voltage glitch (IN-133),
+  so someone with glitching gear can still open the port at boot and read the flash. A
+  chip key would fall the same way, which is why there is none (roadmap, phase 5).
 
   The USB drive no longer hands it out. The factory UF2 bootloader served `CURRENT.UF2`,
   the whole application area, to anyone who held the button while plugging the key in.
@@ -51,7 +52,8 @@ and every guarantee below that rests on the eFuse key, JTAG being off or Secure 
   Everything above applies to it:
   - for 1 h 17 min, until the fork was installed, `CURRENT.UF2` and the offline PIN search
     handed it to anyone who held the board for a minute and then computed for a few hours;
-  - since then, SWD does the same until APPROTECT (phase 4), and the glitch after that.
+  - then SWD did the same, until APPROTECT closed it on 2026-10-15 (phase 4); since then
+    it takes the glitch.
 
   Whoever has the key signs firmware the fork runs. By design, the fork moves to a new key
   only through a self-update signed with the old one. A leak is mended only while the
@@ -64,10 +66,15 @@ everything once the steps below are done. The glitch above stays open after them
 who takes the key and has the gear reads the flash and finds the PIN offline in hours. For
 a personal key, that risk is accepted rather than paid for with a revision-3 dongle.
 
-Before this board holds a real secret, all three are required: our own fork of the UF2
-bootloader (signed images only, no read-back, writes only to the application region),
-APPROTECT, and a chip-bound key (a secret in a flash page locked by the ACL until reset).
-The plan is in `docs2/roadmap.md`. Nordic's secure bootloader was dropped from it: there is
+Before this board holds a real secret, two things are required:
+- our own fork of the UF2 bootloader, which runs signed images only, serves no read-back
+  and writes only to the application region (accepted 2026-10-14);
+- APPROTECT (written 2026-10-15).
+
+A chip-bound key, a secret in a flash page locked by the ACL until reset, was the third.
+It was dropped on this revision (2026-10-15): it loads from flash at boot, so the glitch
+above reads it as well, and it would protect nothing the PIN does not already. On a
+revision-3 chip it would be worth having. The plan is in `docs2/roadmap.md`. Nordic's secure bootloader was dropped from it: there is
 no SWD probe, and installing it moves the bootloader address in UICR, a one-shot change
 with no way back.
 

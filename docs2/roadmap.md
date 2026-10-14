@@ -527,6 +527,15 @@ built). It writes only while the low byte is not 0x00:
 The disassembly holds that sequence and no other store to UICR. The PAC's `write`
 starts from the register's reset value, 0xFFFF_FFFF, so only PALL changes.
 
+**Installed and accepted 2026-10-15,** on the maintainer's go:
+- copied as `vaultkey.signed.uf2` through the fork; the first boot showed
+  `UICR APPROTECT 0xffffff00`, with the PIN and its 8 attempts intact;
+- after a reset with the button held, the fork took the same signed UF2 again and ran it,
+  so updates go on with the port closed;
+- `selftest` green (device 627642 against the independent HMAC).
+
+**Phase 4 accepted 2026-10-15.**
+
 ## Phase 5 - chip key, then move daily use
 
 **Skipped on this chip (2026-10-15; the maintainer left the call to the analysis).**

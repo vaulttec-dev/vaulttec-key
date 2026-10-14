@@ -12,8 +12,9 @@ single-binary host CLI, and a press of the board's button for every secret that 
 > **Two boards** (2026-10-13). Development now targets the Makerdiary nRF52840 MDK USB Dongle
 > (`firmware/boards/nrf52840-mdk-dongle`), the board passkeys will come to. It runs the same
 > core and passes the full lifecycle test. Its bootloader is now our own fork, which runs
-> only signed firmware and serves no flash back. It has no chip key yet, though, and its debug
-> port is open. So it is **not for real secrets** until the steps
+> only signed firmware and serves no flash back, and APPROTECT closes its debug port. This
+> revision-2 chip can still be glitched open, though, and it has no chip key
+> ([docs/threat-model.md](docs/threat-model.md)). So it is **not for real secrets** until the steps
 > in [docs2/roadmap.md](docs2/roadmap.md) are done, and `vkey setup` does not flash it yet.
 > Everything below still describes the ESP32-C6-Zero, which is now only a test board.
 
