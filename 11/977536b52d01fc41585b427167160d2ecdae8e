@@ -1,0 +1,57 @@
+docs2/roadmap.md
+  s_211416f9294557::t_e78bf7dbb52426 276-277
+  s_211416f9294557::t_d2ee2e4530be00 292-325,327-330
+  s_211416f9294557::t_1b35d808b35f57 287
+  s_211416f9294557::t_87fd74bf12a073 326
+  s_211416f9294557::t_986202e478532e 273,275
+firmware/boards/nrf52840-mdk-dongle/bootloader/build.sh
+  s_211416f9294557::t_0314bca32e835e 81
+  s_211416f9294557::t_8eb8183be48ba3 11
+  s_211416f9294557::t_91c23d197b6725 80,82-94
+  s_211416f9294557::t_dfa8b63d4237c3 23
+firmware/boards/nrf52840-mdk-dongle/bootloader/test/app.ld
+  s_211416f9294557::t_e8c1e2e6a3cff9 1-68
+CLAUDE.md
+  s_211416f9294557::t_a2f67f80a6ad1a 327-331
+firmware/boards/nrf52840-mdk-dongle/bootloader/test/board.py
+  s_211416f9294557::t_f946725a2a35cf 81-82
+  s_211416f9294557::t_69ed62745e76d5 1-11,15-80,83-103
+  s_211416f9294557::t_af2f00bd99d3c1 12-14
+firmware/boards/nrf52840-mdk-dongle/bootloader/test/app_test.c
+  s_211416f9294557::t_0b5f5b96b6f35f 1-3,5-44,46-89
+  s_211416f9294557::t_582d046aeac06b 4
+  s_211416f9294557::t_0ecfcfab13d615 45
+firmware/boards/nrf52840-mdk-dongle/bootloader/test/board.sh
+  s_211416f9294557::t_8ad6d633a293b0 1-52
+firmware/boards/nrf52840-mdk-dongle/bootloader/check.py
+  s_211416f9294557::t_9c227230cbd98d 9-10
+  s_211416f9294557::t_f89080af2044a8 28-29
+  s_211416f9294557::t_99be3d7238c968 90-97,99-105,107-109,114
+  s_211416f9294557::t_43c5e4a858344f 50,54
+  s_211416f9294557::t_1012e42e1ab137 98
+  s_211416f9294557::t_f3ee8c5a9fc005 77-79,81-86
+  s_211416f9294557::t_65f79a1bc52688 8
+  s_211416f9294557::t_1db3f37089b3f4 14-18
+firmware/boards/nrf52840-mdk-dongle/bootloader/board/board.h
+  s_211416f9294557::t_08fe6a7e52258d 70-73,75-79,81-82
+firmware/boards/nrf52840-mdk-dongle/bootloader/patches/0006-no-softdevice.patch
+  s_211416f9294557::t_73b1e54358530f 1-80
+firmware/boards/nrf52840-mdk-dongle/bootloader/patches/0007-as-app.patch
+  s_211416f9294557::t_45404a3d94b4db 1-104
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "11977536b52d01fc41585b427167160d2ecdae8e",
+  "prompts": {},
+  "sessions": {
+    "s_211416f9294557": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "676596db-a983-4b94-8e19-40dad5711989",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "VaultTec-Dev <vaulttec-dev@proton.me>"
+    }
+  }
+}
