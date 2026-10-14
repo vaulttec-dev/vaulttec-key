@@ -324,7 +324,11 @@ plus an offset. The fork runs only images signed with one Ed25519 key, checked o
 boot (`bootloader/src/signature.c`, tested under qemu-arm by `bootloader/test/run.sh`
 before every build); `bootloader/sign.sh` makes the signed UF2. The build needs
 `bootloader/signing-key.pem`, or `BOOTLOADER_TEST_KEY` for a build that names itself a
-test build. Until the fork is installable the outputs stay in a temporary directory, and
+test build. A test-key build also makes `as-app.bin`: the same sources as an application
+at 0x1000 that runs under the factory bootloader and reports its verdicts in
+`INFO_UF2.TXT` (`bootloader/test/app_test.c`). `bootloader/test/board.sh copy` puts a UF2
+only on the drive it is meant for: a bootloader UF2 on the factory `UF2BOOT` would be
+installed. Until the fork is installable the outputs stay in a temporary directory, and
 installing it is never part of a build (`docs2/roadmap.md`, phase 3).
 
 Compilation is the **only** exception to the check rule. Linters, formatters, tests and

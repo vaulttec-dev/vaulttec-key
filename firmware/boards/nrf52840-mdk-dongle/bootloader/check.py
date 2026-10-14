@@ -5,11 +5,17 @@ SWD probe. Takes bootloader.bin, the region from 0xF4000 (code, then the CF2 pag
 - No UICR address the code could write through: the bootloader must never write UICR.
   A write there (PSELRESET, NFCPINS, APPROTECT) is permanent without a probe. Searched
   three ways: as a word anywhere in the code, as an immediate in any instruction but a
-  comparison, and as a movw/movt pair. Like the radio search in build-vaultkey.sh, it
-  catches direct addressing, not an address computed from another base plus an offset.
+  comparison, and as a movw/movt pair or a movt of 0x1000 whose low half it cannot
+  see. Like the radio search in build-vaultkey.sh, it catches direct addressing, not an
+  address computed from another base plus an offset.
 - The CF2 block is the factory one, word for word. Its board ID is what the factory
   bootloader checks before it accepts this one as a self-update, and what a later
   self-update of this one is checked against.
+
+With --as-app it checks the on-board test build (test/app_test.c), an application from
+0x1000 that runs on the chip as well: the same UICR search, no CF2 block, an image that
+ends below the scratch window its drive writes, and no `svc`, since its own vectors
+handle that and the MBR's commands are compiled out of it.
 """
 
 import re
@@ -19,6 +25,8 @@ import sys
 BASE = 0xF4000
 CF2_AT = 0xFD800
 UICR = range(0x10001000, 0x10002000)
+APP_BASE = 0x1000
+APP_END = 0x40000  # BOARD_TEST_SCRATCH in board/board.h
 
 # What the factory 0.7.1 image holds at 0xFD800: magic, 5 of 100 entries used,
 # flash 1 MiB, RAM 256 KiB, board ID 2886:F00F, UF2 family, 32 pins per port.
@@ -39,11 +47,11 @@ MOVW = re.compile(r"^movw\S*\s+(r\d+|ip|lr|sl|fp), #(\d+)")
 MOVT = re.compile(r"^movt\S*\s+(r\d+|ip|lr|sl|fp), #(\d+)")
 
 
-def words_in_code(code: bytes) -> list[str]:
+def words_in_code(code: bytes, base: int) -> list[str]:
     # Halfword steps: Thumb literal pools are word-aligned, but a constant packed in
     # data need not be.
     return [
-        hex(BASE + i)
+        hex(base + i)
         for i in range(0, len(code) - 3, 2)
         if struct.unpack_from("<I", code, i)[0] in UICR
     ]
@@ -66,18 +74,44 @@ def immediates_and_pairs(dis: str) -> list[str]:
         if w := MOVW.match(text):
             last_movw[w.group(1)] = int(w.group(2))
         elif t := MOVT.match(text):
+            # A high half of 0x1000 with a low half that did not come from a movw into
+            # the same register (a mov.w, a mov from another register) could still be
+            # UICR, so it counts as one.
             low = last_movw.get(t.group(1))
-            if low is not None and (int(t.group(2)) << 16 | low) in UICR:
-                hits.append(f"{addr}: {text} (with movw #{low:#x})")
+            high = int(t.group(2)) << 16
+            if (low is None and high == UICR.start & 0xFFFF0000) or (
+                low is not None and (high | low) in UICR
+            ):
+                hits.append(f"{addr}: {text} (with movw #{low:#x})" if low is not None
+                            else f"{addr}: {text} (low half unknown)")
     return hits
 
 
+def check_as_app(data: bytes, dis: str) -> int:
+    hits = words_in_code(data, APP_BASE) + immediates_and_pairs(dis)
+    if hits:
+        print("UICR addresses the code could write through:\n  " + "\n  ".join(hits))
+        return 1
+    if APP_BASE + len(data) > APP_END:
+        print(f"the test build ends at {APP_BASE + len(data):#x}, inside its scratch window")
+        return 1
+    svc = [line.strip() for line in dis.splitlines() if re.search(r"\tsvc", line)]
+    if svc:
+        print("the test build calls svc:\n  " + "\n  ".join(svc))
+        return 1
+    print(f"check: no UICR address and no svc in the {len(data)}-byte test build")
+    return 0
+
+
 def main() -> int:
+    if sys.argv[1] == "--as-app":
+        return check_as_app(open(sys.argv[2], "rb").read(), open(sys.argv[3]).read())
+
     data = open(sys.argv[1], "rb").read()
     dis = open(sys.argv[2]).read()
     code = data[: CF2_AT - BASE]
 
-    hits = words_in_code(code) + immediates_and_pairs(dis)
+    hits = words_in_code(code, BASE) + immediates_and_pairs(dis)
     if hits:
         print("UICR addresses the code could write through:\n  " + "\n  ".join(hits))
         return 1

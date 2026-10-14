@@ -8,6 +8,7 @@
 #                     the signing step signs and wraps into the self-update UF2
 #   bootloader.dis    its disassembly, for check.py
 #   systeminit.txt    SystemInit disassembled, read before any install
+#   as-app.bin/.dis   with a test key only: the on-board test build (test/app_test.c)
 #
 # The tree is the image's pristine upstream checkout, so every run starts from the same
 # sources. The version and the build date are fixed, so the same inputs give the same
@@ -19,7 +20,7 @@ BOARD=nrf52840_mdk_usb_dongle
 # Upstream's version, then the fork's revision, bumped with every change to this folder:
 # with no probe, INFO_UF2.TXT on the drive is the only way to tell which build a board
 # runs. The Makefile takes the bootloader version number from the part before "-".
-VERSION=0.9.2-vkey.3
+VERSION=0.9.2-vkey.4
 # What `git submodule status` reports for the pinned commits today, as the factory
 # 0.7.1 bootloader reports it too. Fixed here because the uf2 part names an upstream
 # branch, and a fresh clone after that branch moves would change the INFO text.
@@ -76,3 +77,18 @@ arm-none-eabi-objdump -d --no-show-raw-insn "$out" > /work/out/bootloader.dis
 arm-none-eabi-size "$out"
 python3 /work/in/check.py /work/out/bootloader.bin /work/out/bootloader.dis
 echo "key: $fingerprint"
+
+# With a test key, also the on-board test build (test/app_test.c, patches/0007): the
+# same sources as an application at 0x1000, run under the factory bootloader. It runs
+# on the chip too, so it passes the same UICR search.
+[ "$KEY_KIND" = test ] || exit 0
+cp /work/in/test/app_test.c src/
+cp /work/in/test/app.ld linker/
+printf 'CFLAGS += -DVKEY_AS_APP\nC_SRC += src/app_test.c\n' > Makefile.user
+app="_build/app/${BOARD}_bootloader-$VERSION.out"
+make -s BOARD="$BOARD" BUILD=_build/app LD_FILE=linker/app.ld GIT_VERSION="$VERSION" \
+    GIT_SUBMODULE_VERSIONS="$SUBMODULES" "$app"
+arm-none-eabi-objcopy -O binary -R .uicrBootStartAddress -R .uicrMbrParamsPageAddress \
+    "$app" /work/out/as-app.bin
+arm-none-eabi-objdump -d --no-show-raw-insn "$app" > /work/out/as-app.dis
+python3 /work/in/check.py --as-app /work/out/as-app.bin /work/out/as-app.dis

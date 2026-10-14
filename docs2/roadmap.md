@@ -270,8 +270,11 @@ Milestones, one commit each:
        nothing written between the check and the jump;
      - DFU mode always ends in a reset;
      - a bootloader update is copied only if signed;
-     - the jump address is always 0x1000, and no SoftDevice is looked for;
+     - the jump address is always 0x1000, and the boot path looks for no SoftDevice;
      - `INFO_UF2.TXT` names the key.
+
+     tinyusb's USB clock code still looked for one, at an address in the app, until
+     milestone 4's `0006`; the message of commit a8b50cd overstates this for vkey.3.
    - **`test/run.sh`, run before every build.** It compiles `signature.c` for Cortex-M4
      and runs it under qemu-arm on 17 openssl-signed cases: valid app and bootloader;
      a flipped bit in header, image, R or s; wrong key; s + L; wrong kind; length
@@ -281,26 +284,50 @@ Milestones, one commit each:
      ≈1.8 KiB of the 8 KiB reserved.
    - **Signing.** `sign.sh` signs with openssl, checks the signature before writing, and
      wraps the image and slot into a UF2. By the factory bootloader's code it accepts that
-     UF2 too, the slot being ordinary app space to it; not tried yet. It refuses to sign
+     UF2 too, the slot being ordinary app space to it (confirmed in milestone 4). It refuses to sign
      a bootloader that trusts a test key unless `ALLOW_TEST_KEY=1`. `memory.x` now ends
      the firmware at 0x96000; its image did not change.
    - **The build refuses to run without `bootloader/signing-key.pem`.** A test build
      names its key with `BOOTLOADER_TEST_KEY`, and `INFO_UF2.TXT` then says "TEST KEY".
-4. The on-device test as an application. The plan:
-   - a build flag (`VKEY_AS_APP=1`) in the same patch series, not separate code;
-   - linked at 0x1000, `COPY_BL` compiled out;
-   - its write window and verify target on a scratch area (0x40000..0x80000), clear of
-     itself;
-   - marked a test build in its INFO text.
+4. The on-device test as an application, and one fix it turned up. **Run on the board
+   2026-10-14, with the factory bootloader in place throughout.**
+   - **`patches/0006-no-softdevice`, a change to the bootloader itself.** tinyusb's USB
+     clock code asked a SoftDevice about the clock whenever the word at 0x3004 held its
+     magic number. Here that word is the app's, so an app holding it there would have
+     sent DFU mode into an SVC nothing serves: a hang on the drive, and an app no update
+     could replace. Found by the test build's `svc` check. The clock is now the CLOCK
+     peripheral's alone, and the only `svc` left is `sd_mbr_command`. Version
+     `0.9.2-vkey.4`.
+   - **`patches/0007-as-app` and `VKEY_AS_APP` in `board.h`: the test build.** The same
+     sources linked at 0x1000 (`test/app.ld`) to run under the factory bootloader.
+     `COPY_BL` is compiled out, the settings page is never written, the drive writes only
+     0x40000..0x80000 and stages a self-update at 0x76000, and its label is `VKEYTEST`.
+     Built only with a test key, after the real build. With these hooks the real
+     `bootloader.bin` stayed byte-identical. `check.py --as-app` puts it through the same
+     UICR search, and it must contain no `svc` and end below 0x40000.
+   - **`test/app_test.c`** makes the bootloader's own `signature_valid` calls before the
+     drive starts and writes each verdict with its DWT cycle count into `INFO_UF2.TXT`.
+     **`test/board.py`** moves the real-pipeline signed app into the scratch window (the
+     signature covers no address). **`test/board.sh copy`** reads the target drive's
+     `INFO_UF2.TXT` first: a bootloader UF2 goes only to `VKEYTEST`, never to the factory
+     `UF2BOOT`, which would install it.
 
-   With no serial port the drive is the only output, so it writes its results into
-   `INFO_UF2.TXT`:
-   - accept or refuse on a real-pipeline signed app, an altered one and a signed
-     self-update image;
-   - DWT cycle counts for a boot verify, turning the qemu estimate into a measurement on
-     the chip.
+   On the chip:
 
-   The factory bootloader stays in place throughout, so this milestone is reversible.
+   | Check | Result |
+   |---|---|
+   | the signed app, 77 100 B | accepted, 15.13 M cycles, ≈ 236 ms at 64 MHz |
+   | the same with one bit of R flipped | refused |
+   | the app checked as a bootloader | refused, 88 cycles |
+   | a signed self-update copied to `VKEYTEST` | staged by the fork's own write path, accepted at the next boot |
+   | the same with one bit flipped at 0xF4110 | refused |
+
+   The fork's USB drive works on this board. The measured ≈1.44 cycles an instruction
+   matches the qemu estimate, so a 300 KiB image with Trussed would take ≈ 0.8 s. The
+   instruction cache was off (`ICACHECNF` 0). Turning it on in the fork before the check
+   is an open speed-up, not done. The vkey firmware was then restored from its signed UF2
+   through the factory bootloader, which runs it with the slot at 0x96000: the first
+   install step, rehearsed with the test key.
 
 Install needs its own go and a checklist:
 

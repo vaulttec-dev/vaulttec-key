@@ -67,15 +67,25 @@
 /* Flash: the drive writes 0x1000..BOARD_APP_FLASH_END and nothing else. Above it lie
  * the vault (0x97000..0xD8000) and the filesystem a firmware keeps (0xD8000..0xEC000).
  * The same boundary as FLASH in the firmware's memory.x and VAULT_BASE in its main.rs.
+ *
+ * The on-board test build (VKEY_AS_APP, bootloader/test/) runs from 0x1000 under the
+ * factory bootloader, so its drive writes only a scratch window above itself and stages
+ * a self-update at the top of it. Its own label tells its drive from a bootloader's.
  *------------------------------------------------------------------*/
+#ifdef VKEY_AS_APP
+#define BOARD_TEST_SCRATCH    0x40000
+#define BOARD_APP_FLASH_END   0x80000
+#define UF2_VOLUME_LABEL      "VKEYTEST   "
+#else
 #define BOARD_APP_FLASH_END   0x97000
+#define UF2_VOLUME_LABEL      "UF2BOOT    "
+#endif
 
 /* The app's signature slot (src/signature.h): the last page of the window, which the
  * app itself never reaches - memory.x ends its FLASH here. */
 #define BOARD_APP_SLOT        (BOARD_APP_FLASH_END - 0x1000)
 
 #define UF2_PRODUCT_NAME   "Makerdiary nRF52840 MDK USB Dongle"
-#define UF2_VOLUME_LABEL   "UF2BOOT    "
 #define UF2_BOARD_ID       "nRF52840-MDK-USB-DONGLE"
 #define UF2_INDEX_URL      "https://wiki.makerdiary.com/nrf52840-mdk-usb-dongle"
 
