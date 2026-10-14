@@ -317,7 +317,7 @@ it. A UF2 is made from `images/vaultkey.bin` with family `0xADA52840` and base 0
 (`uf2conv -f 0xADA52840 -c -b 0x1000`). Until our own fork of this bootloader replaces it
 (`docs2/roadmap.md`, phase 3; Nordic's secure bootloader was dropped for want of a probe)
 the board holds no real secrets, because UF2 flashes anything and its `CURRENT.UF2` reads
-the vault's ciphertext out.
+the vault's ciphertext out. The fork replaced it on 2026-10-14.
 
 Open questions only the board answers:
 

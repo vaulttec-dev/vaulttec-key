@@ -6,7 +6,7 @@
 > on guarantees the device does not give.
 
 Last reviewed 2026-09-12; the nRF52840 board section added 2026-10-13, its signing key
-2026-10-14. Revisited on every
+and bootloader fork 2026-10-14. Revisited on every
 hardware or firmware change. Reporting policy: [`SECURITY.md`](../SECURITY.md). Board
 details: [`docs/hardware.md`](hardware.md).
 
@@ -25,28 +25,36 @@ and every guarantee below that rests on the eFuse key, JTAG being off or Secure 
   0.97 ms per guess at 20 passes (2.4 ms at the C6's 48). All 10^8 PINs then take about
   28 core-hours, a few hours on an ordinary laptop, and less on a GPU. The "years for
   eight digits" figure is for the C6 with the counter erased; it does not apply here.
-- **The flash can be copied.** The factory UF2 bootloader serves `CURRENT.UF2`, the whole
-  application area, to anyone who holds the button while plugging the key in. Verified
-  2026-10-13: the vault's region came back with its contents. SWD reads it too: the chip
-  reports revision 2 (build code `AAD0`) with UICR `APPROTECT` erased, which on revision 2
-  leaves the debug port open. Revision 2 also predates Nordic's fix for the published
-  APPROTECT voltage glitch (IN-133), so even with the port closed in UICR, someone with
-  glitching gear can open it and read the flash, a chip key in it included.
-- **Any firmware is accepted.** UF2 flashes whatever it is given, with no signature.
-  Firmware that records the PIN on its next use is one file copy away.
+- **The flash can be copied over SWD.** The chip reports revision 2 (build code `AAD0`)
+  with UICR `APPROTECT` erased, which on revision 2 leaves the debug port open. Revision 2
+  also predates Nordic's fix for the published APPROTECT voltage glitch (IN-133), so even
+  with the port closed in UICR, someone with glitching gear can open it and read the
+  flash, a chip key in it included.
+
+  The USB drive no longer hands it out. The factory UF2 bootloader served `CURRENT.UF2`,
+  the whole application area, to anyone who held the button while plugging the key in.
+  On 2026-10-13 the vault's region came back with its contents. Our bootloader fork
+  replaced it on 2026-10-14, and its drive holds only `INFO_UF2.TXT` and `INDEX.HTM`. Its
+  code (`0003-no-readback`) returns zeros for a raw read past them, but that has not been
+  read back on the board yet.
+- **Only firmware signed with the fork's key runs** (since 2026-10-14). The fork checks
+  the signature on every boot. The check was proven on this chip as an app in milestone 4,
+  and the installed fork verified and ran the signed vkey. Whoever holds the button can
+  still write the application region, so a bad copy leaves the board in the bootloader
+  until a signed image is copied. Refusing an unsigned or altered UF2 on the installed
+  fork is phase-3 acceptance and has not been run yet.
 - **`vkey auth` does not exist here.** Its secret is sealed under the chip key, and the
   CLI refuses to enable it.
 - **The bootloader fork's signing key lives on this board.** It is the `.env`
   `vkey-signing-nrf`, made by `bootloader/signing-key.sh` on 2026-10-14 (fingerprint
   `a1700ebd539b0bfc`), with a `.vkb` as its second copy. Everything above applies to it:
-  - until the fork is installed, `CURRENT.UF2` and the offline PIN search hand it to anyone
-    who holds the board for a minute and then computes for a few hours;
-  - after that, SWD does the same until APPROTECT, and the glitch after that.
+  - for 1 h 17 min, until the fork was installed, `CURRENT.UF2` and the offline PIN search
+    handed it to anyone who held the board for a minute and then computed for a few hours;
+  - since then, SWD does the same until APPROTECT (phase 4), and the glitch after that.
 
   Whoever has the key signs firmware the fork runs. By design, the fork moves to a new key
   only through a self-update signed with the old one. A leak is mended only while the
-  owner still holds the key. So the time from making the key to installing the fork is
-  kept short.
+  owner still holds the key.
 - **A backup made on this board uses its own cost** (20 passes). It is still guarded by
   the passphrase's entropy, at less than half the C6's work per guess.
 

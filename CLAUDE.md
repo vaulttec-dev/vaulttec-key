@@ -150,9 +150,10 @@ folder's business.
 The boards:
 
 - **`nrf52840-mdk-dongle`**, the primary. USB CDC-ACM from the firmware (`1209:0001`),
-  polled; the factory UF2 bootloader (Adafruit-based, 0x1000..0xF4000 is the application) is
-  how it is flashed: hold the button while plugging in, copy a UF2 (family `0xADA52840`,
-  base 0x1000) to `UF2BOOT`, replug. No chip key, so it holds no real secrets yet. `vkey
+  polled; our UF2 bootloader fork (installed 2026-10-14, below) is how it is flashed: hold
+  the button while plugging in, copy `images/vaultkey.signed.uf2` to `UF2BOOT`, replug. It
+  runs only images signed with the key in `bootloader/signing-key.pem`; the app ends by
+  its signature slot at 0x96000. No chip key, so it holds no real secrets yet. `vkey
   info` prints the chip's build code, UICR `APPROTECT` and last reset cause. Notes,
   measurements and factory state: `docs2/makerdiary.md`; the plan: `docs2/roadmap.md`.
 - **`esp32c6-zero`**, the test board (2026-10-14): nothing is built for it, and it takes
@@ -279,8 +280,9 @@ The boards:
 
 **On the nRF52840, without a probe, the bootloader and UICR are irreversible.** A broken
 bootloader is a board no USB tool reaches, and UICR `APPROTECT` once written stays. Each
-such step happens only while the board holds nothing, and only on the maintainer's
-explicit go for that step (`docs2/roadmap.md`, phases 3 and 4).
+such step happens only while the board holds nothing a `.vkb` cannot restore, and only on
+the maintainer's explicit go for that step (`docs2/roadmap.md`, phases 3 and 4). The
+bootloader fork went in this way on 2026-10-14.
 
 **eFuses are irreversible.** Secure Boot, Flash Encryption and HMAC keys burn the chip
 forever. Never burn an eFuse without a direct instruction from the maintainer — and even

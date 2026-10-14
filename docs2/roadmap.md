@@ -33,7 +33,8 @@ notes, measurements and the factory state: `docs2/makerdiary.md`.
 **Real secrets go onto the nRF when phases 3-5 are done, not when features are done.**
 No board holds real secrets today, and the C6 is a test board, not a fallback
 (2026-10-14), so every feature is built for the nRF alone. The nRF has no chip key, and
-its bootloader flashes anything and serves the flash back (`CURRENT.UF2`). A copy of its
+its debug port is open. Until 2026-10-14 its bootloader also flashed anything and served
+the flash back (`CURRENT.UF2`); our fork has replaced it since (phase 3). A copy of its
 flash gives up the PIN offline in hours (`docs/threat-model.md`). `espflash` stays in the
 CLI while the C6 is flashed through it, and the audit exception with it.
 
@@ -445,6 +446,18 @@ Install needs its own go and a checklist:
   into that app. If it stays in DFU mode instead, copying the signed app UF2 again is
   the next step.
 
+**Installed 2026-10-14, 22:53,** on the maintainer's go.
+- `bootloader.signed.uf2` was copied onto the factory drive once its `INFO_UF2.TXT` showed
+  0.7.1 with no SoftDevice.
+- The board left USB at once and came back by itself 2 s later, running vkey
+  (`last reset: soft reset`).
+- With the button held, the drive showed `0.9.2-vkey.4`, `Key: a1700ebd539b0bfc` and only
+  `INDEX.HTM` and `INFO_UF2.TXT`.
+- Replugged without it, the first cold boot (`power-on`) verified vkey and ran it, with
+  the PIN and its 8 attempts intact.
+
+The key had spent 1 h 17 min on a board that served `CURRENT.UF2`.
+
 **The risk, stated plainly.** A bug in the new bootloader leaves a board no USB tool can
 reach. Without a probe that is a new dongle. Since 2026-10-14 the board holds the signing
 key. A brick therefore costs the board but not the key: the `.vkb` is proven by a restore
@@ -455,7 +468,8 @@ plugged in until it comes back.
 Acceptance:
 
 - an unsigned or altered UF2 is refused and never runs;
-- the drive offers no `CURRENT.UF2`;
+- the drive offers no `CURRENT.UF2` (seen 2026-10-14; that a raw read past its files
+  returns zeros is not read back yet);
 - a UF2 aimed at the vault region is refused;
 - `check --wipe-everything` passes;
 - the threat model loses the "flashes anything" and `CURRENT.UF2` lines.
@@ -536,7 +550,7 @@ Acceptance: registration and login on webauthn.io and with `fido2-token`; `pam_u
 |---|---|
 | Phase 0 | ~~the audit exception for RUSTSEC-2026-0344~~ - done 2026-10-13 |
 | Phase 2 | ~~if the chip is older than revision 3: accept the glitch risk or keep the important secrets on the C6~~ - revision 2; everything moves here, risk accepted (2026-10-13) |
-| Phase 3 | ~~own bootloader instead of the Nordic secure bootloader~~ - own fork chosen (2026-10-13); installing it still needs its own go |
+| Phase 3 | ~~own bootloader instead of the Nordic secure bootloader~~ - own fork chosen (2026-10-13), installed on the maintainer's go (2026-10-14) |
 | Phase 3 | ~~the signing key's second home~~ - a `.vkb` that restores onto the C6; the C6 is the test board, everything else is on the nRF (2026-10-14) |
 | Phase 5 | ~~wiping the C6 after migration~~ - the C6 is a test board, not a fallback, and neither board holds real secrets (2026-10-14) |
 | Phase 5 | chip key option A or B |

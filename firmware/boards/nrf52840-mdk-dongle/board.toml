@@ -22,8 +22,9 @@ button = "USER"
 # reaches this address.
 radio_base = 0x40001000
 
-# Flashed through the factory UF2 bootloader for now (docs2/makerdiary.md). `vkey setup`
-# talks only to the ESP ROM loader, so it never picks this board.
+# Flashed through its UF2 bootloader fork as images/vaultkey.signed.uf2 (bootloader/,
+# docs2/roadmap.md phase 3). `vkey setup` talks only to the ESP ROM loader, so it never
+# picks this board.
 [[image]]
 offset = 0x1000
 file = "images/vaultkey.bin"
