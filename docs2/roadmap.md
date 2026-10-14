@@ -458,6 +458,12 @@ Install needs its own go and a checklist:
 
 The key had spent 1 h 17 min on a board that served `CURRENT.UF2`.
 
+The as-app harness (`test/board.sh`, `m4.uf2`) ran under the factory bootloader. The fork
+runs an app only with a slot at 0x96000 signed by the real key. `board.sh copy` also
+looks for 0.7.1 in the drive's INFO, so it now refuses the fork's drive, which fails safe.
+Before the fork's next change, the harness has to be adapted: the test build is signed as
+an app with the real key, while its test images keep the test key.
+
 **The risk, stated plainly.** A bug in the new bootloader leaves a board no USB tool can
 reach. Without a probe that is a new dongle. Since 2026-10-14 the board holds the signing
 key. A brick therefore costs the board but not the key: the `.vkb` is proven by a restore
@@ -467,12 +473,32 @@ plugged in until it comes back.
 
 Acceptance:
 
-- an unsigned or altered UF2 is refused and never runs;
-- the drive offers no `CURRENT.UF2` (seen 2026-10-14; that a raw read past its files
-  returns zeros is not read back yet);
-- a UF2 aimed at the vault region is refused;
-- `check --wipe-everything` passes;
-- the threat model loses the "flashes anything" and `CURRENT.UF2` lines.
+- an unsigned or altered UF2 is refused and never runs. Done 2026-10-14 with two images,
+  each copied onto the fork's drive and then cold-booted without the button:
+  - `vaultkey.signed.uf2` with one bit flipped at 0x9010;
+  - the same app signed with the test key.
+
+  Both times the board came back as the bootloader (`2886:f00f`), not vkey. Then the
+  real `vaultkey.signed.uf2` brought vkey back at once, with the PIN and its 8 attempts
+  intact;
+- the drive offers no `CURRENT.UF2`. Done 2026-10-14: the drive holds only `INDEX.HTM` and
+  `INFO_UF2.TXT`. The same 192 raw sectors that gave the factory bootloader's code back
+  (`dd`, skip 4411) now read as 98 304 zero bytes;
+- a UF2 aimed at the vault region is refused. Done 2026-10-14 at the boundary, with one
+  block at 0x97000, the first address past the app window and the vault's attempt
+  sector. It was all 0xFF but a zero first word, so a write would have shown as one spent
+  attempt without the PIN. The fork did not count the block as part of a transfer, so
+  the copy ended no session and caused no reset. After a cold boot, vkey still showed 8
+  attempts;
+- `check --wipe-everything` passes. Done 2026-10-14 under the fork: every line PASS,
+  backup, restore, rekey, the live HMAC selftest and the wipe after 8 wrong PINs
+  included. The signing key then came back from its `.vkb` (on the second try, after a
+  mistyped passphrase). Signing again gave `vaultkey.signed.uf2` and
+  `bootloader.signed.uf2` byte for byte;
+- the threat model loses the "flashes anything" and `CURRENT.UF2` lines. Done
+  2026-10-14.
+
+**Phase 3 accepted 2026-10-14.**
 
 ## Phase 4 - APPROTECT, from the firmware
 

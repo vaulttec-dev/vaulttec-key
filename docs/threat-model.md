@@ -34,20 +34,21 @@ and every guarantee below that rests on the eFuse key, JTAG being off or Secure 
   The USB drive no longer hands it out. The factory UF2 bootloader served `CURRENT.UF2`,
   the whole application area, to anyone who held the button while plugging the key in.
   On 2026-10-13 the vault's region came back with its contents. Our bootloader fork
-  replaced it on 2026-10-14, and its drive holds only `INFO_UF2.TXT` and `INDEX.HTM`. Its
-  code (`0003-no-readback`) returns zeros for a raw read past them, but that has not been
-  read back on the board yet.
+  replaced it on 2026-10-14, and its drive holds only `INFO_UF2.TXT` and `INDEX.HTM`. Raw
+  sectors past them read as zeros: checked on the board where the factory's drive had
+  served its own code.
 - **Only firmware signed with the fork's key runs** (since 2026-10-14). The fork checks
-  the signature on every boot. The check was proven on this chip as an app in milestone 4,
-  and the installed fork verified and ran the signed vkey. Whoever holds the button can
-  still write the application region, so a bad copy leaves the board in the bootloader
-  until a signed image is copied. Refusing an unsigned or altered UF2 on the installed
-  fork is phase-3 acceptance and has not been run yet.
+  the signature on every boot. On the board it refused an image with one bit flipped and
+  an image signed with another key, and it ran the signed vkey. Whoever holds the button
+  can still write the application region, so a bad copy leaves the board in the
+  bootloader until a signed image is copied.
 - **`vkey auth` does not exist here.** Its secret is sealed under the chip key, and the
   CLI refuses to enable it.
 - **The bootloader fork's signing key lives on this board.** It is the `.env`
   `vkey-signing-nrf`, made by `bootloader/signing-key.sh` on 2026-10-14 (fingerprint
-  `a1700ebd539b0bfc`), with a `.vkb` as its second copy. Everything above applies to it:
+  `a1700ebd539b0bfc`), with a `.vkb` as its second copy. That copy was proven twice, each
+  time by a restore that signed byte for byte the same, the second after the wipe test.
+  Everything above applies to it:
   - for 1 h 17 min, until the fork was installed, `CURRENT.UF2` and the offline PIN search
     handed it to anyone who held the board for a minute and then computed for a few hours;
   - since then, SWD does the same until APPROTECT (phase 4), and the glitch after that.
