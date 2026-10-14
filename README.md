@@ -14,7 +14,7 @@ single-binary host CLI, and a press of the board's button for every secret that 
 > core and passes the full lifecycle test. It has no chip key yet, though, and its bootloader
 > flashes anything and reads the flash back. So it is **not for real secrets** until the steps
 > in [docs2/roadmap.md](docs2/roadmap.md) are done, and `vkey setup` does not flash it yet.
-> Everything below describes the ESP32-C6-Zero, the key in use today.
+> Everything below still describes the ESP32-C6-Zero, which is now only a test board.
 
 ## In ten seconds
 

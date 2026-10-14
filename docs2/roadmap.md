@@ -2,8 +2,9 @@
 
 Written 2026-10-13, after the first green `vkey check --wipe-everything` on the Makerdiary
 dongle. Revised the same day for a constraint the maintainer set: **no SWD probe and no
-spare board, now or later.** Decided already, not reopened here: the nRF52840 is the
-primary board and the C6 the fallback; Trussed + `fido-authenticator` for passkeys. Board
+spare board, now or later.** Decided already, not reopened here: the nRF52840 is the key
+and the C6 a test board, not a fallback (2026-10-14); Trussed + `fido-authenticator` for
+passkeys. Board
 notes, measurements and the factory state: `docs2/makerdiary.md`.
 
 ## What "no probe, no spare" changes
@@ -20,20 +21,21 @@ notes, measurements and the factory state: `docs2/makerdiary.md`.
   board installs through its own update path at the same address.
 - **UF2 stays the transport for good.** `vkey setup` for the nRF copies a signed UF2 to
   the bootloader's drive. That is no longer throwaway work.
-- **Test without a spare.** The nRF is empty now, so it is the test board until migration.
-  Afterwards the C6, wiped and kept as the fallback, takes the full
-  `check --wipe-everything` for core changes. nRF-only changes get `selftest` and a `.vkb`
+- **Test without a spare.** Neither board holds real secrets (2026-10-14). The C6 takes
+  the full `check --wipe-everything` for core changes, once a `.vkb` holds its Secure Boot
+  key `vkey-signing`; the nRF takes it while it holds nothing a `.vkb` cannot restore.
+  nRF-only changes get `selftest` and a `.vkb`
   backup before each update. A release then says plainly that the full lifecycle test was
   not re-run on the nRF, as `CLAUDE.md` requires.
 
 ## The rule that orders everything
 
-**Secrets move to the nRF at security parity, not when features are done.** Today the C6
-is the stronger key: the eFuse HMAC key, Secure Boot v2 and JTAG off. The nRF has no chip
-key, and its bootloader flashes anything and serves the flash back (`CURRENT.UF2`). A copy
-of its flash gives up the PIN offline in hours (`docs/threat-model.md`). Until phases 3-5
-are done, real secrets stay on the C6. `espflash` stays in the CLI and the audit exception
-stays open until the migration.
+**Real secrets go onto the nRF when phases 3-5 are done, not when features are done.**
+No board holds real secrets today, and the C6 is a test board, not a fallback
+(2026-10-14), so every feature is built for the nRF alone. The nRF has no chip key, and
+its bootloader flashes anything and serves the flash back (`CURRENT.UF2`). A copy of its
+flash gives up the PIN offline in hours (`docs/threat-model.md`). `espflash` stays in the
+CLI while the C6 is flashed through it, and the audit exception with it.
 
 The order is fixed by what each step depends on. First the **bootloader** with no read-back
 and signed images only: APPROTECT means nothing while UF2 hands out the flash. Then
@@ -65,7 +67,7 @@ and signed images only: APPROTECT means nothing while UF2 hands out the flash. T
 ## Phase 1 - true docs and a board that reports itself
 
 - **The docs pass.** Done 2026-10-13 for `CLAUDE.md`, the README (a "two boards" note; the
-  full rewrite waits for the migration, since the C6 is the key in use until then) and the
+  full rewrite waits until the nRF takes real secrets) and the
   core comments. `docs/hardware.md` and moving the C6 docs into its folder are deferred:
   they describe the C6 correctly as they are.
   - README, `CLAUDE.md` and `docs/hardware.md` put the nRF first.
@@ -369,17 +371,15 @@ strong as phases 3-4. Two options, decided by the maintainer:
   to the C6's eFuse HMAC. It needs Nordic's closed library or undocumented registers,
   which goes against "crypto from RustCrypto".
 
-The existing nRF vault is unbound, so it reads as `Incompatible`. It is wiped, which costs
-nothing while it is empty.
+The existing nRF vault is unbound, so it reads as `Incompatible`. It is wiped and its
+signing key restored from the `.vkb`, which costs nothing while it holds nothing else.
 
-**Migration:**
+**What is left of the migration.** No board holds real secrets (2026-10-14), so nothing
+moves but the keys:
 
-1. Back up the C6 to a `.vkb`.
-2. Restore onto the nRF. The cost travels in the file, so this works across boards.
-3. Check that the signing keys are on the nRF, and write down where their backups live.
-   Losing the C6 Secure Boot key ends C6 updates forever.
-4. Wipe the C6. It becomes the fallback and the test board for core changes.
-5. C6 flashing moves out of the CLI into a script in its folder. `espflash` leaves, and the
+1. Put `vkey-signing`, the C6's Secure Boot key, on the nRF next to the bootloader key,
+   back up to a `.vkb`, and write down where it lives. Losing it ends C6 updates forever.
+2. C6 flashing moves out of the CLI into a script in its folder. `espflash` leaves, and the
    audit exception goes.
 
 Acceptance: the threat model's nRF section is rewritten to match; `selftest` green on the
@@ -413,7 +413,8 @@ Acceptance: registration and login on webauthn.io and with `fido2-token`; `pam_u
 | Phase 2 | ~~if the chip is older than revision 3: accept the glitch risk or keep the important secrets on the C6~~ - revision 2; everything moves here, risk accepted (2026-10-13) |
 | Phase 3 | ~~own bootloader instead of the Nordic secure bootloader~~ - own fork chosen (2026-10-13); installing it still needs its own go |
 | Phase 3 | ~~the signing key's second home~~ - a `.vkb` that restores onto the C6; the C6 is the test board, everything else is on the nRF (2026-10-14) |
-| Phase 5 | chip key option A or B; wiping the C6 after migration |
+| Phase 5 | ~~wiping the C6 after migration~~ - the C6 is a test board, not a fallback, and neither board holds real secrets (2026-10-14) |
+| Phase 5 | chip key option A or B |
 | Phase 6 | RTIC or Embassy, and the `unsafe` rule if the runtime needs it |
 
 ## Sources

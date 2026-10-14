@@ -1,9 +1,9 @@
 # Project rules
 
 **vaulttecdev** — a hardware key for TOTP codes, passwords and project `.env` files, own
-code. Two boards: the Makerdiary nRF52840 MDK USB Dongle (primary, not yet for real
-secrets) and the Waveshare ESP32-C6-Zero (fallback, holds the maintainer's secrets until
-the migration in `docs2/roadmap.md`).
+code. Two boards: the Makerdiary nRF52840 MDK USB Dongle (the key, not yet for real
+secrets) and the Waveshare ESP32-C6-Zero (a test board, not a fallback). Neither holds
+real secrets yet.
 
 | Part | What it is |
 |---|---|
@@ -20,11 +20,11 @@ C6 has no USB HID; reopened 2026-10-03 for the nRF52840 board on Trussed +
 `fido-authenticator`, not an own CTAP2 (maintainer's decision, `docs2/makerdiary.md`). It
 never exists on the C6.
 
-**The nRF52840 board is the primary board; the C6 is the fallback** (maintainer's
-decision, 2026-10-13). Code is shaped for the nRF first. Nothing is kept only so the C6
-works. A C6 need that remains is driven by its board folder or `board.toml`, not by
-shared code. Real secrets move to the nRF at security parity, not when features are done
-(`docs2/roadmap.md`).
+**The nRF52840 board is the key; the C6 is a test board, not a fallback** (maintainer's
+decisions, 2026-10-13 and 2026-10-14). Every feature is built for the nRF. Nothing is kept
+only so the C6 works. A C6 need that remains is driven by its board folder or
+`board.toml`, not by shared code. Real secrets go onto the nRF when phases 3-5 of
+`docs2/roadmap.md` are done, not when features are done.
 
 Consequence for code: "convenience for a buyer" is not an argument; security of the
 maintainer's own secrets and minimal code are.
@@ -155,8 +155,10 @@ The boards:
   base 0x1000) to `UF2BOOT`, replug. No chip key, so it holds no real secrets yet. `vkey
   info` prints the chip's build code, UICR `APPROTECT` and last reset cause. Notes,
   measurements and factory state: `docs2/makerdiary.md`; the plan: `docs2/roadmap.md`.
-- **`esp32c6-zero`**, the fallback, holding the maintainer's secrets until the migration.
-  USB is a fixed Serial/JTAG (`303a:1001`), HID is impossible, so passkey will never exist
+- **`esp32c6-zero`**, the test board (2026-10-14): nothing is built for it, and it takes
+  `check --wipe-everything` for core changes. Secure Boot v2 is burned, so before its
+  first wipe a `.vkb` holding `vkey-signing` (its Secure Boot key) must exist: losing that
+  key ends its updates for good. USB is a fixed Serial/JTAG (`303a:1001`), HID is impossible, so passkey will never exist
   here; one port carries both the protocol and logs — hence the `VTC2` magic word in
   frames. Pins and pitfalls: `docs/hardware.md`.
 
@@ -265,9 +267,10 @@ The boards:
   - Before a **release**, and on every new board: `vkey check --wipe-everything` green too
     (it says when to tap, when to double tap and when to hold). It leaves the device with
     no PIN and no entries, so run it on an empty board — never on a key holding secrets.
-    There is no spare board: until the migration the empty nRF takes this test, afterwards
-    the wiped C6 does for core changes. A release that could not re-run it says so plainly
-    rather than pretending it was.
+    There is no spare board: the C6 takes this test for core changes, once a `.vkb`
+    holds its `vkey-signing`, and the nRF only while it holds nothing a `.vkb` cannot
+    restore. A release that could not re-run it on
+    the nRF says so plainly rather than pretending it was.
 
   Gesture rules are proven on the host (`firmware/core/tests/key.rs`); the board verifies
   the hardware honours them.
