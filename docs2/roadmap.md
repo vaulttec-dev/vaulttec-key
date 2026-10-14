@@ -518,7 +518,27 @@ Acceptance:
 Acceptance: after a reset, the `chip:` line shows the `APPROTECT` low byte at `0x00`; the
 board still updates through UF2; `selftest` green.
 
+**Written 2026-10-15** (`protect` in the board's `main.rs`, run at boot before INFO is
+built). It writes only while the low byte is not 0x00:
+- `NVMC.CONFIG` = WEN, then one store of `0xFFFF_FF00` to 0x10001208, then
+  `CONFIG` = REN, waiting for READY around each step;
+- no retry and no reset. A word that did not stick shows in `vkey info`.
+
+The disassembly holds that sequence and no other store to UICR. The PAC's `write`
+starts from the register's reset value, 0xFFFF_FFFF, so only PALL changes.
+
 ## Phase 5 - chip key, then move daily use
+
+**Skipped on this chip (2026-10-15; the maintainer left the call to the analysis).**
+Once APPROTECT is on, a copy of the flash needs the boot-time glitch. A and B both start
+from a secret the firmware loads out of flash at boot - B only moves it into CryptoCell's
+write-only register afterwards - so the same glitch, before the ACL lock, reads it too.
+Neither adds protection against the one attack left. A would mostly bring `vkey auth`
+back, and phase 6 removes `vkey auth`. B would also break "crypto from RustCrypto". The
+vault stays PIN-only, as `docs/threat-model.md` says. A revision-3 chip would change the
+answer, since its glitch fix leaves the ACL lock standing.
+
+The C6 steps below are not done either: the C6 is left alone (maintainer, 2026-10-14).
 
 **Chip key.** On this chip any secret is loaded by software, so a chip key is only as
 strong as phases 3-4. Two options, decided by the maintainer:
@@ -579,7 +599,8 @@ Acceptance: registration and login on webauthn.io and with `fido2-token`; `pam_u
 | Phase 3 | ~~own bootloader instead of the Nordic secure bootloader~~ - own fork chosen (2026-10-13), installed on the maintainer's go (2026-10-14) |
 | Phase 3 | ~~the signing key's second home~~ - a `.vkb` that restores onto the C6; the C6 is the test board, everything else is on the nRF (2026-10-14) |
 | Phase 5 | ~~wiping the C6 after migration~~ - the C6 is a test board, not a fallback, and neither board holds real secrets (2026-10-14) |
-| Phase 5 | chip key option A or B |
+| Phase 5 | ~~chip key option A or B~~ - neither on this revision-2 chip: the boot-time glitch reads either (2026-10-15) |
+| Phase 6 | ~~passkey backup~~ - a deliberate export into the `.vkb`, outside FIDO's no-export rule (2026-10-15) |
 | Phase 6 | RTIC or Embassy, and the `unsafe` rule if the runtime needs it |
 
 ## Sources

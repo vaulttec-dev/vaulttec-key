@@ -360,6 +360,30 @@ fn chip_report(
     Ok(())
 }
 
+/// Closes the debug port for good: UICR `APPROTECT` goes from erased to Enabled, the low
+/// byte 0x00 and the rest left at 0xFF. On revision 1-2 an erased word leaves SWD open;
+/// on revision 3 it is closed unless UICR holds 0x5A, and 0x00 takes that away. It takes
+/// effect at the next reset. Irreversible with no probe, and harmless to the owner, who
+/// never has one - so the firmware does it itself, the first time it boots.
+///
+/// One attempt, no retry and no reset: a loop around a write that does not stick is how
+/// boards have been reported to hang. A word that did not change shows in `vkey info`.
+/// Nothing else writes UICR, and with the port protected nothing can afterwards.
+fn protect(nvmc: &pac::NVMC, uicr: &pac::UICR) {
+    if uicr.approtect.read().pall().is_enabled() {
+        return;
+    }
+    let ready = || while nvmc.ready.read().ready().is_busy() {};
+    ready();
+    nvmc.config.write(|w| w.wen().wen());
+    ready();
+    // `write` starts from the register's reset value, 0xFFFF_FFFF: only PALL changes.
+    uicr.approtect.write(|w| w.pall().enabled());
+    ready();
+    nvmc.config.write(|w| w.wen().ren());
+    ready();
+}
+
 /// Fail closed: a panic resets the chip. The vault comes back locked, and the statics
 /// that held keys are zeroed again at boot.
 #[panic_handler]
@@ -371,6 +395,9 @@ fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
 fn main() -> ! {
     let p = pac::Peripherals::take().expect("the peripherals are taken once, here");
     let mut cp = cortex_m::Peripherals::take().expect("the core peripherals are taken once, here");
+
+    // Before INFO is written, so the chip line shows the word as it now stands.
+    protect(&p.NVMC, &p.UICR);
 
     let info = INFO.init(heapless::String::new());
     writeln!(info, "{VERSION}")
