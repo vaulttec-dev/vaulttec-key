@@ -1,0 +1,24 @@
+firmware/boards/nrf52840-mdk-dongle/src/main.rs
+  s_211416f9294557::t_ce51ae0a0351f2 363-386
+  s_211416f9294557::t_376198131ffd62 399-401
+docs2/roadmap.md
+  s_211416f9294557::t_c4ae7a6d2203df 532-542
+  s_211416f9294557::t_a321e16ffaee91 521-529
+  s_211416f9294557::t_1871968191dce0 602-603
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "624fb91c523b8571d1df4b90806f054f4d344e17",
+  "prompts": {},
+  "sessions": {
+    "s_211416f9294557": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "676596db-a983-4b94-8e19-40dad5711989",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "VaultTec-Dev <vaulttec-dev@proton.me>"
+    }
+  }
+}
