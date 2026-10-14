@@ -11,7 +11,7 @@ ROOT="$(git rev-parse --show-toplevel)"
 # shellcheck source=tools/checks.sh
 . "$ROOT/tools/checks.sh"
 
-paths=('*.rs' '*.toml' '*.lock' '*.sh' '*.py' '.githooks/*' 'firmware/boards/*/images/*')
+paths=('*.rs' '*.toml' '*.lock' '*.sh' '*.py' '*.pem' '.githooks/*' 'firmware/boards/*/images/*')
 
 git diff --cached --quiet && fail "nothing staged"
 

@@ -322,14 +322,22 @@ back from the factory binary, a patch series, a pinned Arm toolchain, all in Doc
 immediate or a movw/movt pair; like the radio search, not one computed from another base
 plus an offset. The fork runs only images signed with one Ed25519 key, checked on every
 boot (`bootloader/src/signature.c`, tested under qemu-arm by `bootloader/test/run.sh`
-before every build); `bootloader/sign.sh` makes the signed UF2. The build needs
-`bootloader/signing-key.pem`, or `BOOTLOADER_TEST_KEY` for a build that names itself a
-test build. A test-key build also makes `as-app.bin`: the same sources as an application
+before every build); `bootloader/sign.sh` makes the signed UF2. The real key is made
+once by `bootloader/signing-key.sh` and lives on the nRF itself as the `.env`
+`vkey-signing-nrf`, with a `.vkb` as the second copy. Its public half,
+`bootloader/signing-key.pem`, is committed. `bootloader/sign-vaultkey.sh` signs
+`images/vaultkey.bin`, and `images/bootloader.bin` once there, into `*.signed.uf2` (PIN
+and a tap). A hook (`check_signed_uf2`) checks each against its unsigned twin and the
+pem, and checks that `bootloader.bin` names that key. So once the pem exists, every
+firmware change is signed again too. The build needs the pem, or `BOOTLOADER_TEST_KEY`
+for a build that names itself a test build; either is refused if it holds more than a
+public key. A test-key build also makes `as-app.bin`: the same sources as an application
 at 0x1000 that runs under the factory bootloader and reports its verdicts in
 `INFO_UF2.TXT` (`bootloader/test/app_test.c`). `bootloader/test/board.sh copy` puts a UF2
 only on the drive it is meant for: a bootloader UF2 on the factory `UF2BOOT` would be
-installed. Until the fork is installable the outputs stay in a temporary directory, and
-installing it is never part of a build (`docs2/roadmap.md`, phase 3).
+installed. A real-key build writes `images/bootloader.bin`, which no `board.toml` names.
+A test build's outputs stay in a temporary directory. Installing the fork is never part
+of a build (`docs2/roadmap.md`, phase 3).
 
 Compilation is the **only** exception to the check rule. Linters, formatters, tests and
 static analysers are not run without a direct request: git hooks in `.githooks/`

@@ -6,10 +6,10 @@
 #   sign.sh app        VERSION images/vaultkey.bin  PRIVATE.pem OUT.uf2
 #   sign.sh bootloader VERSION bootloader.bin       PRIVATE.pem OUT.uf2
 #
-# PRIVATE.pem is an Ed25519 private key. tools/sign-vaultkey.sh fetches the real one
-# from the vkey into tmpfs and calls this; a test key works the same way, and the
-# bootloader built with its public half (BOOTLOADER_TEST_KEY) is the only one that
-# accepts the result. The signature is checked against the key's public half before
+# PRIVATE.pem is an Ed25519 private key. sign-vaultkey.sh next to this file fetches
+# the real one from the board into tmpfs and calls this; a test key works the same way,
+# and the bootloader built with its public half (BOOTLOADER_TEST_KEY) is the only one
+# that accepts the result. The signature is checked against the key's public half before
 # the UF2 is written, so a bad signature never reaches a file.
 
 set -euo pipefail

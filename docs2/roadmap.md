@@ -328,6 +328,29 @@ Milestones, one commit each:
    is an open speed-up, not done. The vkey firmware was then restored from its signed UF2
    through the factory bootloader, which runs it with the slot at 0x96000: the first
    install step, rehearsed with the test key.
+5. The real key's tools. **Written 2026-10-14; the key is not made yet.**
+   - **`bootloader/signing-key.sh`** makes the Ed25519 key on tmpfs and stores it on the
+     board as the `.env` `vkey-signing-nrf`. It talks to the board through the firmware's
+     own port, so a C6 plugged in beside it never gets the key. It needs a PIN on the board
+     first, writes `signing-key.pem` and prints the fingerprint.
+   - **`bootloader/sign-vaultkey.sh`** takes the key off the board (PIN, one tap). It
+     refuses the key unless its public half is `signing-key.pem`. It then signs
+     `images/vaultkey.bin`, and `images/bootloader.bin` once there, into `*.signed.uf2`.
+     Both are signed as version 1, since the field is not compared yet.
+   - **`tools/build-bootloader.sh`** refuses a key file that is not exactly a public
+     Ed25519 key before it reaches Docker. A build with the real key writes
+     `images/bootloader.bin`.
+   - **The hook's `check_signed_uf2`** makes four checks:
+     - the pem is a public Ed25519 key and nothing else;
+     - each UF2, rebuilt from its unsigned twin with the version and signature from its own
+       slot (`signed_image.py verify`), matches byte for byte;
+     - the signature verifies under the pem;
+     - `bootloader.bin`'s INFO line is `Key: <fingerprint>`, with no `TEST KEY`.
+
+     Tried on the milestone-4 files and on a real-key-mode build with the test key. It
+     passes on those, and fails on a stale image, an altered UF2, a test-key bootloader, a
+     foreign key, and a private, mixed or empty pem.
+   - **`board.toml` names none of these files**, so the CLI embeds none of them.
 
 Install needs its own go and a checklist:
 
@@ -335,16 +358,39 @@ Install needs its own go and a checklist:
 - `SystemInit` disassembled;
 - the board ID confirmed;
 - the update padded to the whole region;
-- the UF2 actually installed is checked block by block. Every target address falls in the
-  MBR, 0xF4000..0xFE000, the settings page at 0xFF000 or the two UICR words, and its
-  0xF4000.. payload equals the checked `bootloader.bin`;
-- the MBR: the update carries Nordic's MBR 2.4.1 and a whole settings page. Read in the
-  update handler what happens to those blocks, and compare the chip's own MBR (the app can
-  read 0x0..0xB00) with 2.4.1;
+- the UF2 actually installed is checked block by block. It has 161 blocks:
+  - 159 of the bootloader at 0xF4000..0xFDF00;
+  - its slot at 0xFDF00;
+  - one UICR block with the two words already on the chip.
+
+  There is no MBR and no settings page in it, and its 0xF4000.. payload equals the checked
+  `bootloader.bin`;
+- the factory bootloader's handling of it. In the published 0.7.1 hex, the handler writes
+  each block 0x14000 lower, to 0xE0000..0xEA000. That is the reserve above the vault, not
+  the vault. It calls `COPY_BL` only if the staged image differs from the running one.
+  Still open: the chip's own bootloader against that hex, and its MBR against 2.4.1. The
+  as-app build can read both;
 - the key reachable from two places, and `signing-key.pem` committed with its
-  fingerprint recorded here;
-- the bootloader being installed names that fingerprint in its INFO text, not "TEST KEY"
-  (`sign.sh` refuses a test-key bootloader unless told);
+  fingerprint recorded here (not made yet):
+  - the `.vkb` is made right after the key;
+  - prove it by restoring it onto the same board and signing again. Ed25519 is
+    deterministic, so `images/` must not change;
+  - restoring it onto the C6, the decided second home, comes only after a `.vkb` of the
+    C6 holding `vkey-signing` exists. A restore replaces everything on the board,
+    `vkey-signing` included. `sign-vaultkey.sh` talks only to this board, so signing from
+    the C6 needs a change made at that point;
+  - the commit that brings the key carries `signing-key.pem`, `images/vaultkey.signed.uf2`
+    and the fingerprint here together. Once the pem is tracked, the hook demands the
+    signed UF2;
+- the bootloader being installed names that fingerprint in its INFO text, not "TEST KEY".
+  `sign.sh` refuses a test-key bootloader unless told, and the hook refuses one in
+  `images/`;
+- `images/bootloader.bin` is what the committed sources and pem build:
+  `tools/build-bootloader.sh` again, then `git diff --exit-code`. The hook does not
+  rebuild it;
+- the time from making the key to installing the fork kept short. Until the fork is in,
+  `CURRENT.UF2` hands the vault, key included, to anyone holding the board
+  (`docs/threat-model.md`);
 - the order: first copy the signed app (real key) through the factory bootloader and
   confirm it boots under it. Then install the fork, and the board must boot straight
   into that app. If it stays in DFU mode instead, copying the signed app UF2 again is

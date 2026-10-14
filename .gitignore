@@ -6,11 +6,13 @@ __pycache__/
 .mypy_cache/
 
 # Keys, should any ever appear in the tree: they do not belong in the repository.
-# The one exception is the public half of the firmware signing key
-# (tools/signing-key.sh) - it is not a secret.
+# The exceptions are the public halves of signing keys - the firmware's
+# (tools/signing-key.sh) and a bootloader fork's (bootloader/signing-key.sh in a board
+# folder, which the git hooks check holds nothing more). Neither is a secret.
 *.key
 *.pem
 !firmware/secure-boot/public.pem
+!firmware/boards/*/bootloader/signing-key.pem
 *.vkb
 
 # Editors

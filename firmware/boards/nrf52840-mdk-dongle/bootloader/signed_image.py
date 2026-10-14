@@ -5,6 +5,10 @@
         its fixed length). Sign it with  openssl pkeyutl -sign -rawin.
     signed_image.py uf2 KIND VERSION IMAGE SIGNATURE OUT
         writes the UF2 to copy to the drive: the image and its slot.
+    signed_image.py verify KIND IMAGE SIGNED OUTDIR
+        fails unless SIGNED is exactly what `uf2` makes of IMAGE with the version and
+        signature in SIGNED's own slot, then writes OUTDIR/message and OUTDIR/signature
+        for  openssl pkeyutl -verify -rawin. The git hooks run it.
 
 KIND is `app` (images/vaultkey.bin, flashed from 0x1000) or `bootloader` (the build's
 bootloader.bin, from 0xF4000). Only the private key is outside this file: the signature
@@ -89,6 +93,15 @@ def build_uf2(k: Kind, version: int, image: bytes, signature: bytes) -> bytes:
     return uf2(blocks, k.family)
 
 
+def slot_of(k: Kind, signed: bytes) -> tuple[int, bytes]:
+    """The version and signature in a signed UF2's slot block."""
+    for at in range(0, len(signed) - 511, 512):
+        if struct.unpack_from("<I", signed, at + 12)[0] == k.slot:
+            slot = signed[at + 32:at + 32 + SLOT]
+            return struct.unpack_from("<I", slot, 8)[0], slot[HEADER:HEADER + 64]
+    raise SystemExit(f"no block at the slot address {k.slot:#x}")
+
+
 def main() -> int:
     args = sys.argv[1:]
     if len(args) == 5 and args[0] == "message":
@@ -100,6 +113,16 @@ def main() -> int:
         k, version = kind_of(args[1]), int(args[2], 0)
         image = image_for(k, Path(args[3]).read_bytes())
         Path(args[5]).write_bytes(build_uf2(k, version, image, Path(args[4]).read_bytes()))
+        return 0
+    if len(args) == 5 and args[0] == "verify":
+        k = kind_of(args[1])
+        image = image_for(k, Path(args[2]).read_bytes())
+        signed = Path(args[3]).read_bytes()
+        version, signature = slot_of(k, signed)
+        if build_uf2(k, version, image, signature) != signed:
+            raise SystemExit(f"{args[3]} is not {args[2]} plus its slot: it was signed from another image")
+        Path(args[4], "message").write_bytes(header(k, version, image) + image)
+        Path(args[4], "signature").write_bytes(signature)
         return 0
     print(__doc__, file=sys.stderr)
     return 2

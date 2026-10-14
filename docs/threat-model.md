@@ -5,7 +5,8 @@
 > There is no sale today, and the document holds all the same: the owner must not rely
 > on guarantees the device does not give.
 
-Last reviewed 2026-09-12; the nRF52840 board section added 2026-10-13. Revisited on every
+Last reviewed 2026-09-12; the nRF52840 board section added 2026-10-13, its signing key
+2026-10-14. Revisited on every
 hardware or firmware change. Reporting policy: [`SECURITY.md`](../SECURITY.md). Board
 details: [`docs/hardware.md`](hardware.md).
 
@@ -35,6 +36,17 @@ and every guarantee below that rests on the eFuse key, JTAG being off or Secure 
   Firmware that records the PIN on its next use is one file copy away.
 - **`vkey auth` does not exist here.** Its secret is sealed under the chip key, and the
   CLI refuses to enable it.
+- **The bootloader fork's signing key lives on this board.** It is the `.env`
+  `vkey-signing-nrf`, made by `bootloader/signing-key.sh`, with a `.vkb` as its second
+  copy. Everything above applies to it:
+  - until the fork is installed, `CURRENT.UF2` and the offline PIN search hand it to anyone
+    who holds the board for a minute and then computes for a few hours;
+  - after that, SWD does the same until APPROTECT, and the glitch after that.
+
+  Whoever has the key signs firmware the fork runs. By design, the fork moves to a new key
+  only through a self-update signed with the old one. A leak is mended only while the
+  owner still holds the key. So the time from making the key to installing the fork is
+  kept short.
 - **A backup made on this board uses its own cost** (20 passes). It is still guarded by
   the passphrase's entropy, at less than half the C6's work per guess.
 

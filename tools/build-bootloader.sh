@@ -28,9 +28,10 @@
 # commit with bootloader/'s board definition and patches, built and checked by
 # bootloader/build.sh in bootloader/Dockerfile. It trusts one Ed25519 public key:
 # bootloader/signing-key.pem, or with BOOTLOADER_TEST_KEY=<pem> a throwaway key, which
-# INFO_UF2.TXT then names as a test key. Until the fork is installable
-# (docs2/roadmap.md, phase 3) the outputs stay in a temporary directory: nothing goes
-# into images/, and nothing is installed.
+# INFO_UF2.TXT then names as a test key. Either must be a public key and nothing else.
+# A build with the real key copies bootloader.bin into images/, for bootloader/
+# sign-vaultkey.sh to sign and the git hooks to check; a test build leaves its outputs
+# in a temporary directory. Nothing is ever installed (docs2/roadmap.md, phase 3).
 
 set -euo pipefail
 
@@ -38,7 +39,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BOARDS="$ROOT/firmware/boards"
 IDF_IMAGE="espressif/idf:v5.5"
 
-command -v docker >/dev/null || { echo "docker is missing" >&2; exit 1; }
+for tool in docker openssl; do
+    command -v "$tool" >/dev/null || { echo "$tool is missing" >&2; exit 1; }
+done
 toml_value() { grep -E "^$2\s*=" "$1" | head -1 | cut -d'"' -f2; }
 
 build_esp() {
@@ -100,6 +103,13 @@ build_uf2() {
         echo "  a test build:  BOOTLOADER_TEST_KEY=<Ed25519 public key .pem> $0" >&2
         exit 1
     }
+    # Checked before it is mounted into the build: a file equal to its own public
+    # re-encoding holds no private key.
+    if [[ "$(openssl pkey -pubin -in "$key" -noout -text 2>/dev/null)" != "ED25519 Public-Key:"* ]] \
+        || ! openssl pkey -pubin -in "$key" 2>/dev/null | cmp -s - "$key"; then
+        echo "$name: $key must be an Ed25519 public key and nothing else" >&2
+        exit 1
+    fi
     docker build -q -t "vkey-bootloader-$name" "$dir/bootloader" >/dev/null
     out="$(mktemp -d)"
     log="$out/build.log"
@@ -114,7 +124,13 @@ build_uf2() {
     fi
     grep -E "^ *(FLASH|BOOTLOADER_CONFIG):|^check:|^signature test:|^key:" "$log" || true
     (cd "$out" && sha256sum bootloader.bin)
-    echo "$name: outputs in $out - not installed, not copied into images/"
+    if [[ "$kind" == real ]]; then
+        cp "$out/bootloader.bin" "$dir/images/bootloader.bin"
+        echo "$name: images/bootloader.bin (the rest in $out), not installed"
+        echo "sign it next:  firmware/boards/$name/bootloader/sign-vaultkey.sh"
+    else
+        echo "$name: outputs in $out - a test build, not installed, not copied into images/"
+    fi
 }
 
 if [[ -n "${BOARD:-}" ]]; then
