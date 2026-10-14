@@ -12,7 +12,9 @@
  *     staged there.
  *
  * Each verdict and the cycles DWT counted for it go into INFO_UF2.TXT: with no serial
- * port and no probe, the drive is the only way out.
+ * port and no probe, the drive is the only way out. So does what the install leans on:
+ * the leading bytes of the SHA-512 of the chip's MBR page and of its factory bootloader,
+ * for the host to compare with Nordic's MBR 2.4.1 and the published 0.7.1 hex.
  */
 
 #include <stdarg.h>
@@ -24,6 +26,7 @@
 #include "app_util.h"
 #include "boards.h"
 #include "uf2/uf2.h"
+#include "monocypher-ed25519.h"
 #include "signature.h"
 
 /* Where test/board.py puts the app: the image, then its slot and the altered slot. */
@@ -61,6 +64,17 @@ static void check(char const *what, uint8_t const *image, uint8_t const *slot,
       want == NULL ? "" : strcmp(verdict, want) == 0 ? " - ok" : " - WRONG");
 }
 
+/* The first four bytes of the digest in byte order, as `sha512sum | cut -c1-8` prints. */
+static void digest(char const *what, uint32_t start, uint32_t end) {
+  uint8_t const *flash = (uint8_t const *) start;
+  // The MBR starts at address 0, which C calls null: hidden from the compiler, the
+  // pointer is read like any other instead of becoming a trap.
+  __asm__ volatile("" : "+r"(flash));
+  uint8_t hash[64];
+  crypto_sha512(hash, flash, end - start);
+  say(" %s %02x%02x%02x%02x", what, hash[0], hash[1], hash[2], hash[3]);
+}
+
 void app_test_run(void) {
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
   DWT->CYCCNT = 0;
@@ -68,6 +82,11 @@ void app_test_run(void) {
 
   say("Test: as app at 0x%X, ICACHECNF 0x%lX\r\n", MBR_SIZE,
       (unsigned long) NRF_NVMC->ICACHECNF);
+  // Before the checks, so that if INFO_UF2.TXT runs out of room it cuts those instead.
+  say("Chip:");
+  digest("MBR", 0, MBR_SIZE);
+  digest("BL", BOOTLOADER_REGION_START, BOOTLOADER_MBR_PARAMS_PAGE_ADDRESS);
+  say("\r\n");
 
   uint8_t const *image = (uint8_t const *) TEST_APP_IMAGE;
   check("app", image, (uint8_t const *) TEST_APP_SLOT, SIGNATURE_KIND_APP, REAL_APP_MAX,

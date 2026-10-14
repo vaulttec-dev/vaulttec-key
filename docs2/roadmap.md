@@ -307,6 +307,8 @@ Milestones, one commit each:
      UICR search, and it must contain no `svc` and end below 0x40000.
    - **`test/app_test.c`** makes the bootloader's own `signature_valid` calls before the
      drive starts and writes each verdict with its DWT cycle count into `INFO_UF2.TXT`.
+     Since the install checklist, the file also carries a `Chip:` line: the leading bytes
+     of the SHA-512 of the chip's MBR page and of its factory bootloader.
      **`test/board.py`** moves the real-pipeline signed app into the scratch window (the
      signature covers no address). **`test/board.sh copy`** reads the target drive's
      `INFO_UF2.TXT` first: a bootloader UF2 goes only to `VKEYTEST`, never to the factory
@@ -360,22 +362,62 @@ Milestones, one commit each:
 
 Install needs its own go and a checklist:
 
-- no UICR address (0x10001xxx) and no NVMC `CONFIG` write in the binary;
-- `SystemInit` disassembled;
-- the board ID confirmed;
-- the update padded to the whole region;
-- the UF2 actually installed is checked block by block. It has 161 blocks:
+- no UICR address (0x10001xxx) in the binary (`check.py`), and no erase beyond a page.
+  Done 2026-10-14 on the real-key build. Three functions use the NVMC:
+  - `nrfx_nvmc_page_erase` sets `CONFIG` to 2 and erases through `ERASEPAGE`;
+  - `nrfx_nvmc_words_write` and `nvmc_word_write` set it to 1, then back to 0.
+
+  They are called only from `flash_nrf5x_flush`, the app window, and from
+  `bootloader_dfu_update_process`, the settings page. No store reaches `ERASEALL` or
+  `ERASEUICR`;
+- `SystemInit` disassembled. Done 2026-10-14: as in milestone 1, it stores to CLOCK,
+  POWER, errata registers and `CPACR`, reads FICR, and never touches UICR;
+- the board ID confirmed. Done 2026-10-14: the CF2 block is the factory's (`check.py`),
+  and the update UF2 carries 0x2886F00F;
+- the update padded to the whole region. Done 2026-10-14: 0xF4000..0xFE000 is covered
+  with no gap;
+- the UF2 actually installed is checked block by block. Done 2026-10-14 on
+  `images/bootloader.signed.uf2`. It has 161 blocks:
   - 159 of the bootloader at 0xF4000..0xFDF00;
   - its slot at 0xFDF00;
-  - one UICR block with the two words already on the chip.
+  - one UICR block holding 0xF4000 and 0xFE000 at 0x14 and 0x18 and 0xFF everywhere
+    else. The factory handler only compares those two words with its own constants and
+    writes nothing to UICR.
 
   There is no MBR and no settings page in it, and its 0xF4000.. payload equals the checked
-  `bootloader.bin`;
+  `bootloader.bin` (`signed_image.py verify`). The headers, which decide when the factory
+  flushes and calls `COPY_BL`, are also right: `blockNo` runs 0..160 in order,
+  `numBlocks` is 161 and the payload 256 in every block, with flag 0x2000 and both
+  magics;
+- the jump into the app, which never ran in milestone 4, put next to the factory's.
+  Done 2026-10-14. `board_teardown`, the cleared NVIC lines, `sd_mbr_command` 6 with
+  0x1000, and `bootloader_util_reset` (MSP from 0x1000, PC from 0x1004) are the factory's
+  instructions one for one. The only change is that the SoftDevice branch is gone. The
+  factory takes it only when 0x3004 holds the SoftDevice magic, and vkey does not, so
+  vkey already boots today through the path the fork keeps;
 - the factory bootloader's handling of it. In the published 0.7.1 hex, the handler writes
   each block 0x14000 lower, to 0xE0000..0xEA000. That is the reserve above the vault, not
   the vault. It calls `COPY_BL` only if the staged image differs from the running one.
-  Still open: the chip's own bootloader against that hex, and its MBR against 2.4.1. The
-  as-app build can read both;
+
+  **The chip against the published files, 2026-10-14.** Two readings agree:
+  - the as-app build hashed the chip's MBR page and 0xF4000..0xFE000 with SHA-512;
+  - `dd` of those sectors of the factory drive returned the same bytes. The drive serves
+    flash past `CURRENT.UF2`, and only 0xF4000..0x100000 was read.
+
+  What they showed:
+  - **MBR.** The page is Nordic's 2.4.1 byte for byte (`0a1d2691`), with 0xFF8 and 0xFFC
+    erased. So it boots the bootloader from UICR `NRFFW[0]`, and `COPY_BL` takes its
+    parameter page from `NRFFW[1]`. The MBR header says `COPY_BL` returns
+    `NRF_ERROR_NO_MEM` without either. UICR itself was not read, since `check.py` keeps
+    every UICR address out of the test build.
+  - **Bootloader.** The code is the published 0.7.1 hex (Jul 20 2023, "SoftDevice: not
+    found") byte for byte. Only 34 bytes differ:
+    - at 0xFD000, `0xDEADC0DE 0xF11E01FF`, a Nordic FDS swap-page tag that some earlier
+      application wrote. The bootloader's code holds neither word. The CF2 block at
+      0xFD800 is intact, and `COPY_BL` overwrites the page;
+    - at 0xFF000, the bootloader's own settings page.
+
+    The handler analysed in the hex is the one on the chip.
 - the key reachable from two places, and `signing-key.pem` committed with its
   fingerprint recorded here, `a1700ebd539b0bfc`:
   - the `.vkb` is made right after the key (done 2026-10-14);
@@ -393,18 +435,22 @@ Install needs its own go and a checklist:
   `images/`;
 - `images/bootloader.bin` is what the committed sources and pem build:
   `tools/build-bootloader.sh` again, then `git diff --exit-code`. The hook does not
-  rebuild it;
+  rebuild it. Done 2026-10-14, twice, the second time after the as-app readback change;
 - the time from making the key to installing the fork kept short. Until the fork is in,
   `CURRENT.UF2` hands the vault, key included, to anyone holding the board
   (`docs/threat-model.md`);
 - the order: first copy the signed app (real key) through the factory bootloader and
-  confirm it boots under it. Then install the fork, and the board must boot straight
+  confirm it boots under it (done 2026-10-14: `vaultkey.signed.uf2`, `vkey info`, the
+  PIN and its 8 attempts intact). Then install the fork, and the board must boot straight
   into that app. If it stays in DFU mode instead, copying the signed app UF2 again is
   the next step.
 
 **The risk, stated plainly.** A bug in the new bootloader leaves a board no USB tool can
-reach. Without a probe that is a new dongle. That is acceptable only because the board
-holds nothing yet.
+reach. Without a probe that is a new dongle. Since 2026-10-14 the board holds the signing
+key. A brick therefore costs the board but not the key: the `.vkb` is proven by a restore
+and opens on any vkey, including a new factory dongle, which then takes this same fork.
+The power-fail safety of `COPY_BL` is Nordic's claim, untested here, so the board stays
+plugged in until it comes back.
 
 Acceptance:
 

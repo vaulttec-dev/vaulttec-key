@@ -329,6 +329,11 @@ Open questions only the board answers:
   2023-07-20, S132 5.1.0 plus the connectivity app in 0x1000..0x35000 and one page at
   0x50000) is all 0xFF over 0x97000..0xD8000. Kept at `~/mdk-factory/`, sha256
   `3022eb28...6aab`; it restores through the same drive.
+- ~~Is the chip's bootloader the published 0.7.1?~~ Yes (2026-10-14, `docs2/roadmap.md`
+  phase 3 checklist). Its code equals the published `-nosd.hex` byte for byte, and the
+  MBR page is Nordic's 2.4.1 with 0xFF8/0xFFC erased. Beside the settings page at
+  0xFF000, one thing differs: a Nordic FDS swap-page tag at 0xFD000 that an earlier
+  application wrote into the bootloader's last page, below its CF2 block.
 - ~~Green LED on P0.22?~~ Yes, as far as `vkey check` shows: Adafruit's `board.h` lists
   only red P0.23 and blue P0.24, but amber is red plus green, and the taps on amber went
   through. Red alone (the 5 s hold) has not been watched yet.
