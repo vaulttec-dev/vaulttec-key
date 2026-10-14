@@ -7,7 +7,7 @@
 //! frame from a known geometry and drawing it again - nothing is left to a widget
 //! library's guesses.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -39,6 +39,14 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     ("unlock", "enter the PIN now"),
     ("lock", "forget the key until the next PIN"),
+    (
+        "settings",
+        "PIN, backup and restore, self-test, setup, factory reset",
+    ),
+];
+/// Behind `/settings`: what is done to the key rather than with an entry. They still
+/// resolve when typed, so `/pin` and `/backup` work as before.
+const SETTINGS: &[(&str, &str)] = &[
     ("pin", "set or change the PIN"),
     (
         "wipe",
@@ -169,13 +177,14 @@ fn resolve_command(word: &str) -> Option<&'static str> {
     if let Some(n) = LIST_COMMANDS
         .iter()
         .copied()
-        .chain(COMMANDS.iter().map(|(n, _)| *n))
+        .chain(COMMANDS.iter().chain(SETTINGS).map(|(n, _)| *n))
         .find(|n| *n == w)
     {
         return Some(n);
     }
     let hits: Vec<&str> = COMMANDS
         .iter()
+        .chain(SETTINGS)
         .map(|(n, _)| *n)
         .filter(|n| n.starts_with(&w))
         .collect();
@@ -414,6 +423,18 @@ enum Tab {
     Of(Category),
 }
 
+/// The level above the tabs: the 1Password vaults the entries came from, then one of
+/// them. `In(None)` is what no vault owns - added by hand, imported from a CSV, or a
+/// Developer Environment, which belongs to the account rather than a vault.
+#[derive(Clone, PartialEq, Eq)]
+enum Shelf {
+    Vaults,
+    In(Option<String>),
+}
+
+/// The row that stands for entries no vault owns.
+const NO_VAULT: &str = "(no vault)";
+
 impl Tab {
     fn label(self) -> &'static str {
         match self {
@@ -476,6 +497,10 @@ pub struct Shell {
     known: HashMap<String, Known>,
     /// Which tab of `/list` is showing.
     tab: Tab,
+    /// The 1Password vault each entry came from, as the last sync on this host saw it.
+    vaults: BTreeMap<String, String>,
+    /// Whether `/list` shows the vaults or the inside of one.
+    shelf: Shelf,
     unlocked: bool,
     has_pin: bool,
     retries: u8,
@@ -498,6 +523,8 @@ pub fn run(dev: Device, version: Option<String>) -> Result<u8, Error> {
         entries: Vec::new(),
         known: HashMap::new(),
         tab: Tab::All,
+        vaults: BTreeMap::new(),
+        shelf: Shelf::Vaults,
         unlocked: false,
         has_pin: true,
         retries: MAX_ATTEMPTS,
@@ -678,7 +705,16 @@ impl Shell {
         if listing {
             let open = self.tab;
             let mut parts = vec![(Color::Reset, "   ".to_string())];
-            for (i, t) in self.tabs().iter().enumerate() {
+            // The vault level has no tabs; inside a vault its name leads them.
+            let place = match &self.shelf {
+                _ if self.vaults.is_empty() => None,
+                Shelf::Vaults => Some((ACCENT, "vaults".to_string())),
+                Shelf::In(v) => Some((DIM, format!("{} ▸ ", v.as_deref().unwrap_or(NO_VAULT)))),
+            };
+            let at_vaults = self.at_vaults();
+            parts.extend(place);
+            let tabs = if at_vaults { Vec::new() } else { self.tabs() };
+            for (i, t) in tabs.iter().enumerate() {
                 if i > 0 {
                     parts.push((DIM, " · ".into()));
                 }
@@ -718,6 +754,10 @@ impl Shell {
         // like the firmware label above, so the keys show whatever the status row's
         // width leaves.
         let legend = match (self.letters_act(), listing) {
+            _ if listing && self.at_vaults() => " Enter open · type to search ",
+            (true, true) if !self.vaults.is_empty() => {
+                " Enter use · type to search · a e d i · ← → tab · Esc vaults "
+            }
             (true, true) => {
                 " Enter use · type to search · a add · e edit · d delete · i import · ← → tab "
             }
@@ -845,6 +885,7 @@ impl Shell {
     /// the whole of it.
     fn relist(&mut self) -> Result<(), Error> {
         self.entries.clear();
+        self.vaults = op::load_vault_map();
         let entries = self.dev()?.list()?;
         // One request per item, and what it says changes only when the item is
         // rewritten - where `forget_logins` drops it. Asking again for what is already
@@ -1205,12 +1246,20 @@ impl Shell {
     /// why the list holds nothing but items. The category is a column, not a tab:
     /// there are twenty-four of them now, and an item can be a login and a TOTP code
     /// at once.
-    fn cmd_list(&mut self) -> Result<(), Error> {
+    /// `/list [vault]`: the vaults, or straight into one. Enter on a vault runs this
+    /// too, so a key that locked meanwhile asks for the PIN before the vault opens.
+    fn cmd_list(&mut self, vault: &str) -> Result<(), Error> {
         self.ensure_unlocked()?;
         self.relist()?;
         if self.entries.is_empty() {
             self.line(DIM, "  nothing stored yet - a adds, i imports");
         }
+        self.shelf = match vault.trim() {
+            "" => Shelf::Vaults,
+            NO_VAULT => Shelf::In(None),
+            v => Shelf::In(Some(v.to_string())),
+        };
+        self.tab = Tab::All;
         self.open_list();
         Ok(())
     }
@@ -1219,12 +1268,60 @@ impl Shell {
     fn open_list(&mut self) {
         self.input.clear();
         self.cursor = 0;
+        let items = if self.at_vaults() {
+            self.vault_groups()
+                .into_iter()
+                .map(|(vault, n)| Row {
+                    text: vault.unwrap_or_else(|| NO_VAULT.to_string()),
+                    login: String::new(),
+                    what: format!("{n} item{}", if n == 1 { "" } else { "s" }),
+                })
+                .collect()
+        } else {
+            self.tab_entries()
+        };
         self.menu = Some(Menu {
-            items: self.tab_entries(),
+            items,
             selected: None,
             first: 0,
             kind: MenuKind::List,
         });
+    }
+
+    /// Whether `/list` shows the vaults. Never before a sync has named any: then the
+    /// level would hold one row, and the tabs are what was always shown.
+    fn at_vaults(&self) -> bool {
+        self.shelf == Shelf::Vaults && !self.vaults.is_empty()
+    }
+
+    fn vault_of(&self, e: &Stored) -> Option<String> {
+        self.vaults.get(&e.name).cloned()
+    }
+
+    /// The vaults the key's entries came from with how many each, by name, and what no
+    /// vault owns last.
+    fn vault_groups(&self) -> Vec<(Option<String>, usize)> {
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut loose = 0;
+        for e in &self.entries {
+            match self.vault_of(e) {
+                Some(v) => *counts.entry(v).or_default() += 1,
+                None => loose += 1,
+            }
+        }
+        let mut groups: Vec<(Option<String>, usize)> =
+            counts.into_iter().map(|(v, n)| (Some(v), n)).collect();
+        if loose > 0 {
+            groups.push((None, loose));
+        }
+        groups
+    }
+
+    fn in_shelf(&self, e: &Stored) -> bool {
+        match &self.shelf {
+            Shelf::Vaults => true,
+            Shelf::In(v) => self.vault_of(e) == *v,
+        }
     }
 
     /// Whether `/list` is what is showing.
@@ -1865,41 +1962,29 @@ impl Shell {
         let done = if query.is_empty() {
             self.line(Color::Blue, "  ● 1Password Developer Environments (.env)");
 
-            let saved = op::load_saved_envs();
-            let mut env_pairs = Vec::new();
-
-            if !saved.is_empty() {
-                let mut env_list: Vec<(String, String)> = saved.into_iter().collect();
-                env_list.sort_by(|a, b| a.0.cmp(&b.0));
-
-                let prompt_label = format!("include {} saved Environment(s)?", env_list.len());
-                let include_saved = self.choose(
-                    &prompt_label,
-                    &[
-                        (true, "update saved", "include all saved environments"),
-                        (
-                            false,
-                            "custom / add new",
-                            "add or enter environments manually",
-                        ),
-                    ],
-                );
-                if include_saved == Some(true) {
-                    env_pairs.extend(env_list);
-                }
+            // `op` cannot list Developer Environments, so the saved ones are the whole
+            // known set: every sync takes all of them, and a new one is only ever added.
+            let mut env_pairs: Vec<(String, String)> = op::load_saved_envs().into_iter().collect();
+            env_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            // With some saved, the run just takes them: asking every time for one more
+            // is a question nobody needs. A new one comes in through /op env.
+            for (name, id) in &env_pairs {
+                self.line(DIM, &format!("    saved: {name} ({id})"));
             }
-
             if env_pairs.is_empty() {
                 self.line(
                     DIM,
                     "    (in 1Password: Developer -> View Environments -> View environment -> Manage environment -> Copy environment ID)",
                 );
-
                 while let Some(pair) =
                     self.ask_env("add Environment (name or name:ID, Enter to proceed): ")
                 {
-                    env_pairs.push(pair);
+                    if !env_pairs.iter().any(|(n, _)| *n == pair.0) {
+                        env_pairs.push(pair);
+                    }
                 }
+            } else {
+                self.line(DIM, "    (another one: /op env)");
             }
 
             let env_refs: Vec<(&str, &str)> = env_pairs
@@ -2170,6 +2255,19 @@ impl Shell {
         }
     }
 
+    /// `/settings`: one of the commands that act on the key itself.
+    fn cmd_settings(&mut self) -> Result<(), Error> {
+        let options: Vec<(usize, &str, &str)> = SETTINGS
+            .iter()
+            .enumerate()
+            .map(|(i, (name, desc))| (i, *name, *desc))
+            .collect();
+        let Some(at) = self.choose("settings:", &options) else {
+            return Ok(());
+        };
+        self.dispatch(&format!("/{}", SETTINGS[at].0))
+    }
+
     /// A `/command [arg]` runs the command; anything else is the name of an entry to
     /// use, and an empty line offers the list of them. Leaving is Ctrl-D, not a command.
     fn dispatch(&mut self, line: &str) -> Result<(), Error> {
@@ -2207,7 +2305,7 @@ impl Shell {
         }
         let r = match cmd {
             "use" => self.cmd_use(arg),
-            "list" => self.cmd_list(),
+            "list" => self.cmd_list(arg),
             "add" => self.cmd_add(arg),
             "edit" => self.cmd_edit(arg),
             "rm" => self.cmd_rm(arg),
@@ -2220,6 +2318,7 @@ impl Shell {
                 }
             }
             "lock" => self.dev()?.lock().map(|()| self.refresh()),
+            "settings" => self.cmd_settings(),
             "pin" => self.cmd_pin(),
             "wipe" => self.cmd_wipe(),
             "setup" => self.cmd_setup(arg),
@@ -2299,6 +2398,9 @@ impl Shell {
     }
 
     fn in_tab(&self, e: &Stored) -> bool {
+        if !self.in_shelf(e) {
+            return false;
+        }
         match self.tab {
             Tab::All => true,
             Tab::Totp => self.known.get(&e.name).is_some_and(|k| k.has_seed),
@@ -2311,11 +2413,12 @@ impl Shell {
     /// drawn, so a tab never outlives what put it there.
     fn tabs(&self) -> Vec<Tab> {
         let mut tabs = vec![Tab::All];
-        if self.entries.iter().any(|e| self.in_seed_tab(e)) {
+        let shown = || self.entries.iter().filter(|e| self.in_shelf(e));
+        if shown().any(|e| self.in_seed_tab(e)) {
             tabs.push(Tab::Totp);
         }
         let mut counts: Vec<(Category, usize)> = Vec::new();
-        for e in &self.entries {
+        for e in shown() {
             match counts.iter_mut().find(|(c, _)| *c == e.category) {
                 Some((_, n)) => *n += 1,
                 None => counts.push((e.category, 1)),
@@ -2395,8 +2498,9 @@ impl Shell {
     }
 
     fn letters_act(&self) -> bool {
+        // A vault row is not an entry: e or d on it would edit or delete by its name.
         self.menu.as_ref().is_some_and(|m| match m.kind {
-            MenuKind::List => true,
+            MenuKind::List => !self.at_vaults(),
             MenuKind::Names => m.selected.is_some(),
             MenuKind::Commands => false,
         })
@@ -2468,7 +2572,40 @@ impl Shell {
             .map_or(self.cursor, |c| self.cursor + c.len_utf8())
     }
 
+    /// The keys the vault level of `/list` answers differently: Enter goes into the
+    /// highlighted vault, Esc inside one steps back out to the vaults.
+    fn vault_key(&mut self, code: KeyCode) -> Option<Key> {
+        if !self.listing() {
+            return None;
+        }
+        match code {
+            KeyCode::Enter if self.at_vaults() => {
+                // A vault is a place to go into, not a name to run.
+                let Some(vault) = self
+                    .menu
+                    .as_ref()
+                    .and_then(|m| m.selected.map(|at| m.items[at].text.clone()))
+                else {
+                    return Some(Key::Redraw);
+                };
+                self.input.clear();
+                self.cursor = 0;
+                self.menu = None;
+                Some(Key::Submit(format!("/list {vault}")))
+            }
+            KeyCode::Esc if matches!(self.shelf, Shelf::In(_)) && !self.vaults.is_empty() => {
+                self.shelf = Shelf::Vaults;
+                self.open_list();
+                Some(Key::Redraw)
+            }
+            _ => None,
+        }
+    }
+
     fn handle_key(&mut self, k: KeyEvent) -> Key {
+        if let Some(key) = self.vault_key(k.code) {
+            return key;
+        }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
             KeyCode::Enter => {
@@ -2515,8 +2652,9 @@ impl Shell {
             }
             // In the list the arrows turn the tab; a highlighted name there is not
             // something to edit in place.
-            KeyCode::Left if self.listing() => self.shift_tab(Dir::Prev),
-            KeyCode::Right if self.listing() => self.shift_tab(Dir::Next),
+            KeyCode::Left if self.listing() && !self.at_vaults() => self.shift_tab(Dir::Prev),
+            KeyCode::Right if self.listing() && !self.at_vaults() => self.shift_tab(Dir::Next),
+            KeyCode::Left | KeyCode::Right if self.listing() => {}
             KeyCode::Left => self.cursor = self.prev_char(),
             KeyCode::Right => self.cursor = self.next_char(),
             KeyCode::Home => self.cursor = 0,

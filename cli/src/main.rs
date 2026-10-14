@@ -642,19 +642,21 @@ fn run_op(
         }
     }
 
-    if item.is_none() && env_pairs.is_empty() && prompt::is_tty() {
-        println!("  ● 1Password Developer Environments (.env)");
-        if !saved.is_empty() {
-            println!("    Saved environments:");
-            for (name, id) in &saved {
+    // `op` cannot list Developer Environments, so the saved ones are the whole known set:
+    // a run that names none takes all of them, and a new one is only ever added.
+    if item.is_none() && env_pairs.is_empty() {
+        env_pairs.extend(saved);
+        env_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        if prompt::is_tty() {
+            println!("  ● 1Password Developer Environments (.env)");
+            for (name, id) in &env_pairs {
                 println!("      • {name} (ID: {id})");
             }
-            if prompt::yes_no("update saved environments?") {
-                env_pairs.extend(saved);
-            }
         }
-
-        if env_pairs.is_empty() {
+        // With some saved, the run just takes them; a new one comes in through -E.
+        if !env_pairs.is_empty() && prompt::is_tty() {
+            println!("    (another one: vkey op -E name:ID)");
+        } else if prompt::is_tty() {
             println!(
                 "    (in 1Password: Developer -> View Environments -> View environment -> Manage environment -> Copy environment ID)"
             );
@@ -679,7 +681,9 @@ fn run_op(
                     }
                     (trimmed.to_string(), id_trimmed)
                 };
-                env_pairs.push((name, id));
+                if !env_pairs.iter().any(|(n, _)| *n == name) {
+                    env_pairs.push((name, id));
+                }
             }
         }
     }

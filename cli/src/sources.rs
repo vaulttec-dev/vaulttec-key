@@ -27,7 +27,6 @@ use crate::prompt::SyncUi;
 /// The buckets a name can belong to. A name has exactly one owner: the sync that
 /// wrote it last.
 pub const OP_ITEM: &str = "op:item";
-pub const OP_DOC: &str = "op:doc";
 pub const OP_ENV: &str = "op:env";
 pub const FILE: &str = "file";
 
@@ -423,7 +422,7 @@ mod tests {
 
     #[test]
     fn prunes_only_what_the_bucket_owns_and_the_source_dropped() {
-        let m = manifest(&[("gone", OP_ITEM), ("kept", OP_ITEM), ("doc", OP_DOC)]);
+        let m = manifest(&[("gone", OP_ITEM), ("kept", OP_ITEM), ("doc", OP_ENV)]);
         let prune = m.to_prune(OP_ITEM, &set(&["kept"]), &set(&["gone", "kept", "doc"]));
         assert_eq!(prune, vec!["gone".to_string()]);
     }
@@ -498,7 +497,7 @@ mod tests {
             ("AWS:alice", OP_ITEM),
             ("AWS:bob", OP_ITEM),
             ("AWSomeApp", OP_ITEM),
-            ("AWS:doc", OP_DOC),
+            ("AWS:doc", OP_ENV),
         ]);
         let family = m.family(OP_ITEM, "AWS");
         assert!(family.contains(&"AWS".to_string()));

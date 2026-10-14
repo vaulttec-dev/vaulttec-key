@@ -152,6 +152,11 @@ will not take them back as that item's attachment. Items that are only an attach
 the maintainer's three signing-key documents - are named in the import summary and left
 where they are.
 
+Since 2026-10-15 (maintainer's decision) the sync leaves every Document item in
+1Password: it is a file, and the key is no file store. The separate pass that read
+documents as `.env` files is gone too; a `.env` comes in as a Secure Note. Both can be
+restored from commit `7c50caf` (`cli/src/op.rs`, `Mirror::documents`, `process_document`).
+
 ## What this costs, honestly
 
 - ~3-4k lines of the 12.5k in the repo are touched.
