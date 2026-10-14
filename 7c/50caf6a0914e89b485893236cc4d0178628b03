@@ -1,0 +1,25 @@
+docs2/roadmap.md
+  s_211416f9294557::t_9f3ca83149d1a3 461-466
+  s_211416f9294557::t_ab261cd8b38c08 493-501
+  s_211416f9294557::t_451dbef8e49cec 476-486
+  s_211416f9294557::t_2000673b18bcaa 487-492
+docs/threat-model.md
+  s_211416f9294557::t_c4e7a201e5edea 37-39,41-44
+  s_211416f9294557::t_c4ade4793cd4f1 49-51
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7c50caf6a0914e89b485893236cc4d0178628b03",
+  "prompts": {},
+  "sessions": {
+    "s_211416f9294557": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "676596db-a983-4b94-8e19-40dad5711989",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "VaultTec-Dev <vaulttec-dev@proton.me>"
+    }
+  }
+}
