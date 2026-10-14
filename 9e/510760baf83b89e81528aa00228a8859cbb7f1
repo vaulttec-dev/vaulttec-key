@@ -1,0 +1,30 @@
+firmware/boards/nrf52840-mdk-dongle/bootloader/test/app_test.c
+  s_211416f9294557::t_b59cbdef8fb3a5 15-17
+  s_211416f9294557::t_1d0a4939c76fd2 29
+  s_211416f9294557::t_901e1b59855f4e 67-77,85-89
+docs2/makerdiary.md
+  s_211416f9294557::t_b4c428e74c51dc 332-336
+docs2/roadmap.md
+  s_211416f9294557::t_08e118dabd6b20 438
+  s_211416f9294557::t_dac2283028937f 443-444
+  s_211416f9294557::t_4498156850de3e 310-311
+  s_211416f9294557::t_8fdfc83c8fcb49 449-453
+  s_211416f9294557::t_360511138ad2f9 365-380,383-385,401-420
+  s_211416f9294557::t_000db599d2bb65 388-397
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9e510760baf83b89e81528aa00228a8859cbb7f1",
+  "prompts": {},
+  "sessions": {
+    "s_211416f9294557": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "676596db-a983-4b94-8e19-40dad5711989",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "VaultTec-Dev <vaulttec-dev@proton.me>"
+    }
+  }
+}
