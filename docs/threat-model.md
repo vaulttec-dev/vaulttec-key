@@ -37,8 +37,8 @@ and every guarantee below that rests on the eFuse key, JTAG being off or Secure 
 - **`vkey auth` does not exist here.** Its secret is sealed under the chip key, and the
   CLI refuses to enable it.
 - **The bootloader fork's signing key lives on this board.** It is the `.env`
-  `vkey-signing-nrf`, made by `bootloader/signing-key.sh`, with a `.vkb` as its second
-  copy. Everything above applies to it:
+  `vkey-signing-nrf`, made by `bootloader/signing-key.sh` on 2026-10-14 (fingerprint
+  `a1700ebd539b0bfc`), with a `.vkb` as its second copy. Everything above applies to it:
   - until the fork is installed, `CURRENT.UF2` and the offline PIN search hand it to anyone
     who holds the board for a minute and then computes for a few hours;
   - after that, SWD does the same until APPROTECT, and the glitch after that.

@@ -328,7 +328,8 @@ Milestones, one commit each:
    is an open speed-up, not done. The vkey firmware was then restored from its signed UF2
    through the factory bootloader, which runs it with the slot at 0x96000: the first
    install step, rehearsed with the test key.
-5. The real key's tools. **Written 2026-10-14; the key is not made yet.**
+5. The real key's tools. **Written 2026-10-14; the key was made the same day, fingerprint
+   `a1700ebd539b0bfc`.**
    - **`bootloader/signing-key.sh`** makes the Ed25519 key on tmpfs and stores it on the
      board as the `.env` `vkey-signing-nrf`. It talks to the board through the firmware's
      own port, so a C6 plugged in beside it never gets the key. It needs a PIN on the board
@@ -351,6 +352,11 @@ Milestones, one commit each:
      passes on those, and fails on a stale image, an altered UF2, a test-key bootloader, a
      foreign key, and a private, mixed or empty pem.
    - **`board.toml` names none of these files**, so the CLI embeds none of them.
+   - **The key itself**, 2026-10-14: made on the board, then a `.vkb` of it at once.
+     The `.vkb` was restored onto the same board and `vaultkey.signed.uf2` signed again
+     came out byte for byte the same. `images/bootloader.bin` was built with
+     `signing-key.pem`: its INFO line names `a1700ebd539b0bfc`, and the raw key is in it
+     once. Not installed.
 
 Install needs its own go and a checklist:
 
@@ -371,10 +377,10 @@ Install needs its own go and a checklist:
   Still open: the chip's own bootloader against that hex, and its MBR against 2.4.1. The
   as-app build can read both;
 - the key reachable from two places, and `signing-key.pem` committed with its
-  fingerprint recorded here (not made yet):
-  - the `.vkb` is made right after the key;
+  fingerprint recorded here, `a1700ebd539b0bfc`:
+  - the `.vkb` is made right after the key (done 2026-10-14);
   - prove it by restoring it onto the same board and signing again. Ed25519 is
-    deterministic, so `images/` must not change;
+    deterministic, so `images/` must not change (done 2026-10-14);
   - restoring it onto the C6, the decided second home, comes only after a `.vkb` of the
     C6 holding `vkey-signing` exists. A restore replaces everything on the board,
     `vkey-signing` included. `sign-vaultkey.sh` talks only to this board, so signing from
