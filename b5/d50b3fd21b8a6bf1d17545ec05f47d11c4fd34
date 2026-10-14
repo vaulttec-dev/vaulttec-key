@@ -1,0 +1,35 @@
+docs2/roadmap.md
+  s_211416f9294557::t_875fdf4c1f5c5b 471-472
+  s_211416f9294557::t_009079b8e45e47 449-460
+  s_211416f9294557::t_afd7858565862d 36-37
+  s_211416f9294557::t_68f311cb926417 553
+docs2/makerdiary.md
+  s_211416f9294557::t_8d4280f539db3a 320
+README.md
+  s_211416f9294557::t_048c37a730850d 14-16
+firmware/boards/nrf52840-mdk-dongle/board.toml
+  s_211416f9294557::t_42bb6dea6529d6 25-27
+docs/threat-model.md
+  s_211416f9294557::t_5458204a61a5e2 28-45
+  s_211416f9294557::t_ab61576cc06ea2 51-53,57
+  s_211416f9294557::t_41f495a00bdc02 9
+CLAUDE.md
+  s_211416f9294557::t_fb3eabf44dfd27 153-156
+  s_211416f9294557::t_df3e89fe7cd585 283-285
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b5d50b3fd21b8a6bf1d17545ec05f47d11c4fd34",
+  "prompts": {},
+  "sessions": {
+    "s_211416f9294557": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "676596db-a983-4b94-8e19-40dad5711989",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "VaultTec-Dev <vaulttec-dev@proton.me>"
+    }
+  }
+}
