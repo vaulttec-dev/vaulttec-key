@@ -1,0 +1,23 @@
+CLAUDE.md
+  s_211416f9294557::t_04caaf36b5ea87 4-6,23-27,158-161,270-273
+README.md
+  s_211416f9294557::t_4ed933b2da1d36 17
+docs2/roadmap.md
+  s_211416f9294557::t_e05a08d327daba 5-7,24-27,33-38,70,374-375,377-378,380-382,416-417
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b102168681e175b7968370d3a0ed25f5dc93b737",
+  "prompts": {},
+  "sessions": {
+    "s_211416f9294557": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "676596db-a983-4b94-8e19-40dad5711989",
+        "model": "unknown"
+      },
+      "human_author": "VaultTec-Dev <vaulttec-dev@proton.me>"
+    }
+  }
+}
