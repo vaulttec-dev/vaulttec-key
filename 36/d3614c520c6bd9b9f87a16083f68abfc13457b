@@ -1,0 +1,49 @@
+firmware/boards/nrf52840-mdk-dongle/bootloader/signed_image.py
+  s_211416f9294557::t_c25195a62bc6f7 8-11
+  s_211416f9294557::t_1e8cf12cd04c7a 96-104
+  s_211416f9294557::t_09e30b69924d89 117-126
+firmware/boards/nrf52840-mdk-dongle/bootloader/signing-key.sh
+  s_211416f9294557::t_d57bce7ba444fd 1-70
+.gitignore
+  s_211416f9294557::t_3a78bd5070fba1 9-11,15
+docs2/roadmap.md
+  s_211416f9294557::t_acf8f6f4ea3aec 331-353,361-372,374-377,385-393
+  s_211416f9294557::t_4c6df022150465 378-384
+CLAUDE.md
+  s_211416f9294557::t_ccacf4ff54af69 325-334,338-340
+firmware/boards/nrf52840-mdk-dongle/bootloader/sign.sh
+  s_211416f9294557::t_c45d76666251b4 9-12
+tools/build-bootloader.sh
+  s_211416f9294557::t_ea988befa6b506 42-44
+  s_211416f9294557::t_4d9b1c9aabe2a9 127-133
+  s_211416f9294557::t_94c6d3daf41a4a 106-112
+  s_211416f9294557::t_e32144da1ea2f3 31-34
+firmware/boards/nrf52840-mdk-dongle/bootloader/sign-vaultkey.sh
+  s_211416f9294557::t_ecb4fbc3a98425 1-51
+docs/threat-model.md
+  s_211416f9294557::t_3e12b629c1c848 8-9
+  s_211416f9294557::t_36c54373bbf91d 39-49
+tools/checks.sh
+  s_211416f9294557::t_1c4fd60480e223 7-8
+  s_211416f9294557::t_6695d5029dc30a 225
+  s_211416f9294557::t_15cb4132024959 169-170,172-174
+  s_211416f9294557::t_50d2332b62adda 141-168,171,175-186
+.githooks/pre-commit
+  s_211416f9294557::t_037186d0024b3e 14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "36d3614c520c6bd9b9f87a16083f68abfc13457b",
+  "prompts": {},
+  "sessions": {
+    "s_211416f9294557": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "676596db-a983-4b94-8e19-40dad5711989",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "VaultTec-Dev <vaulttec-dev@proton.me>"
+    }
+  }
+}
