@@ -1,0 +1,33 @@
+docs2/roadmap.md
+  s_211416f9294557::t_f0593dbda0f56c 331-332
+  s_211416f9294557::t_ffc45eb3785931 355-359
+  s_211416f9294557::t_30c125eae3548e 380-381,383
+docs/threat-model.md
+  s_211416f9294557::t_78100917049245 40-41
+firmware/boards/nrf52840-mdk-dongle/bootloader/signing-key.pem
+  s_138c44a33aebf9::t_bf0cc494823dd0 1-3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2ba479c1a48b77707dce7363475206ae63d239c0",
+  "prompts": {},
+  "sessions": {
+    "s_138c44a33aebf9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a23a86a1-3212-491e-a6dd-df985f494203",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "VaultTec-Dev <vaulttec-dev@proton.me>"
+    },
+    "s_211416f9294557": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "676596db-a983-4b94-8e19-40dad5711989",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "VaultTec-Dev <vaulttec-dev@proton.me>"
+    }
+  }
+}
