@@ -70,6 +70,10 @@
  *------------------------------------------------------------------*/
 #define BOARD_APP_FLASH_END   0x97000
 
+/* The app's signature slot (src/signature.h): the last page of the window, which the
+ * app itself never reaches - memory.x ends its FLASH here. */
+#define BOARD_APP_SLOT        (BOARD_APP_FLASH_END - 0x1000)
+
 #define UF2_PRODUCT_NAME   "Makerdiary nRF52840 MDK USB Dongle"
 #define UF2_VOLUME_LABEL   "UF2BOOT    "
 #define UF2_BOARD_ID       "nRF52840-MDK-USB-DONGLE"

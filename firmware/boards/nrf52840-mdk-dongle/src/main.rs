@@ -63,8 +63,8 @@ const RESET_CAUSES: [(u32, &str); 9] = [
 const USB_VID: u16 = 0x1209;
 const USB_PID: u16 = 0x0001;
 
-/// The vault's flash, 0x97000..0xD8000: past the end of FLASH in memory.x, before
-/// Trussed's filesystem. `LAYOUT` counts from its start.
+/// The vault's flash, 0x97000..0xD8000: past the end of FLASH in memory.x and the
+/// signature slot after it, before Trussed's filesystem. `LAYOUT` counts from its start.
 const VAULT_BASE: u32 = 0x9_7000;
 const VAULT_LEN: u32 = 0x4_1000;
 
@@ -205,7 +205,7 @@ fn vault_region() -> &'static mut [u8] {
     );
     let base = core::ptr::with_exposed_provenance_mut::<u8>(VAULT_BASE as usize);
     // SAFETY: 0x97000..0xD8000 is flash outside the image - memory.x ends FLASH at
-    // 0x97000 - so nothing the compiler knows of lives there; it is page-aligned, as
+    // 0x96000 - so nothing the compiler knows of lives there; it is page-aligned, as
     // the driver asserts; and the flag above makes this the only reference to it. The
     // flash controller rewrites these bytes on erase, which is why every access goes
     // through `Flash` and its fences.

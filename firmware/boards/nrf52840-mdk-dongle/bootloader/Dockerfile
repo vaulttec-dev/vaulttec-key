@@ -12,8 +12,15 @@ ARG TOOLCHAIN_SHA256=12a2815644318ebcceaf84beabb665d0924b6e79e21048452c5331a5633
 ARG UPSTREAM=https://github.com/adafruit/Adafruit_nRF52_Bootloader.git
 ARG COMMIT=eefbe6bda98b80cb296e2f1bb1c982d58fe4c12d
 
+# Monocypher 4.0.2 for the signature check: Ed25519 (RFC 8032) from monocypher.c and
+# optional/monocypher-ed25519.c, CC0/BSD-2.
+ARG MONOCYPHER=https://github.com/LoupVaillant/Monocypher.git
+ARG MONOCYPHER_COMMIT=0d85f98c9d9b0227e42cf795cb527dff372b40a4
+
+# qemu-user and openssl run test/run.sh: the signature check, compiled for the same
+# core, against images openssl signed.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl git make patch python3 python3-intelhex xz-utils \
+ && apt-get install -y --no-install-recommends ca-certificates curl git make openssl patch python3 python3-intelhex qemu-user xz-utils \
  && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL -o /tmp/tc.tar.xz "https://developer.arm.com/-/media/Files/downloads/gnu/12.3.rel1/binrel/$TOOLCHAIN.tar.xz" \
@@ -26,6 +33,8 @@ ENV PATH=/opt/arm/bin:$PATH
 RUN git clone -q "$UPSTREAM" /src \
  && git -C /src checkout -q "$COMMIT" \
  && git -C /src submodule update -q --init lib/nrfx lib/tinyusb lib/uf2 \
+ && git clone -q "$MONOCYPHER" /src/lib/monocypher \
+ && git -C /src/lib/monocypher checkout -q "$MONOCYPHER_COMMIT" \
  && chmod -R a+rwX /src \
  && git config --system --add safe.directory '*'
 # The build runs as the host user, so its outputs are the host user's; the tree is

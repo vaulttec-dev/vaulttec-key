@@ -26,7 +26,9 @@
 #
 # nRF52840 boards: the UF2 bootloader, upstream Adafruit_nRF52_Bootloader at a pinned
 # commit with bootloader/'s board definition and patches, built and checked by
-# bootloader/build.sh in bootloader/Dockerfile. Until the fork is complete
+# bootloader/build.sh in bootloader/Dockerfile. It trusts one Ed25519 public key:
+# bootloader/signing-key.pem, or with BOOTLOADER_TEST_KEY=<pem> a throwaway key, which
+# INFO_UF2.TXT then names as a test key. Until the fork is installable
 # (docs2/roadmap.md, phase 3) the outputs stay in a temporary directory: nothing goes
 # into images/, and nothing is installed.
 
@@ -87,20 +89,31 @@ build_esp() {
 }
 
 build_uf2() {
-    local dir="$1" name="$2" out log
+    local dir="$1" name="$2" out log key kind
+    if [[ -n "${BOOTLOADER_TEST_KEY:-}" ]]; then
+        key="$BOOTLOADER_TEST_KEY" kind=test
+    else
+        key="$dir/bootloader/signing-key.pem" kind=real
+    fi
+    [[ -f "$key" ]] || {
+        echo "$name: no $key. The real key is not made yet (docs2/roadmap.md, phase 3);" >&2
+        echo "  a test build:  BOOTLOADER_TEST_KEY=<Ed25519 public key .pem> $0" >&2
+        exit 1
+    }
     docker build -q -t "vkey-bootloader-$name" "$dir/bootloader" >/dev/null
     out="$(mktemp -d)"
     log="$out/build.log"
     # As the host user, so the outputs are the host user's. The log keeps newlib's
     # "is not implemented" linker warnings out of sight; build.sh fails on anything real.
-    if ! docker run --rm -u "$(id -u):$(id -g)" -v "$dir/bootloader:/work/in:ro" -v "$out:/work/out" \
+    if ! docker run --rm -u "$(id -u):$(id -g)" -e KEY_KIND="$kind" -v "$key:/work/key.pem:ro" \
+        -v "$dir/bootloader:/work/in:ro" -v "$out:/work/out" \
         "vkey-bootloader-$name" sh /work/in/build.sh >"$log" 2>&1; then
         cat "$log" >&2
         echo "$name: the bootloader build or its checks failed" >&2
         exit 1
     fi
-    grep -E "^ *(FLASH|BOOTLOADER_CONFIG):|^check:" "$log" || true
-    (cd "$out" && sha256sum bootloader.bin update-bootloader.uf2)
+    grep -E "^ *(FLASH|BOOTLOADER_CONFIG):|^check:|^signature test:|^key:" "$log" || true
+    (cd "$out" && sha256sum bootloader.bin)
     echo "$name: outputs in $out - not installed, not copied into images/"
 }
 

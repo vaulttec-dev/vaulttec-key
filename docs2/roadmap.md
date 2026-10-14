@@ -175,8 +175,10 @@ Constraints that come with it:
   the app is flashed again after a bootloader update.
 - **The signing key must exist in two places.** Once everything moves here, a broken app
   leaves the board in the bootloader waiting for a signed image. If the only copy of the key
-  is on this board, nothing can sign it. Before the key is generated, decide its second home:
-  the wiped C6 as the signing device, or a `.vkb` that restores onto it.
+  is on this board, nothing can sign it. Decided 2026-10-14: the second home is a `.vkb`
+  that restores onto the C6, which is the test board, not a signing device. The key is an
+  item on this board, made with a `.vkb` right after; a wipe test here (phase 3
+  acceptance) is followed by a restore.
 - ~~**The page at 0xFD800**~~ is the CF2 config page (`.bootloaderConfig`, 88 B: board ID,
   family, flash and RAM size), part of the bootloader image inside the 40 KiB that `COPY_BL`
   copies. `check.py` pins it to the factory's words. The code region is 0xF4000..0xFD800.
@@ -226,7 +228,77 @@ Milestones, one commit each:
 3. The signed trailer, with length and version inside the signed bytes, checked on every
    boot; the host signing tool. The signature scheme is chosen by measuring the code size
    and boot time of each verify-only candidate.
-4. The on-device test as an application.
+
+   **Measured 2026-10-14.** Each verify-only path was compiled `-Os` for Cortex-M4. For
+   speed, qemu-arm counted the instructions of one verify of a real openssl signature over
+   1 KiB:
+
+   | Candidate | Code | Instructions | At 64 MHz (≈1.3 CPI) |
+   |---|---|---|---|
+   | Monocypher 4.0.2, Ed25519 (SHA-512) | 10.5 KiB | 1.8 M | ≈ 40 ms |
+   | micro-ecc 1.1, P-256 + SHA-256 | 4.4 KiB | 7.6 M | ≈ 150 ms |
+   | compact25519, Ed25519 | 4.9 KiB | 90 M | ≈ 1.8 s |
+
+   **Chosen: Monocypher Ed25519.** It is the fastest of the three, and the scheme is the
+   RFC 8032 one that openssl signs and `ed25519-dalek` in the CLI already verifies.
+   Hashing costs ≈113 instructions a byte: ≈0.2 s a boot for today's 77 KiB image, ≈0.7 s
+   for a 300 KiB one with Trussed. A SHA-256 pre-hash would be 1.6× faster to hash, but it
+   puts a second hash function in the bootloader, so plain Ed25519 it is.
+
+   **Format.** One signature slot per image, the first 256 bytes of a page that the image
+   never reaches:
+   - for the app at 0x96000, so the app must end by 0x96000 and `memory.x` loses a page;
+   - for a bootloader update at 0xFDF00, the end of its CF2 page.
+
+   The slot holds magic `VKS1`, kind (1 app, 2 bootloader), version, length, then the
+   signature over `slot[0..64] || image[0..length]`. The bootloader checks it on every
+   boot, streaming SHA-512 over the slot header and the flash, so a torn or unsigned
+   upload never runs and no "valid" flag is trusted. It checks a bootloader update in
+   staging before `COPY_BL`; there the length must cover the whole region up to the slot.
+   A bootloader update lands its staging on the app's slot, so the app is flashed again
+   after one. The public key is compiled in. The build fails without it, and
+   `INFO_UF2.TXT` shows its fingerprint, so a test-key build cannot pass for a real one.
+
+   **Built and tested 2026-10-14 with a throwaway key; not run on a board.**
+   - **`src/signature.c`.** Monocypher's own `crypto_ed25519_check`, with the message
+     streamed: the slot header, then the image from flash in 4 KiB pieces, with the
+     watchdog fed between them.
+   - **`patches/0005-signed-images`:**
+     - the app is valid only if its signature verifies, checked on every boot, once, with
+       nothing written between the check and the jump;
+     - DFU mode always ends in a reset;
+     - a bootloader update is copied only if signed;
+     - the jump address is always 0x1000, and no SoftDevice is looked for;
+     - `INFO_UF2.TXT` names the key.
+   - **`test/run.sh`, run before every build.** It compiles `signature.c` for Cortex-M4
+     and runs it under qemu-arm on 17 openssl-signed cases: valid app and bootloader;
+     a flipped bit in header, image, R or s; wrong key; s + L; wrong kind; length
+     edges; reserved or tail bytes. The streamed check must agree with the one-shot one,
+     and a deliberately wrong expectation does fail.
+   - **Size and stack.** 28 384 B of code, 10.5 KiB to spare. Stack on the verify path
+     ≈1.8 KiB of the 8 KiB reserved.
+   - **Signing.** `sign.sh` signs with openssl, checks the signature before writing, and
+     wraps the image and slot into a UF2. By the factory bootloader's code it accepts that
+     UF2 too, the slot being ordinary app space to it; not tried yet. It refuses to sign
+     a bootloader that trusts a test key unless `ALLOW_TEST_KEY=1`. `memory.x` now ends
+     the firmware at 0x96000; its image did not change.
+   - **The build refuses to run without `bootloader/signing-key.pem`.** A test build
+     names its key with `BOOTLOADER_TEST_KEY`, and `INFO_UF2.TXT` then says "TEST KEY".
+4. The on-device test as an application. The plan:
+   - a build flag (`VKEY_AS_APP=1`) in the same patch series, not separate code;
+   - linked at 0x1000, `COPY_BL` compiled out;
+   - its write window and verify target on a scratch area (0x40000..0x80000), clear of
+     itself;
+   - marked a test build in its INFO text.
+
+   With no serial port the drive is the only output, so it writes its results into
+   `INFO_UF2.TXT`:
+   - accept or refuse on a real-pipeline signed app, an altered one and a signed
+     self-update image;
+   - DWT cycle counts for a boot verify, turning the qemu estimate into a measurement on
+     the chip.
+
+   The factory bootloader stays in place throughout, so this milestone is reversible.
 
 Install needs its own go and a checklist:
 
@@ -240,8 +312,14 @@ Install needs its own go and a checklist:
 - the MBR: the update carries Nordic's MBR 2.4.1 and a whole settings page. Read in the
   update handler what happens to those blocks, and compare the chip's own MBR (the app can
   read 0x0..0xB00) with 2.4.1;
-- a signed app already on the board;
-- the key reachable from two places.
+- the key reachable from two places, and `signing-key.pem` committed with its
+  fingerprint recorded here;
+- the bootloader being installed names that fingerprint in its INFO text, not "TEST KEY"
+  (`sign.sh` refuses a test-key bootloader unless told);
+- the order: first copy the signed app (real key) through the factory bootloader and
+  confirm it boots under it. Then install the fork, and the board must boot straight
+  into that app. If it stays in DFU mode instead, copying the signed app UF2 again is
+  the next step.
 
 **The risk, stated plainly.** A bug in the new bootloader leaves a board no USB tool can
 reach. Without a probe that is a new dongle. That is acceptable only because the board
@@ -334,6 +412,7 @@ Acceptance: registration and login on webauthn.io and with `fido2-token`; `pam_u
 | Phase 0 | ~~the audit exception for RUSTSEC-2026-0344~~ - done 2026-10-13 |
 | Phase 2 | ~~if the chip is older than revision 3: accept the glitch risk or keep the important secrets on the C6~~ - revision 2; everything moves here, risk accepted (2026-10-13) |
 | Phase 3 | ~~own bootloader instead of the Nordic secure bootloader~~ - own fork chosen (2026-10-13); installing it still needs its own go |
+| Phase 3 | ~~the signing key's second home~~ - a `.vkb` that restores onto the C6; the C6 is the test board, everything else is on the nRF (2026-10-14) |
 | Phase 5 | chip key option A or B; wiping the C6 after migration |
 | Phase 6 | RTIC or Embassy, and the `unsafe` rule if the runtime needs it |
 

@@ -317,9 +317,12 @@ folder: upstream Adafruit_nRF52_Bootloader at a pinned commit, the board definit
 back from the factory binary, a patch series, a pinned Arm toolchain, all in Docker.
 `bootloader/check.py` fails the build on a UICR address in the code - as a word, an
 immediate or a movw/movt pair; like the radio search, not one computed from another base
-plus an offset. Until the fork is
-complete the outputs stay in a temporary directory, and installing it is never part of a
-build (`docs2/roadmap.md`, phase 3).
+plus an offset. The fork runs only images signed with one Ed25519 key, checked on every
+boot (`bootloader/src/signature.c`, tested under qemu-arm by `bootloader/test/run.sh`
+before every build); `bootloader/sign.sh` makes the signed UF2. The build needs
+`bootloader/signing-key.pem`, or `BOOTLOADER_TEST_KEY` for a build that names itself a
+test build. Until the fork is installable the outputs stay in a temporary directory, and
+installing it is never part of a build (`docs2/roadmap.md`, phase 3).
 
 Compilation is the **only** exception to the check rule. Linters, formatters, tests and
 static analysers are not run without a direct request: git hooks in `.githooks/`
