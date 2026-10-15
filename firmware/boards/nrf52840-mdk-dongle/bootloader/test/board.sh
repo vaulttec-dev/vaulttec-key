@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# The on-board test (test/app_test.c, docs2/roadmap.md phase 3, milestone 4):
+# The on-board test (test/app_test.c, docs/roadmap.md phase 3, milestone 4):
 #
 #   board.sh make TEST.pem OUTDIR   sign with the test key and write the test's UF2s
 #                                   into OUTDIR, the output of a test-key build:

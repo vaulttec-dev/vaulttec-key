@@ -1,4 +1,4 @@
-//! Passkeys: Trussed and fido-authenticator (docs2/roadmap.md, phase 6), in the main loop
+//! Passkeys: Trussed and fido-authenticator (docs/roadmap.md, phase 6), in the main loop
 //! like everything else. A CTAP request reaches `Passkeys::call` through the CTAPHID
 //! dispatch, fido-authenticator turns it into Trussed requests, and `Syscall` serves each
 //! of those on the spot by running the Trussed service inline: no interrupt, no runtime,

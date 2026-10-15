@@ -1,7 +1,7 @@
 //! The key's FIDO2 side, spoken directly: just enough CTAP2 over hidraw for `vkey auth`
 //! to make a credential and try it. `pamu2fcfg` would do the first half, but the 1.1.0
 //! that distributions ship insists on an attestation certificate, and this key attests
-//! with the credential's own key, as `WebAuthn` allows (docs2/roadmap.md, phase 6).
+//! with the credential's own key, as `WebAuthn` allows (docs/roadmap.md, phase 6).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};

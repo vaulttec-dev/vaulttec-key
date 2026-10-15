@@ -5,7 +5,7 @@ dongle. Revised the same day for a constraint the maintainer set: **no SWD probe
 spare board, now or later.** Decided already, not reopened here: the nRF52840 is the key
 and the C6 a test board, not a fallback (2026-10-14); Trussed + `fido-authenticator` for
 passkeys. Board
-notes, measurements and the factory state: `docs2/makerdiary.md`.
+notes, measurements and the factory state: `docs/makerdiary.md`.
 
 ## What "no probe, no spare" changes
 
@@ -84,7 +84,7 @@ and signed images only: APPROTECT means nothing while UF2 hands out the flash. T
   - the UICR `APPROTECT` word, raw;
   - the last reset cause from `RESETREAS`, cleared after reading.
 
-  How to read them: `docs2/makerdiary.md`, "Reading the `chip:` line". This answers the
+  How to read them: `docs/makerdiary.md`, "Reading the `chip:` line". This answers the
   revision question without a probe. It does **not** explain the first unexplained
   failure. A panic and the bootloader's post-flash restart both read as `soft reset`, and
   the replug that failure needed is a power-on reset, which clears the register. It
@@ -665,7 +665,7 @@ Milestones, one commit each, each leaving a key that works:
      of stack and needed more than twice that; the first getInfo locked the core up. The
      core now takes the 128 KiB on the stack for one derivation (`with_kdf_memory`), and
      the stack is 200 KiB at the bottom of RAM, where an overflow resets the chip instead
-     of corrupting the statics (`docs2/makerdiary.md`, "Passkeys on the board"). The
+     of corrupting the statics (`docs/makerdiary.md`, "Passkeys on the board"). The
      C6's image changed with it. Its signed copy can only be made on the C6, which is
      left alone, so it left the repository, and `vkey setup` refuses a Secure Boot chip
      until it is signed again (maintainer's decision, 2026-10-15). Signed again the same

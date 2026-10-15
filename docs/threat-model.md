@@ -118,7 +118,7 @@ Before this board holds a real secret, two things are required:
 A chip-bound key, a secret in a flash page locked by the ACL until reset, was the third.
 It was dropped on this revision (2026-10-15): it loads from flash at boot, so the glitch
 above reads it as well, and it would protect nothing the PIN does not already. On a
-revision-3 chip it would be worth having. The plan is in `docs2/roadmap.md`. Nordic's secure bootloader was dropped from it: there is
+revision-3 chip it would be worth having. The plan is in `docs/roadmap.md`. Nordic's secure bootloader was dropped from it: there is
 no SWD probe, and installing it moves the bootloader address in UICR, a one-shot change
 with no way back.
 

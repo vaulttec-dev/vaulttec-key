@@ -1,5 +1,5 @@
 /* Makerdiary nRF52840 MDK USB Dongle: 1 MiB flash and 256 KiB RAM, all on the chip.
- * FLASH below is only this firmware's part of the map (docs2/makerdiary.md):
+ * FLASH below is only this firmware's part of the map (docs/makerdiary.md):
  *
  *   0x00000..0x01000   MBR
  *   0x01000..0x96000   this firmware

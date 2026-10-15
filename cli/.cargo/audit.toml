@@ -7,6 +7,6 @@ ignore = [
     # section in an ELF. vkey never parses an ELF - it hands espflash finished images
     # through Connection, Flasher and Segment - so the decoder is linked but never fed.
     # Goes when `cargo tree -i ruzstd` shows 0.9.1 or later, or when espflash leaves
-    # the CLI (docs2/roadmap.md, phase 5).
+    # the CLI (docs/roadmap.md, phase 5).
     "RUSTSEC-2026-0344",
 ]

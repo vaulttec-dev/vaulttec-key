@@ -1,5 +1,5 @@
 /*
- * The on-board test of this bootloader fork (docs2/roadmap.md, phase 3, milestone 4).
+ * The on-board test of this bootloader fork (docs/roadmap.md, phase 3, milestone 4).
  *
  * Built with VKEY_AS_APP (patches/0007-as-app.patch), the bootloader runs as an
  * application from 0x1000 under the factory bootloader, which stays in place, so a

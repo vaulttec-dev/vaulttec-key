@@ -31,7 +31,7 @@
 # INFO_UF2.TXT then names as a test key. Either must be a public key and nothing else.
 # A build with the real key copies bootloader.bin into images/, for bootloader/
 # sign-vaultkey.sh to sign and the git hooks to check; a test build leaves its outputs
-# in a temporary directory. Nothing is ever installed (docs2/roadmap.md, phase 3).
+# in a temporary directory. Nothing is ever installed (docs/roadmap.md, phase 3).
 
 set -euo pipefail
 
@@ -99,7 +99,7 @@ build_uf2() {
         key="$dir/bootloader/signing-key.pem" kind=real
     fi
     [[ -f "$key" ]] || {
-        echo "$name: no $key. The real key is not made yet (docs2/roadmap.md, phase 3);" >&2
+        echo "$name: no $key. The real key is not made yet (docs/roadmap.md, phase 3);" >&2
         echo "  a test build:  BOOTLOADER_TEST_KEY=<Ed25519 public key .pem> $0" >&2
         exit 1
     }

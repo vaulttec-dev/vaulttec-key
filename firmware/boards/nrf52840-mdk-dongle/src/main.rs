@@ -4,7 +4,7 @@
 //!
 //! Runs on the board: `vkey check --wipe-everything` passed on 2026-10-13, flashed
 //! through the factory UF2 bootloader, which sits at 0xF4000 behind Nordic's MBR at 0x0
-//! (docs2/makerdiary.md).
+//! (docs/makerdiary.md).
 
 #![no_std]
 #![no_main]
@@ -80,7 +80,7 @@ const VAULT_LEN: u32 = 0x4_1000;
 const FS_LEN: u32 = 0x1_4000;
 
 /// One attempt sector and two copies of 128 KiB: the sizes decided in
-/// docs2/makerdiary.md, smaller than the C6's because this chip has 1 MiB in all.
+/// docs/makerdiary.md, smaller than the C6's because this chip has 1 MiB in all.
 const LAYOUT: Layout = Layout {
     attempts: 0x0_0000,
     state_a: 0x0_1000,
@@ -147,7 +147,7 @@ impl Clock for Uptime {
 }
 
 /// The USB device with its two interfaces - CDC-ACM for vkey's protocol and CTAPHID for
-/// FIDO (docs2/roadmap.md, phase 6) - polled from the main loop: nothing runs from an
+/// FIDO (docs/roadmap.md, phase 6) - polled from the main loop: nothing runs from an
 /// interrupt. The bus is served wherever the key waits - for the next request (`Usb`) and
 /// for the button (`Panel`), which together cover all but Argon2 and flash writes, when
 /// the host's transfers simply wait. Shared by both through one `RefCell`, borrowed only
@@ -442,7 +442,7 @@ impl rand_core_06::RngCore for Entropy {
 impl rand_core_06::CryptoRng for Entropy {}
 
 /// No chip key yet. This chip has no eFuse key, and its replacement - a secret in a
-/// flash page locked by the ACL until reset - is not built (docs2/makerdiary.md). The
+/// flash page locked by the ACL until reset - is not built (docs/makerdiary.md). The
 /// vault is protected by the PIN alone, and `vkey info` says so.
 struct NoChipKey;
 
@@ -517,7 +517,7 @@ fn light(pin: &mut Pin<Output<PushPull>>, on: bool) {
 /// What the chip says about itself, for a maintainer with no probe: the build code from
 /// FICR (`AAF0` - the third letter is the revision), the UICR `APPROTECT` word as stored,
 /// and why the chip last reset. The first two stay raw, because what an `APPROTECT`
-/// value means depends on the revision; docs2/makerdiary.md reads them together. The
+/// value means depends on the revision; docs/makerdiary.md reads them together. The
 /// factory bootloader leaves the reset cause for the application, and it is cleared
 /// here, so each boot reports only what happened since the last one.
 fn chip_report(

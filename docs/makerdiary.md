@@ -352,7 +352,7 @@ No SoftDevice. The application starts at 0x1000, as `memory.x` assumes, and the 
 (0x97000..0xD8000) misses the bootloader, so the board folder needs no change to run under
 it. A UF2 is made from `images/vaultkey.bin` with family `0xADA52840` and base 0x1000
 (`uf2conv -f 0xADA52840 -c -b 0x1000`). Until our own fork of this bootloader replaces it
-(`docs2/roadmap.md`, phase 3; Nordic's secure bootloader was dropped for want of a probe)
+(`docs/roadmap.md`, phase 3; Nordic's secure bootloader was dropped for want of a probe)
 the board holds no real secrets, because UF2 flashes anything and its `CURRENT.UF2` reads
 the vault's ciphertext out. The fork replaced it on 2026-10-14.
 
@@ -366,7 +366,7 @@ Open questions only the board answers:
   2023-07-20, S132 5.1.0 plus the connectivity app in 0x1000..0x35000 and one page at
   0x50000) is all 0xFF over 0x97000..0xD8000. Kept at `~/mdk-factory/`, sha256
   `3022eb28...6aab`; it restores through the same drive.
-- ~~Is the chip's bootloader the published 0.7.1?~~ Yes (2026-10-14, `docs2/roadmap.md`
+- ~~Is the chip's bootloader the published 0.7.1?~~ Yes (2026-10-14, `docs/roadmap.md`
   phase 3 checklist). Its code equals the published `-nosd.hex` byte for byte, and the
   MBR page is Nordic's 2.4.1 with 0xFF8/0xFFC erased. Beside the settings page at
   0xFF000, one thing differs: a Nordic FDS swap-page tag at 0xFD000 that an earlier
@@ -386,7 +386,7 @@ Open questions only the board answers:
 ### Reading the `chip:` line of `vkey info`
 
 The firmware reads three things at boot and `vkey info` prints them (phase 1 of
-`docs2/roadmap.md`), so the questions a probe would answer need none:
+`docs/roadmap.md`), so the questions a probe would answer need none:
 
 - **Build code** (FICR `INFO.VARIANT`, ASCII): `AAC0` is revision 1, `AADx` revision 2,
   `AAF0` revision 3 (IN-141). Anything else: Nordic's IC revision overview.
@@ -440,7 +440,7 @@ Both runs tripped on the same trap. The "no code from" steps for a password, an 
 
 ## First steps when it arrives
 
-> Superseded 2026-10-13 by `docs2/roadmap.md`. The board ran over UF2 without a probe,
+> Superseded 2026-10-13 by `docs/roadmap.md`. The board ran over UF2 without a probe,
 > step 4's reset question is answered (P0.18 is a GPIO), and the order of everything after
 > step 5 is in the roadmap. Kept for the record.
 

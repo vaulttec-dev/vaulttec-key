@@ -28,7 +28,7 @@ passkeys = true
 radio_base = 0x40001000
 
 # Flashed through its UF2 bootloader fork as images/vaultkey.signed.uf2 (bootloader/,
-# docs2/roadmap.md phase 3). `vkey setup` talks only to the ESP ROM loader, so it never
+# docs/roadmap.md phase 3). `vkey setup` talks only to the ESP ROM loader, so it never
 # picks this board.
 [[image]]
 offset = 0x1000

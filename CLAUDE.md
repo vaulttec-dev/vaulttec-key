@@ -17,14 +17,14 @@ Decision of 2026-09-07. The key is built for the maintainer's own accounts. Sale
 production runs, enclosures, provisioning, certifications and marketing are **not built and
 not proposed** unless the maintainer says otherwise. Passkey/WebAuthn was closed because the
 C6 has no USB HID; reopened 2026-10-03 for the nRF52840 board on Trussed +
-`fido-authenticator`, not an own CTAP2 (maintainer's decision, `docs2/makerdiary.md`). It
+`fido-authenticator`, not an own CTAP2 (maintainer's decision, `docs/makerdiary.md`). It
 never exists on the C6.
 
 **The nRF52840 board is the key; the C6 is a test board, not a fallback** (maintainer's
 decisions, 2026-10-13 and 2026-10-14). Every feature is built for the nRF. Nothing is kept
 only so the C6 works. A C6 need that remains is driven by its board folder or
 `board.toml`, not by shared code. Real secrets go onto the nRF when phases 3-5 of
-`docs2/roadmap.md` are done, not when features are done.
+`docs/roadmap.md` are done, not when features are done.
 
 Consequence for code: "convenience for a buyer" is not an argument; security of the
 maintainer's own secrets and minimal code are.
@@ -158,7 +158,7 @@ The boards:
   runs only images signed with the key in `bootloader/signing-key.pem`; the app ends by
   its signature slot at 0x96000. No chip key, so it holds no real secrets yet. `vkey
   info` prints the chip's build code, UICR `APPROTECT` and last reset cause. Notes,
-  measurements and factory state: `docs2/makerdiary.md`; the plan: `docs2/roadmap.md`.
+  measurements and factory state: `docs/makerdiary.md`; the plan: `docs/roadmap.md`.
 - **`esp32c6-zero`**, the test board (2026-10-14): nothing is built for it, and it takes
   `check --wipe-everything` for core changes. Its images are signed by
   `tools/sign-vaultkey.sh` with `vkey-signing`, which also lives on the nRF since
@@ -306,7 +306,7 @@ The boards:
 **On the nRF52840, without a probe, the bootloader and UICR are irreversible.** A broken
 bootloader is a board no USB tool reaches, and UICR `APPROTECT` once written stays. Each
 such step happens only while the board holds nothing a `.vkb` cannot restore, and only on
-the maintainer's explicit go for that step (`docs2/roadmap.md`, phases 3 and 4). The
+the maintainer's explicit go for that step (`docs/roadmap.md`, phases 3 and 4). The
 bootloader fork went in this way on 2026-10-14.
 
 **eFuses are irreversible.** Secure Boot, Flash Encryption and HMAC keys burn the chip
@@ -364,7 +364,7 @@ at 0x1000 that runs under the factory bootloader and reports its verdicts in
 only on the drive it is meant for: a bootloader UF2 on the factory `UF2BOOT` would be
 installed. A real-key build writes `images/bootloader.bin`, which no `board.toml` names.
 A test build's outputs stay in a temporary directory. Installing the fork is never part
-of a build (`docs2/roadmap.md`, phase 3).
+of a build (`docs/roadmap.md`, phase 3).
 
 Compilation is the **only** exception to the check rule. Linters, formatters, tests and
 static analysers are not run without a direct request: git hooks in `.githooks/`

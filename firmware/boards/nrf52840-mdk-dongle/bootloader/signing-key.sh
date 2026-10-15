@@ -12,7 +12,7 @@
 # The public half lands in signing-key.pem and is committed: the bootloader build
 # compiles it in, and the git hooks verify signed UF2s with it. Neither is secret. Its
 # fingerprint, printed at the end and shown by the fork's INFO_UF2.TXT, goes into
-# docs2/roadmap.md.
+# docs/roadmap.md.
 #
 # Once a bootloader that trusts this key is installed, losing the private key freezes
 # the board - no firmware and no bootloader update ever again - so run `vkey backup`

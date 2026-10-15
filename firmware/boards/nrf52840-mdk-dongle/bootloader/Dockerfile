@@ -2,7 +2,7 @@
 # commit, with this folder's board definition and patches laid over it (build.sh), built
 # with a pinned Arm toolchain. tools/build-bootloader.sh runs it. Nothing here touches a
 # board: what comes out is installed, if ever, by hand and after its own checklist
-# (docs2/roadmap.md, phase 3).
+# (docs/roadmap.md, phase 3).
 FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 
 ARG TOOLCHAIN=arm-gnu-toolchain-12.3.rel1-x86_64-arm-none-eabi
