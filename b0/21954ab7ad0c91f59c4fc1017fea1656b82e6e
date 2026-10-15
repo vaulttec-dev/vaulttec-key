@@ -1,0 +1,22 @@
+cli/src/passkeys.rs
+  s_211416f9294557::t_3dfbbe4ee6a55e 52
+  s_211416f9294557::t_6ed22e0c93ea90 96-104
+cli/src/shell.rs
+  s_211416f9294557::t_6a66fa6332a4db 2389
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b021954ab7ad0c91f59c4fc1017fea1656b82e6e",
+  "prompts": {},
+  "sessions": {
+    "s_211416f9294557": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "676596db-a983-4b94-8e19-40dad5711989",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "VaultTec-Dev <vaulttec-dev@proton.me>"
+    }
+  }
+}
