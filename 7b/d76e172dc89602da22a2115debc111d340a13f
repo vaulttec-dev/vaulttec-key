@@ -1,0 +1,43 @@
+README.md
+  s_211416f9294557::t_d81b0b5604b1d5 171
+  s_211416f9294557::t_b87c5fa16f6c94 179-182
+.github/workflows/audit.yml
+  s_155f4d2a1c4bbd::t_8bed840d0c5fa8 8,10
+  s_155f4d2a1c4bbd::t_924797e54f6595 27-32
+cli/src/main.rs
+  s_211416f9294557::t_1e43795c0732c8 334-336
+  s_211416f9294557::t_64f7e3591920e0 219-221
+cli/src/commits.rs
+  s_211416f9294557::t_8cb0930be95e9d 142,144-146,148-149,153-166,168-178,180-185,191-213
+  s_211416f9294557::t_deff983ec0bc9f 186,188-189
+  s_211416f9294557::t_83a944a9b39c2a 6
+cli/src/shell.rs
+  s_211416f9294557::t_4805f0f70c47c3 2441-2446
+  s_211416f9294557::t_fe34ce014e35d8 74-76
+  s_211416f9294557::t_e4cf60b6569d77 73
+  s_211416f9294557::t_458a9d0ff8c0bb 2440
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7bd76e172dc89602da22a2115debc111d340a13f",
+  "prompts": {},
+  "sessions": {
+    "s_155f4d2a1c4bbd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "781818bb-e4ec-4e97-8ade-b83c806d2379",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "VaultTec-Dev <vaulttec-dev@proton.me>"
+    },
+    "s_211416f9294557": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "676596db-a983-4b94-8e19-40dad5711989",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "VaultTec-Dev <vaulttec-dev@proton.me>"
+    }
+  }
+}
