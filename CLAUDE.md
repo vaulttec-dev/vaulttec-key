@@ -238,6 +238,15 @@ The boards:
   session is killed by any `load()`, by `lock`, and by the first error. An item's AAD is
   `BACKUP_AAD` plus its index in the file: a reordered or altered item does not open
   (`BadBackup`).
+  On the nRF52840 the backup also carries the passkeys (2026-10-15): the board's
+  `hal::Attachment`, Trussed's flash, as sealed 4 KiB sectors after the items under
+  `REGION_AAD` plus the same index, blank sectors left out, the region's geometry in each.
+  The session freezes Trussed (`start_session`/`end_session`, the one place every session
+  begins and ends), and the board lets the freeze go by itself after 10 s of a silent vkey
+  line. A restore rewrites only sectors that differ, and when it changed any the board
+  resets once the answer has left. A file with no sectors leaves the passkeys alone; a
+  board without them refuses sectors, and the CLI leaves them in the file and names them
+  (`passkeys` in `board.toml`).
   The second way is `vkey export` (2026-09-19): an item written back into 1Password
   through `op item create`, under the same double tap, with the seed in the clear. That
   ends the claim that a seed never leaves — `docs/threat-model.md` says what it costs.

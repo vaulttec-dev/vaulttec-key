@@ -7,11 +7,12 @@
 //! The keys live in Trussed's own littlefs at 0xD8000..0xEC000, apart from the vault and
 //! not sealed under the PIN; docs/threat-model.md says what that costs.
 
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 
 use cortex_m::peripheral::SCB;
+use critical_section::Mutex;
 use ctaphid_dispatch::app::{self, App, Command};
 use embedded_storage::nor_flash::{NorFlash, ReadNorFlash};
 use fido_authenticator::{Authenticator, Config, TrussedRequirements, UserPresence};
@@ -34,7 +35,7 @@ use trussed_core::{Error, InterruptFlag};
 use trussed_fs_info::FsInfoExtension;
 use trussed_hkdf::HkdfExtension;
 use trussed_staging::{StagingBackend, StagingContext};
-use vaultkey_core::hal::{Clock, Ui};
+use vaultkey_core::hal::{Attachment, Clock, Ui};
 use vaultkey_core::ui::{self, State};
 
 use crate::{CTAP_MESSAGE, Entropy, FS_LEN, Panel, Region, Uptime, UsbStack};
@@ -418,4 +419,138 @@ pub(crate) fn start(
         Touch { panel, usb },
         config,
     )))
+}
+
+// --- the passkeys in a backup ----------------------------------------------------------
+
+/// What a backup or a restore has done to Trussed's flash (`hal::Attachment`).
+#[derive(Clone, Copy)]
+enum Freeze {
+    /// Trussed's own: passkeys are served.
+    Thawed,
+    /// A backup or a restore has it; `dirty` once a sector was rewritten.
+    Frozen { dirty: bool },
+    /// The host stopped talking mid-backup and the freeze was let go before anything
+    /// was written: passkeys are served again, and the session's next read fails.
+    Expired,
+    /// Rewritten: Trussed's mounted filesystem and fido's cached state are stale, so the
+    /// chip resets once the restore's answer has had time to leave.
+    Restart { at: u64 },
+}
+
+static FREEZE: Mutex<Cell<Freeze>> = Mutex::new(Cell::new(Freeze::Thawed));
+
+fn freeze_state() -> Freeze {
+    critical_section::with(|cs| FREEZE.borrow(cs).get())
+}
+
+fn set_freeze(state: Freeze) {
+    critical_section::with(|cs| FREEZE.borrow(cs).set(state));
+}
+
+/// How long a backup or a restore may leave the vkey line silent before its freeze is
+/// let go: a session runs frame after frame, and a host that died must not leave
+/// passkeys and `sudo` dead until a replug.
+const FREEZE_MS: u64 = 10_000;
+/// How long the restore's last answer gets to reach the host before the reset.
+const RESTART_MS: u64 = 300;
+
+/// Whether CTAP requests may be served now.
+pub(crate) fn serving() -> bool {
+    matches!(freeze_state(), Freeze::Thawed | Freeze::Expired)
+}
+
+/// Called on every look at the vkey line: lets a forgotten freeze go, and resets when
+/// the region was rewritten. `last_rx` is when the last vkey byte came.
+pub(crate) fn tend(now: u64, last_rx: u64) {
+    match freeze_state() {
+        Freeze::Frozen { dirty } if now - last_rx > FREEZE_MS => {
+            if dirty {
+                SCB::sys_reset();
+            }
+            set_freeze(Freeze::Expired);
+        }
+        Freeze::Restart { at } if now - at > RESTART_MS => SCB::sys_reset(),
+        _ => {}
+    }
+}
+
+/// Trussed's flash as a backup sees it: the same 4 KiB sectors littlefs uses, read and
+/// written only while the freeze holds.
+pub(crate) struct Backup(pub(crate) Region);
+
+const SECTOR: usize = 4096;
+
+impl Attachment for Backup {
+    fn sectors(&self) -> u32 {
+        FS_LEN / 4096
+    }
+
+    fn read(&mut self, i: u32, out: &mut [u8]) -> bool {
+        matches!(freeze_state(), Freeze::Frozen { .. })
+            && out.len() == SECTOR
+            && i < self.sectors()
+            && self.0.read(i * 4096, out).is_ok()
+    }
+
+    fn put(&mut self, i: u32, data: Option<&[u8]>) -> Option<bool> {
+        let Freeze::Frozen { .. } = freeze_state() else {
+            return None;
+        };
+        if data.is_some_and(|d| d.len() != SECTOR) || i >= self.sectors() {
+            return None;
+        }
+        let at = i * 4096;
+        if self.holds(at, data)? {
+            return Some(false);
+        }
+        self.0.erase(at, at + 4096).ok()?;
+        // Dirty from the erase on: a sector half done is a rewritten one.
+        set_freeze(Freeze::Frozen { dirty: true });
+        if let Some(data) = data {
+            self.0.write(at, data).ok()?;
+        }
+        Some(true)
+    }
+
+    fn freeze(&mut self) {
+        // A restart still owed - a restore rewrote the region just before - is carried
+        // into this session, so its end resets rather than hand Trussed a stale region.
+        let owed = matches!(
+            freeze_state(),
+            Freeze::Restart { .. } | Freeze::Frozen { dirty: true }
+        );
+        set_freeze(Freeze::Frozen { dirty: owed });
+    }
+
+    fn thaw(&mut self, changed: bool) {
+        let dirty = matches!(freeze_state(), Freeze::Frozen { dirty: true });
+        set_freeze(if changed || dirty {
+            Freeze::Restart {
+                at: Uptime.now_ms(),
+            }
+        } else {
+            Freeze::Thawed
+        });
+    }
+}
+
+impl Backup {
+    /// Whether the sector at `at` already holds `data`, or is blank when `data` is
+    /// None: compared a little at a time, without a sector-sized buffer on the stack.
+    fn holds(&mut self, at: u32, data: Option<&[u8]>) -> Option<bool> {
+        let mut chunk = [0u8; 64];
+        for (n, start) in (0..SECTOR).step_by(chunk.len()).enumerate() {
+            let offset = at + u32::try_from(n * chunk.len()).ok()?;
+            self.0.read(offset, &mut chunk).ok()?;
+            let same = match data {
+                Some(d) => chunk == d[start..start + chunk.len()],
+                None => chunk.iter().all(|&b| b == 0xFF),
+            };
+            if !same {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
 }

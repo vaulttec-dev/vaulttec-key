@@ -17,6 +17,11 @@ usb_pid = 0x0001
 # What is printed on the button the user is asked to press.
 button = "USER"
 
+# It keeps passkeys (Trussed, src/fido.rs). A backup carries them, and `vkey restore`
+# hands them only to a board that says this; another restores the items and names them
+# as left in the file.
+passkeys = true
+
 # The radio peripheral's 4 KiB slot. Its driver ships inside the HAL crate, so the lock
 # file cannot show it is absent. tools/build-vaultkey.sh fails if anything in the image
 # reaches this address.

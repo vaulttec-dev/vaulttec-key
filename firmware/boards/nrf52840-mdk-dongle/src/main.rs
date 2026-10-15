@@ -233,7 +233,10 @@ impl Port for Usb {
         let now = Uptime.now_ms();
         if byte.is_some() {
             self.last_rx = now;
-        } else if now - self.last_rx > Self::QUIET_MS {
+        }
+        fido::tend(now, self.last_rx);
+        // Not while a backup or a restore has the passkeys' flash: CTAP requests wait.
+        if byte.is_none() && now - self.last_rx > Self::QUIET_MS && fido::serving() {
             // Outside the stack's borrow: a passkey's tap wait polls the bus itself.
             let passkeys: &mut dyn App<'static> = &mut *self.passkeys;
             self.fido.poll(&mut [passkeys]);
@@ -669,6 +672,13 @@ fn main() -> ! {
         base: VAULT_LEN,
         len: FS_LEN,
     };
+    // The same flash again, for the backup to carry: never at once with Trussed, which
+    // the backup's freeze keeps off it.
+    let passkey_backup = Region {
+        flash,
+        base: VAULT_LEN,
+        len: FS_LEN,
+    };
 
     let mut dev = Device::new(
         Store::new(vault, LAYOUT),
@@ -676,6 +686,7 @@ fn main() -> ! {
         rng,
         Uptime,
         NoChipKey,
+        fido::Backup(passkey_backup),
         KDF_COST,
         VAULT.init_with(store::Index::empty),
         BUF.take(),

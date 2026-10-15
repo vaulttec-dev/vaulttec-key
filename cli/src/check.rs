@@ -368,7 +368,7 @@ fn backup(
     );
     println!("  >>> tap {} twice when the light turns blue", rep.button);
     let n = backup::export(d, &dir, passphrase(PASS)?)?;
-    rep.check("backup written", n == 3, &format!("{n} items"));
+    rep.check("backup written", n.items == 3, &n.describe());
     d.delete("t")?;
     d.delete("e")?;
     rep.expect(

@@ -12,7 +12,7 @@ use rand_core::{CryptoRng, RngCore};
 use zeroize::Zeroizing;
 
 use crate::device::{Device, Reach};
-use crate::hal::{Clock, DeviceKey, Port, Ui};
+use crate::hal::{Attachment, Clock, DeviceKey, Port, Ui};
 use crate::item::{Category, ITEM_MAX};
 use crate::oath::{NAME_MAX, Name, len_u8};
 use crate::store::MAX_ENTRIES;
@@ -149,13 +149,14 @@ impl<P: Port, C: Clock> Proto<P, C> {
     }
 
     /// Runs forever, one request at a time.
-    pub fn run<F, R, U, DC, K>(&mut self, dev: &mut Device<'_, F, R, U, DC, K>) -> !
+    pub fn run<F, R, U, DC, K, A>(&mut self, dev: &mut Device<'_, F, R, U, DC, K, A>) -> !
     where
         F: NorFlash,
         R: RngCore + CryptoRng,
         U: Ui,
         DC: Clock,
         K: DeviceKey,
+        A: Attachment,
     {
         loop {
             self.await_magic();
@@ -186,13 +187,18 @@ impl<P: Port, C: Clock> Proto<P, C> {
         clippy::too_many_lines,
         reason = "one match over every wire command; splitting it would scatter the dispatch that is meant to be read in one place"
     )]
-    fn handle<F, R, U, DC, K>(&mut self, dev: &mut Device<'_, F, R, U, DC, K>, cmd: Cmd, p: &[u8])
-    where
+    fn handle<F, R, U, DC, K, A>(
+        &mut self,
+        dev: &mut Device<'_, F, R, U, DC, K, A>,
+        cmd: Cmd,
+        p: &[u8],
+    ) where
         F: NorFlash,
         R: RngCore + CryptoRng,
         U: Ui,
         DC: Clock,
         K: DeviceKey,
+        A: Attachment,
     {
         match cmd {
             Cmd::Info => self.respond(OK, self.version.as_bytes()),

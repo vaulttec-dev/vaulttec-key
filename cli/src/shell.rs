@@ -2153,8 +2153,8 @@ impl Shell {
         self.line(Color::Blue, &hint);
         let n = backup::export(self.dev()?, &path, passphrase(&pass)?)?;
         let done = format!(
-            "  {n} item{} sealed into {} - it opens only with the passphrase, on any vkey",
-            if n == 1 { "" } else { "s" },
+            "  {} sealed into {} - it opens only with the passphrase, on any vkey",
+            n.describe(),
             path.display()
         );
         self.line(Color::Green, &done);
@@ -2225,14 +2225,30 @@ impl Shell {
         self.ensure_unlocked()?;
         let restored = backup::import(self.dev()?, &path, passphrase(&pass)?)?;
         let done = format!(
-            "  {} item{} restored from {}",
+            "  {} item{}{} restored from {}",
             restored.count,
             if restored.count == 1 { "" } else { "s" },
+            if restored.passkeys {
+                " and the passkeys"
+            } else {
+                ""
+            },
             path.display()
         );
         self.line(Color::Green, &done);
         for line in &restored.skipped {
             self.line(Color::Yellow, &format!("  left in the file: {line}"));
+        }
+        if restored.passkeys {
+            // The key resets to load them; the port goes and comes back.
+            self.line(Color::Blue, "  the key restarts to load its passkeys...");
+            std::thread::sleep(Duration::from_secs(3));
+            if !self.reconnect() {
+                self.line(
+                    Color::Yellow,
+                    "  the key has not come back: plug it in again",
+                );
+            }
         }
         self.forget_logins(None);
         self.refresh();

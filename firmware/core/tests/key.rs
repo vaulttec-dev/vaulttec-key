@@ -15,7 +15,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use rand_core::{CryptoRng, RngCore};
 use sha2::Sha256;
 use vaultkey_core::device::{self, Device, Reach};
-use vaultkey_core::hal::{Clock, DeviceKey, Ui};
+use vaultkey_core::hal::{Attachment, Clock, DeviceKey, NoAttachment, Ui};
 use vaultkey_core::item::{Category, Class, Field, FieldKind, Item, Writer};
 use vaultkey_core::oath::{Algo, Digits, Name, Params};
 use vaultkey_core::store::{self, Layout, MAX_ATTEMPTS, Store};
@@ -185,6 +185,23 @@ impl MemFlash {
 
     /// Power on with a finger on the button and, maybe, a chip key.
     fn key_with<K: DeviceKey>(&self, button: Button, clock: Ticker, key: K) -> Key<K> {
+        self.key_full(button, clock, key, NoAttachment)
+    }
+
+    /// Power on a board that keeps passkeys beside the vault, its finger tapping twice.
+    fn key_attached(&self, passkeys: &Passkeys) -> Key<Unbound, Passkeys> {
+        let clock = Ticker::default();
+        let button = Button::new(&clock, Finger::DoubleTap { gap: 120 });
+        self.key_full(button, clock, Unbound, passkeys.clone())
+    }
+
+    fn key_full<K: DeviceKey, A: Attachment>(
+        &self,
+        button: Button,
+        clock: Ticker,
+        key: K,
+        attachment: A,
+    ) -> Key<K, A> {
         // The index and the buffer outlive the device, as on the board.
         let index = Box::leak(Box::new(store::Index::empty()));
         let buf: Box<[u8; device::BUF_LEN]> = vec![0u8; device::BUF_LEN]
@@ -198,10 +215,93 @@ impl MemFlash {
             Repeatable(7),
             clock,
             key,
+            attachment,
             COST,
             index,
             buf,
         )
+    }
+}
+
+/// A board's passkey flash, faked: its sectors, and what the device did with the
+/// freeze - whether it holds, and every thaw with whether it was told of a change.
+#[derive(Clone)]
+struct Passkeys(Rc<RefCell<PasskeyState>>);
+
+struct PasskeyState {
+    sectors: Vec<Vec<u8>>,
+    frozen: bool,
+    /// The board let go on its own: reads and writes fail.
+    expired: bool,
+    thaws: Vec<bool>,
+}
+
+const SECTOR: usize = store::SECTOR as usize;
+
+impl Passkeys {
+    fn blank(count: usize) -> Self {
+        Passkeys(Rc::new(RefCell::new(PasskeyState {
+            sectors: vec![vec![0xFF; SECTOR]; count],
+            frozen: false,
+            expired: false,
+            thaws: Vec::new(),
+        })))
+    }
+
+    fn fill(&self, sector: usize, byte: u8) -> &Self {
+        self.0.borrow_mut().sectors[sector] = vec![byte; SECTOR];
+        self
+    }
+
+    /// Each sector as the byte it is filled with, 0xFF for blank.
+    fn bytes(&self) -> Vec<u8> {
+        self.0.borrow().sectors.iter().map(|s| s[0]).collect()
+    }
+
+    fn frozen(&self) -> bool {
+        self.0.borrow().frozen
+    }
+
+    fn last_thaw(&self) -> Option<bool> {
+        self.0.borrow().thaws.last().copied()
+    }
+}
+
+impl Attachment for Passkeys {
+    fn sectors(&self) -> u32 {
+        u32::try_from(self.0.borrow().sectors.len()).expect("a few")
+    }
+
+    fn read(&mut self, i: u32, out: &mut [u8]) -> bool {
+        let s = self.0.borrow();
+        if !s.frozen || s.expired {
+            return false;
+        }
+        out.copy_from_slice(&s.sectors[i as usize]);
+        true
+    }
+
+    fn put(&mut self, i: u32, data: Option<&[u8]>) -> Option<bool> {
+        let mut s = self.0.borrow_mut();
+        if !s.frozen || s.expired {
+            return None;
+        }
+        let want = data.map_or_else(|| vec![0xFF; SECTOR], <[u8]>::to_vec);
+        let changed = s.sectors[i as usize] != want;
+        s.sectors[i as usize] = want;
+        Some(changed)
+    }
+
+    fn freeze(&mut self) {
+        let mut s = self.0.borrow_mut();
+        s.frozen = true;
+        s.expired = false;
+    }
+
+    fn thaw(&mut self, changed: bool) {
+        let mut s = self.0.borrow_mut();
+        s.frozen = false;
+        s.thaws.push(changed);
     }
 }
 
@@ -364,7 +464,8 @@ impl Ui for Button {
     }
 }
 
-type Key<K = Unbound> = Device<'static, MemFlash, Repeatable, Button, Ticker, K>;
+type Key<K = Unbound, A = NoAttachment> =
+    Device<'static, MemFlash, Repeatable, Button, Ticker, K, A>;
 
 // --- helpers ---------------------------------------------------------------------------
 
@@ -436,8 +537,8 @@ fn totp_item(secret: &[u8]) -> Vec<u8> {
     )
 }
 
-fn put<K: DeviceKey>(
-    dev: &mut Key<K>,
+fn put<K: DeviceKey, A: Attachment>(
+    dev: &mut Key<K, A>,
     n: &str,
     category: Category,
     item: &[u8],
@@ -487,7 +588,7 @@ fn code<K: DeviceKey>(dev: &mut Key<K>, n: &str, t: u64) -> Result<String, Fail>
     Ok(String::from_utf8_lossy(&out[..len]).into_owned())
 }
 
-fn names<K: DeviceKey>(dev: &mut Key<K>) -> Result<Vec<String>, Fail> {
+fn names<K: DeviceKey, A: Attachment>(dev: &mut Key<K, A>) -> Result<Vec<String>, Fail> {
     let mut out = Vec::new();
     dev.list(|n, _| out.push(String::from_utf8_lossy(n.as_bytes()).into_owned()))?;
     Ok(out)
@@ -517,7 +618,10 @@ fn passphrase(s: &str) -> Passphrase<'_> {
     Passphrase::new(s.as_bytes()).expect("a valid test passphrase")
 }
 
-fn export<K: DeviceKey>(dev: &mut Key<K>, pass: &str) -> Result<(BackupHead, Vec<Vec<u8>>), Fail> {
+fn export<K: DeviceKey, A: Attachment>(
+    dev: &mut Key<K, A>,
+    pass: &str,
+) -> Result<(BackupHead, Vec<Vec<u8>>), Fail> {
     let head = dev.export_begin(passphrase(pass))?;
     let mut items = Vec::new();
     loop {
@@ -530,8 +634,8 @@ fn export<K: DeviceKey>(dev: &mut Key<K>, pass: &str) -> Result<(BackupHead, Vec
     }
 }
 
-fn import<K: DeviceKey>(
-    dev: &mut Key<K>,
+fn import<K: DeviceKey, A: Attachment>(
+    dev: &mut Key<K, A>,
     pass: &str,
     head: BackupHead,
     items: &[Vec<u8>],
@@ -1423,6 +1527,161 @@ fn a_backup_refuses_the_wrong_passphrase_and_a_reordered_file() {
         Err(Fail::BadBackup),
         "an item's position is under its tag: a reordered file is a changed file"
     );
+}
+
+// --- passkeys in a backup -----------------------------------------------------------------
+
+const PASS: &str = "correct horse battery staple";
+
+/// A board with passkeys in sectors 1 and 3 of four, a PIN and one item.
+fn board_with_passkeys() -> (MemFlash, Passkeys, Key<Unbound, Passkeys>) {
+    let flash = MemFlash::blank();
+    let passkeys = Passkeys::blank(4);
+    passkeys.fill(1, 0x11).fill(3, 0x33);
+    let mut dev = flash.key_attached(&passkeys);
+    dev.pin_set(pin("12345678")).expect("sets the PIN");
+    put(
+        &mut dev,
+        "github.com",
+        Category::Login,
+        &login_item("me", "pw"),
+        false,
+    )
+    .expect("stores");
+    (flash, passkeys, dev)
+}
+
+#[test]
+fn passkeys_go_into_a_backup_and_come_back_exactly() {
+    let (_, passkeys, mut dev) = board_with_passkeys();
+    let (head, blobs) = export(&mut dev, PASS).expect("exports");
+    assert_eq!(
+        blobs.len(),
+        3,
+        "one item and the two sectors that are not blank"
+    );
+    assert!(!passkeys.frozen(), "and the passkeys are served again");
+
+    let target = Passkeys::blank(4);
+    target.fill(0, 0x55).fill(2, 0x77);
+    let other_flash = MemFlash::blank();
+    let mut other = other_flash.key_attached(&target);
+    other.pin_set(pin("87654321")).expect("sets the PIN");
+    import(&mut other, PASS, head, &blobs).expect("restores");
+    assert_eq!(
+        target.bytes(),
+        [0xFF, 0x11, 0xFF, 0x33],
+        "the copy exactly: what the file skipped is blank, whatever was there"
+    );
+    assert_eq!(
+        target.last_thaw(),
+        Some(true),
+        "told it changed: the board restarts"
+    );
+    assert_eq!(names(&mut other).expect("lists"), ["github.com"]);
+
+    import(&mut other, PASS, head, &blobs).expect("restores again");
+    assert_eq!(
+        target.last_thaw(),
+        Some(false),
+        "the same passkeys again change nothing, so nothing restarts"
+    );
+}
+
+#[test]
+fn a_backup_without_passkeys_leaves_them_alone() {
+    let flash = MemFlash::blank();
+    let mut plain = double_tapping(&flash);
+    plain.pin_set(pin("12345678")).expect("sets the PIN");
+    put(
+        &mut plain,
+        "github.com",
+        Category::Login,
+        &login_item("me", "pw"),
+        false,
+    )
+    .expect("stores");
+    let (head, blobs) = export(&mut plain, PASS).expect("exports");
+
+    let (_, passkeys, mut dev) = board_with_passkeys();
+    import(&mut dev, PASS, head, &blobs).expect("restores");
+    assert_eq!(
+        passkeys.bytes(),
+        [0xFF, 0x11, 0xFF, 0x33],
+        "an older backup, or one from the C6, keeps the passkeys there are"
+    );
+    assert_eq!(passkeys.last_thaw(), Some(false));
+}
+
+#[test]
+fn a_board_without_passkeys_or_laid_out_otherwise_refuses_them() {
+    let (_, _, mut dev) = board_with_passkeys();
+    let (head, blobs) = export(&mut dev, PASS).expect("exports");
+
+    let flash = MemFlash::blank();
+    let mut plain = tapping(&flash);
+    plain.pin_set(pin("12345678")).expect("sets the PIN");
+    assert_eq!(
+        import(&mut plain, PASS, head, &blobs),
+        Err(Fail::BadBackup),
+        "a board with nowhere to put passkeys says so rather than drop them"
+    );
+
+    let wider = Passkeys::blank(5);
+    wider.fill(4, 0x44);
+    let other_flash = MemFlash::blank();
+    let mut other = other_flash.key_attached(&wider);
+    other.pin_set(pin("12345678")).expect("sets the PIN");
+    assert_eq!(import(&mut other, PASS, head, &blobs), Err(Fail::BadBackup));
+    assert_eq!(
+        wider.bytes(),
+        [0xFF, 0xFF, 0xFF, 0xFF, 0x44],
+        "a filesystem of another size would not mount: nothing of it is written"
+    );
+    assert!(!wider.frozen());
+}
+
+#[test]
+fn every_way_a_session_ends_lets_the_passkeys_go() {
+    let (_, passkeys, mut dev) = board_with_passkeys();
+
+    dev.export_begin(passphrase(PASS)).expect("begins");
+    assert!(passkeys.frozen(), "held from the double tap on");
+    dev.lock();
+    assert!(!passkeys.frozen(), "a lock ends it");
+
+    dev.pin_unlock(pin("12345678")).expect("unlocks");
+    dev.export_begin(passphrase(PASS)).expect("begins");
+    names(&mut dev).expect("lists");
+    assert!(
+        !passkeys.frozen(),
+        "anything that reloads the index ends it"
+    );
+
+    let (head, blobs) = export(&mut dev, PASS).expect("exports");
+    dev.import_begin(passphrase(PASS), head).expect("begins");
+    assert!(passkeys.frozen(), "a restore holds it too");
+    assert_eq!(
+        dev.import_item(&blobs[2]),
+        Err(Fail::BadBackup),
+        "out of order"
+    );
+    assert!(!passkeys.frozen(), "and a refused item ends it");
+
+    dev.import_begin(passphrase(PASS), head).expect("begins");
+    dev.import_end().expect("an empty restore");
+    assert!(!passkeys.frozen(), "as does the end");
+
+    dev.export_begin(passphrase(PASS)).expect("begins");
+    let mut item = Vec::new();
+    dev.export_next(|b| item = b.to_vec()).expect("the item");
+    passkeys.0.borrow_mut().expired = true;
+    assert_eq!(
+        dev.export_next(|_| {}),
+        Err(Fail::Internal),
+        "a board that let go mid-backup gives no sector, so no copy is torn"
+    );
+    assert!(!passkeys.frozen());
 }
 
 // --- the shape of a reach on the wire -------------------------------------------------------

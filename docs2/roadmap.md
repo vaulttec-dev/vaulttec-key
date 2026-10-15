@@ -573,8 +573,13 @@ moves but the keys:
 
 1. Put `vkey-signing`, the C6's Secure Boot key, on the nRF next to the bootloader key,
    back up to a `.vkb`, and write down where it lives. Losing it ends C6 updates forever.
+   `vkey restore --only vkey-signing <C6 .vkb>` (2026-10-15) adds one item from a backup
+   without replacing the vault. With the key on the nRF, `tools/sign-vaultkey.sh` signs the
+   C6's images again and its signed app returns to the repository, the C6 left alone.
 2. C6 flashing moves out of the CLI into a script in its folder. `espflash` leaves, and the
-   audit exception goes.
+   audit exception goes. **Deferred** (2026-10-15): the script chooses between the plain
+   and the Secure Boot bootloader, and the wrong choice on a plain chip burns its eFuses.
+   It waits until the C6 may be touched to test it; until then `vkey setup` keeps doing it.
 
 Acceptance: the threat model's nRF section is rewritten to match; `selftest` green on the
 nRF; `check --wipe-everything` green on the C6.
@@ -696,7 +701,37 @@ Milestones, one commit each, each leaving a key that works:
    - `check --wipe-everything` passed, then the restore from the `.vkb` through the new
      host-side reseal, the 1Password sync and `selftest`.
 5. **The passkeys in the `.vkb`**: backup and restore carry the Trussed filesystem, sealed
-   under the passphrase like the items.
+   under the passphrase like the items. Built 2026-10-15:
+   - The core takes a fifth board trait, `hal::Attachment`: sectors to read and put, a
+     freeze and a thaw. The C6 passes `NoAttachment`.
+   - A backup carries the non-blank sectors after the items, each sealed under
+     `REGION_AAD` plus its position and holding the geometry. Every session begins and
+     ends in one place (`start_session`/`end_session`).
+   - The board freezes Trussed for the session, lets go by itself after 10 s of a silent
+     vkey line, and resets after a restore that changed a sector.
+   - The CLI opens the written backup to count items and sectors. It reseals sectors in
+     their new positions on restore, or leaves them in the file on a board without
+     passkeys.
+   - Host tests cover the exact copy, an identical restore that changes nothing, an older
+     file that leaves the passkeys alone, the refusal by a board without them or laid out
+     otherwise, and every way a session ends.
+
+   Acceptance, still on the board:
+   1. Take a fresh `.vkb`.
+   2. authenticatorReset (the hold, within 10 s of plugging in).
+   3. `sudo` asks for the password and the webauthn.io login fails.
+   4. Restore the `.vkb`. The key restarts.
+   5. `sudo` takes a tap and webauthn.io logs in again, with nothing enrolled anew.
+   6. `check --wipe-everything`, the restore, the 1Password sync and `selftest`.
+
+   **Accepted 2026-10-15**, all six in the order 6, 1-5: `check --wipe-everything`
+   green on the new image, the restore, the sync and `selftest` green; a backup of 48
+   items "and the passkeys"; authenticatorReset erased them after the hold; `sudo` then
+   asked for the password and webauthn.io refused the login; the restore brought back 48
+   items and the passkeys and the key restarted ("soft reset"); `sudo` took a tap and
+   webauthn.io logged in, nothing enrolled anew. Two `Broken pipe`s during the session
+   were the dongle's edge connector moving under a press (re-enumeration within a
+   second, the vault still unlocked), not the firmware.
 
 ---
 

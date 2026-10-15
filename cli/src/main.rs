@@ -179,6 +179,10 @@ enum Cmd {
         /// 1Password Developer Environment to import (name:id or name=id)
         #[arg(short = 'E', long = "environment")]
         environments: Vec<String>,
+        /// Only these items out of a .vkb, added beside what the key holds; nothing
+        /// else is replaced
+        #[arg(long = "only", value_name = "NAME")]
+        only: Vec<String>,
     },
     /// Lifecycle test of a development board; ERASES everything
     #[command(long_about = "vkey check --wipe-everything\n\n\
@@ -398,7 +402,8 @@ fn run(cli: Cli) -> Result<u8, Error> {
             file,
             op,
             environments,
-        } => run_restore(&mut dev, file.as_deref(), op, &environments),
+            only,
+        } => run_restore(&mut dev, file.as_deref(), op, &environments, &only),
     }
 }
 
@@ -484,8 +489,8 @@ fn run_backup(dev: &mut Device, version: &str, file: &Path) -> Result<u8, Error>
         backup::export(d, &file, passphrase(&pass)?)
     })?;
     println!(
-        "{n} item{} sealed into {} - it opens only with the passphrase, on any vkey",
-        if n == 1 { "" } else { "s" },
+        "{} sealed into {} - it opens only with the passphrase, on any vkey",
+        n.describe(),
         file.display()
     );
     Ok(0)
@@ -498,12 +503,34 @@ enum RestoreSource {
     Backup,
 }
 
+/// `vkey restore --only NAME file.vkb`: those items added, the rest of the key as it was.
+fn run_pick(dev: &mut Device, file: &Path, names: &[String]) -> Result<u8, Error> {
+    let file = backup::source(file)?;
+    let pass = prompt_secret("backup passphrase")?;
+    passphrase(&pass)?;
+    let added = with_unlock(dev, |d| backup::pick(d, &file, passphrase(&pass)?, names))?;
+    for name in &added {
+        println!("added '{name}' from {}", file.display());
+    }
+    println!("nothing else on the key changed");
+    Ok(0)
+}
+
 fn run_restore(
     dev: &mut Device,
     file: Option<&Path>,
     op: bool,
     environments: &[String],
+    only: &[String],
 ) -> Result<u8, Error> {
+    if !only.is_empty() {
+        let Some(file) = file else {
+            return Err(Error::Value(
+                "--only takes items out of a .vkb: name the file".into(),
+            ));
+        };
+        return run_pick(dev, file, only);
+    }
     if op {
         return run_op(dev, None, None, None, environments, false);
     }
@@ -565,13 +592,23 @@ fn run_restore(
     passphrase(&pass)?;
     let done = with_unlock(dev, |d| backup::import(d, &file, passphrase(&pass)?))?;
     println!(
-        "{} item{} restored from {}",
+        "{} item{}{} restored from {}",
         done.count,
         if done.count == 1 { "" } else { "s" },
+        if done.passkeys {
+            " and the passkeys"
+        } else {
+            ""
+        },
         file.display()
     );
     for line in &done.skipped {
         eprintln!("  left in the file: {line}");
+    }
+    if done.passkeys {
+        println!("the key restarts to load its passkeys...");
+        // Past the reset, so a command run right after does not land in it.
+        std::thread::sleep(std::time::Duration::from_secs(3));
     }
     Ok(0)
 }

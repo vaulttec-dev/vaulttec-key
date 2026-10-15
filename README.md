@@ -118,8 +118,9 @@ vkey get myapp > .env                 # better without a file:  env $(vkey get m
 vkey list · rm · info · lock · pin set/change · totp selftest · wipe
 vkey op [query]                       # mirror 1Password (passwords, TOTP, notes, developer .env)
 vkey import passwords.csv             # Google Password Manager or 1Password CSV export (skips unchanged)
-vkey backup vault.vkb                 # everything in one file, sealed on the key; two taps
+vkey backup vault.vkb                 # everything, the nRF's passkeys too, sealed on the key; two taps
 vkey restore [file]                   # restore from 1Password, CSV, or .vkb backup file
+vkey restore --only NAME file.vkb     # just that item out of a backup, nothing replaced
 vkey check --wipe-everything          # lifecycle test on a board; ERASES EVERYTHING
 sudo vkey auth enable                 # sudo and the lock screen with a tap (below)
 ```

@@ -84,9 +84,15 @@ fn main() {
             )
             .expect("writing to a String cannot fail");
         }
+        let passkeys = match t.get("passkeys") {
+            None => false,
+            Some(v) => v
+                .as_bool()
+                .unwrap_or_else(|| panic!("{}: `passkeys` is not a bool", toml_path.display())),
+        };
         writeln!(
             out,
-            "    Board {{ name: {:?}, chip: {:?}, button: {:?}, usb_vid: {:#x}, usb_pid: {:#x}, images: &[{images}] }},",
+            "    Board {{ name: {:?}, chip: {:?}, button: {:?}, usb_vid: {:#x}, usb_pid: {:#x}, passkeys: {passkeys}, images: &[{images}] }},",
             string("name"),
             string("chip"),
             string("button"),

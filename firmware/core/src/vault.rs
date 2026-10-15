@@ -51,6 +51,14 @@ pub const ENV_KEY_AAD: &[u8] = b"vaultkey/env-key/v1";
 /// What a backup item is sealed under, followed by its position in the file: an item
 /// moved, repeated or dropped from the middle fails to open on the way back in.
 pub const BACKUP_AAD: &[u8] = b"vaultkey/backup/v1";
+/// What a sector of the board's attachment (`hal::Attachment`, the nRF52840's passkeys)
+/// is sealed under in a backup, followed like an item by its position in the file:
+/// never read as an item, never moved unnoticed. Sectors come after the items.
+pub const REGION_AAD: &[u8] = b"vaultkey/backup-region/v1";
+/// A sealed sector's plaintext starts `sector_size u32le | sector_count u32le | index
+/// u32le`, then the sector: a board laid out differently refuses it rather than write
+/// a filesystem that would not mount.
+pub const REGION_HEAD: usize = 12;
 
 /// Argon2id cost: memory in KiB and passes over it. Stored per vault and per backup, so
 /// a board can change its own without breaking either.

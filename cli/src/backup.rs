@@ -37,15 +37,58 @@ pub fn target(path: &Path) -> Result<PathBuf, Error> {
     Ok(file)
 }
 
-/// Every item off the device into `path`; how many there were. Nothing is written
-/// until the last item is in hand, so a refused tap or a pulled cable leaves no
-/// half file behind.
-pub fn export(dev: &mut Device, path: &Path, pass: Passphrase<'_>) -> Result<usize, Error> {
+/// What a backup holds: the items, and the sectors of the board's passkeys.
+pub struct Exported {
+    pub items: usize,
+    pub sectors: usize,
+}
+
+impl Exported {
+    /// "50 items" or "50 items and the passkeys", for the line that reports it.
+    pub fn describe(&self) -> String {
+        let items = format!(
+            "{} item{}",
+            self.items,
+            if self.items == 1 { "" } else { "s" }
+        );
+        if self.sectors == 0 {
+            items
+        } else {
+            format!("{items} and the passkeys")
+        }
+    }
+}
+
+/// Every item off the device into `path`, and the passkeys after them on a board that
+/// keeps them. Nothing is written until the last one is in hand, so a refused tap or a
+/// pulled cable leaves no half file behind; and before saying it is done, this side
+/// opens every one with the passphrase it was given, so a file that would not open is
+/// never reported as a backup.
+pub fn export(dev: &mut Device, path: &Path, pass: Passphrase<'_>) -> Result<Exported, Error> {
     let path = &target(path)?;
     let head = dev.export_begin(pass)?;
     let mut items = Vec::new();
     while let Some(item) = dev.export_next()? {
         items.push(item);
+    }
+    let mut mem = vec![Block::new(); KDF_BLOCKS];
+    let key = vault::backup_key(pass, &head.salt, head.cost, &mut mem)
+        .ok_or_else(|| Error::Value("the backup's key cannot be made here".into()))?;
+    let mut exported = Exported {
+        items: 0,
+        sectors: 0,
+    };
+    for (i, sealed) in (0u32..).zip(&items) {
+        match open_item(&key, i, sealed) {
+            Some(Incoming::Region(_)) => exported.sectors += 1,
+            Some(_) => exported.items += 1,
+            None => {
+                return Err(Error::Value(
+                    "the key's backup does not open with the passphrase; nothing was written"
+                        .into(),
+                ));
+            }
+        }
     }
     let count = u32::try_from(items.len()).map_err(|_| Error::BadArg)?;
     let mut file = Vec::with_capacity(FIXED + items.iter().map(|i| 2 + i.len()).sum::<usize>());
@@ -59,7 +102,7 @@ pub fn export(dev: &mut Device, path: &Path, pass: Passphrase<'_>) -> Result<usi
     }
     write_private(path, &file)
         .map_err(|e| Error::Value(format!("cannot write {}: {e}", path.display())))?;
-    Ok(items.len())
+    Ok(exported)
 }
 
 /// Written readable by the owner alone where the filesystem has owners: the file
@@ -96,7 +139,7 @@ pub fn source(path: &Path) -> Result<PathBuf, Error> {
 use vaultkey_core::item::{Category, Class, FieldKind, Item as CoreItem};
 use vaultkey_core::oath::{Name, Params};
 use vaultkey_core::vault::{
-    self, BACKUP_AAD, Block, CryptoRng, KDF_BLOCKS, NONCE_LEN, RngCore, TAG_LEN,
+    self, BACKUP_AAD, Block, CryptoRng, KDF_BLOCKS, NONCE_LEN, REGION_AAD, RngCore, TAG_LEN,
 };
 use zeroize::Zeroizing;
 
@@ -142,17 +185,19 @@ const RETIRED_AUTH: u8 = 201;
 const RETIRED_AUTH_KIND: [u8; 4] = [4, 0, 0, 0];
 
 /// One backup item as this side reads it: what goes back on the key, as the plaintext
-/// the device packed - `category | name_len | name | item` - or a retired item's name.
+/// the device packed - `category | name_len | name | item` - a sector of the board's
+/// passkeys, or a retired item's name.
 enum Incoming {
     Keep(Zeroizing<Vec<u8>>),
+    Region(Zeroizing<Vec<u8>>),
     Retired(String),
 }
 
-/// Where item `item_idx` sits in the file, as its seal binds it.
-fn item_aad(item_idx: u32) -> [u8; BACKUP_AAD.len() + 4] {
-    let mut aad = [0u8; BACKUP_AAD.len() + 4];
-    aad[..BACKUP_AAD.len()].copy_from_slice(BACKUP_AAD);
-    aad[BACKUP_AAD.len()..].copy_from_slice(&item_idx.to_le_bytes());
+/// Where item `item_idx` sits in the file, as its seal binds it: after `BACKUP_AAD` for
+/// an item, `REGION_AAD` for a sector.
+fn aad(prefix: &[u8], item_idx: u32) -> Vec<u8> {
+    let mut aad = prefix.to_vec();
+    aad.extend_from_slice(&item_idx.to_le_bytes());
     aad
 }
 
@@ -160,7 +205,14 @@ fn item_aad(item_idx: u32) -> [u8; BACKUP_AAD.len() + 4] {
 /// items existed. None when it does not open or parse.
 fn open_item(key: &[u8; vault::KEY_LEN], item_idx: u32, sealed: &[u8]) -> Option<Incoming> {
     let mut buf = Zeroizing::new(sealed.to_vec());
-    let n = vault::open_in_place(key, &item_aad(item_idx), &mut buf)?;
+    let Some(n) = vault::open_in_place(key, &aad(BACKUP_AAD, item_idx), &mut buf) else {
+        // Not an item: a sector of the passkeys, or nothing this key opens.
+        let mut buf = Zeroizing::new(sealed.to_vec());
+        let n = vault::open_in_place(key, &aad(REGION_AAD, item_idx), &mut buf)?;
+        return Some(Incoming::Region(Zeroizing::new(
+            buf[NONCE_LEN..NONCE_LEN + n].to_vec(),
+        )));
+    };
     let plain = &buf[NONCE_LEN..NONCE_LEN + n];
 
     if let Some((&category, rest)) = plain.split_first()
@@ -230,11 +282,15 @@ fn retired(name: Name<'_>) -> Incoming {
 
 /// `plain` sealed as backup item `item_idx`, as the device would have sealed it.
 fn seal_item(key: &[u8; vault::KEY_LEN], item_idx: u32, plain: &[u8]) -> Result<Vec<u8>, Error> {
+    seal_at(key, &aad(BACKUP_AAD, item_idx), plain)
+}
+
+fn seal_at(key: &[u8; vault::KEY_LEN], aad: &[u8], plain: &[u8]) -> Result<Vec<u8>, Error> {
     let total = plain.len();
     let mut out = vec![0u8; NONCE_LEN + total + TAG_LEN];
     out[NONCE_LEN..NONCE_LEN + total].copy_from_slice(plain);
     let mut rng = BackupRng::new();
-    let sealed = vault::seal_in_place(key, &mut rng, &item_aad(item_idx), &mut out, total);
+    let sealed = vault::seal_in_place(key, &mut rng, aad, &mut out, total);
     if rng.failed {
         return Err(Error::Value("no randomness from OS".into()));
     }
@@ -250,54 +306,150 @@ fn seal_item(key: &[u8; vault::KEY_LEN], item_idx: u32, plain: &[u8]) -> Result<
 /// that does not open here goes as it is, for the device to refuse.
 pub fn import(dev: &mut Device, path: &Path, pass: Passphrase<'_>) -> Result<Restored, Error> {
     let (head, items) = read(&source(path)?)?;
+    let passkeys = keeps_passkeys(dev)?;
     let mut mem = vec![Block::new(); KDF_BLOCKS];
-    let (items, skipped) = match vault::backup_key(pass, &head.salt, head.cost, &mut mem) {
-        Some(key) => prepare(&key, items)?,
-        None => (items, Vec::new()),
+    let prepared = match vault::backup_key(pass, &head.salt, head.cost, &mut mem) {
+        Some(key) => prepare(&key, items, passkeys)?,
+        None => Restored {
+            count: items.len(),
+            blobs: items,
+            skipped: Vec::new(),
+            passkeys: false,
+        },
     };
 
     dev.import_begin(pass, head)?;
-    for item in &items {
-        dev.import_item(item)?;
+    for blob in &prepared.blobs {
+        dev.import_item(blob)?;
     }
     dev.import_end()?;
-    Ok(Restored {
-        count: items.len(),
-        skipped,
-    })
+    Ok(prepared)
 }
 
-/// The items as the device takes them back, and the names of those left out.
+/// The items called `names` out of the backup at `path`, put on the key beside what it
+/// holds, under the PIN: a restore of a few things that replaces nothing. An item the
+/// key already has under that name is refused, never overwritten. The names put on.
+pub fn pick(
+    dev: &mut Device,
+    path: &Path,
+    pass: Passphrase<'_>,
+    names: &[String],
+) -> Result<Vec<String>, Error> {
+    let (head, blobs) = read(&source(path)?)?;
+    let mut mem = vec![Block::new(); KDF_BLOCKS];
+    let key = vault::backup_key(pass, &head.salt, head.cost, &mut mem)
+        .ok_or_else(|| Error::Value("the backup's key cannot be made here".into()))?;
+    let mut found = Vec::new();
+    for (i, sealed) in (0u32..).zip(&blobs) {
+        let Some(incoming) = open_item(&key, i, sealed) else {
+            return Err(Error::Value(format!(
+                "{} does not open with that passphrase",
+                path.display()
+            )));
+        };
+        let Incoming::Keep(plain) = incoming else {
+            continue;
+        };
+        let Some((_, rest)) = plain.split_first() else {
+            continue;
+        };
+        let Some((name, body)) = Name::take(rest) else {
+            continue;
+        };
+        let name = String::from_utf8_lossy(name.as_bytes()).into_owned();
+        if names.contains(&name) {
+            found.push((name, Item::unpack(body)?));
+        }
+    }
+    let missing: Vec<&String> = names
+        .iter()
+        .filter(|n| !found.iter().any(|(f, _)| f == *n))
+        .collect();
+    if !missing.is_empty() {
+        return Err(Error::Value(format!(
+            "not in {}: {}; nothing was added",
+            path.display(),
+            missing
+                .iter()
+                .map(|n| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    for (name, item) in &found {
+        dev.put(name, item, false)?;
+    }
+    Ok(found.into_iter().map(|(name, _)| name).collect())
+}
+
+/// Whether the board on the other end keeps passkeys, as its folder says.
+fn keeps_passkeys(dev: &mut Device) -> Result<bool, Error> {
+    let version = dev.info()?;
+    Ok(version
+        .rsplit(' ')
+        .next()
+        .and_then(crate::boards::by_name)
+        .is_some_and(|b| b.passkeys))
+}
+
+/// The items and the passkeys as the device takes them back - the passkeys only on a
+/// board that keeps them - and the names of what is left out.
 fn prepare(
     key: &[u8; vault::KEY_LEN],
     items: Vec<Vec<u8>>,
-) -> Result<(Vec<Vec<u8>>, Vec<String>), Error> {
+    passkeys: bool,
+) -> Result<Restored, Error> {
     let opened = (0u32..)
         .zip(&items)
         .map(|(i, sealed)| open_item(key, i, sealed))
         .collect::<Option<Vec<Incoming>>>();
     let Some(opened) = opened else {
-        return Ok((items, Vec::new()));
+        return Ok(Restored {
+            count: items.len(),
+            blobs: items,
+            skipped: Vec::new(),
+            passkeys: false,
+        });
     };
-    let mut kept = Vec::with_capacity(opened.len());
-    let mut skipped = Vec::new();
+    let mut out = Restored {
+        count: 0,
+        blobs: Vec::with_capacity(opened.len()),
+        skipped: Vec::new(),
+        passkeys: false,
+    };
+    let mut sectors_left = 0;
     for item in opened {
+        let at = u32::try_from(out.blobs.len()).map_err(|_| Error::BadArg)?;
         match item {
             Incoming::Keep(plain) => {
-                let at = u32::try_from(kept.len()).map_err(|_| Error::BadArg)?;
-                kept.push(seal_item(key, at, &plain)?);
+                out.blobs.push(seal_item(key, at, &plain)?);
+                out.count += 1;
             }
-            Incoming::Retired(name) => skipped.push(name),
+            Incoming::Region(plain) if passkeys => {
+                out.blobs.push(seal_at(key, &aad(REGION_AAD, at), &plain)?);
+                out.passkeys = true;
+            }
+            Incoming::Region(_) => sectors_left += 1,
+            Incoming::Retired(name) => out.skipped.push(name),
         }
     }
-    Ok((kept, skipped))
+    if sectors_left > 0 {
+        out.skipped
+            .push("the passkeys: this board does not keep passkeys".to_string());
+    }
+    Ok(out)
 }
 
-/// What a restore did: how many items are on the key, and what the file held that this
-/// build could not store - a retired `vkey auth` secret from an older backup.
+/// What a restore did: how many items are on the key, whether the passkeys went back
+/// too - the key then restarts to load them - and what the file held that this board
+/// could not take: the passkeys on one without them, a retired `vkey auth` secret from
+/// an older backup.
 pub struct Restored {
     pub count: usize,
+    pub passkeys: bool,
     pub skipped: Vec<String>,
+    /// The sealed items and sectors as they went to the device.
+    blobs: Vec<Vec<u8>>,
 }
 
 /// The file's head and items, checked for shape only: what is inside an item is the
@@ -431,7 +583,11 @@ mod tests {
             .map(|(i, p)| seal_item(&key, i, p).expect("seals"))
             .collect();
 
-        let (items, skipped) = prepare(&key, sealed).expect("prepares");
+        let Restored {
+            blobs: items,
+            skipped,
+            ..
+        } = prepare(&key, sealed, true).expect("prepares");
         assert_eq!(items.len(), 2, "the auth secret stays in the file");
         assert_eq!(skipped.len(), 1, "and is named: {skipped:?}");
         assert!(skipped[0].starts_with("hifes@pop-os:"), "{skipped:?}");
@@ -453,11 +609,43 @@ mod tests {
         let login = Category::Login.wire();
         let sealed =
             vec![seal_item(&key, 0, &backup_plain(login, "github", login)).expect("seals")];
-        let (items, skipped) = prepare(&[8u8; vault::KEY_LEN], sealed.clone()).expect("prepares");
+        let out = prepare(&[8u8; vault::KEY_LEN], sealed.clone(), true).expect("prepares");
         assert_eq!(
-            items, sealed,
+            out.blobs, sealed,
             "a wrong passphrase is the device's to refuse"
         );
-        assert!(skipped.is_empty());
+        assert!(out.skipped.is_empty());
+    }
+
+    #[test]
+    fn passkeys_move_up_behind_the_items_or_stay_in_the_file() {
+        let key = [7u8; vault::KEY_LEN];
+        let login = Category::Login.wire();
+        let sector = vec![0x5A; 16];
+        let file = [
+            seal_item(
+                &key,
+                0,
+                &backup_plain(RETIRED_AUTH, "hifes@pop-os", RETIRED_AUTH),
+            )
+            .expect("seals"),
+            seal_item(&key, 1, &backup_plain(login, "github", login)).expect("seals"),
+            seal_at(&key, &aad(REGION_AAD, 2), &sector).expect("seals"),
+        ];
+
+        let out = prepare(&key, file.to_vec(), true).expect("prepares");
+        assert_eq!((out.count, out.passkeys, out.blobs.len()), (1, true, 2));
+        let Some(Incoming::Region(plain)) = open_item(&key, 1, &out.blobs[1]) else {
+            panic!("the sector opens one place up, under the sectors' associated data");
+        };
+        assert_eq!(plain.as_slice(), sector.as_slice());
+
+        let out = prepare(&key, file.to_vec(), false).expect("prepares");
+        assert_eq!((out.count, out.passkeys, out.blobs.len()), (1, false, 1));
+        assert!(
+            out.skipped.iter().any(|s| s.starts_with("the passkeys")),
+            "a board without passkeys takes the items and names what it leaves: {:?}",
+            out.skipped
+        );
     }
 }

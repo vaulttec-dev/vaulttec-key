@@ -83,9 +83,23 @@ and every guarantee below that rests on the eFuse key, JTAG being off or Secure 
   - **Origin binding.** The browser binds a passkey to its site's origin, so a look-alike
     site gets nothing it can use: the property WebAuthn has and TOTP lacks. TOTP codes and
     passwords from the vault stay as phishable as anywhere.
-  - **No backup yet.** Milestone 5 puts the passkeys into the `.vkb`, a deliberate break
-    from FIDO's rule that they never leave. Until then, losing the key loses them, so
-    every site keeps a second way in.
+  - **They are in the backup, under its passphrase** (milestone 5): a deliberate break
+    from FIDO's rule that they never leave (maintainer's decision, 2026-10-15). `vkey
+    backup` carries Trussed's whole filesystem after the items, as sealed 4 KiB sectors:
+    every passkey, the key that wraps the non-resident credentials (`pam_u2f`'s among
+    them), the signature counters. They leave only after the double tap, like the items.
+    Passkeys are not served while the backup runs, so the copy is never torn.
+    - Whoever has the `.vkb` and its passphrase has the passkeys. Restored onto another
+      nRF52840, they make a clone that answers every site and this host's `sudo`.
+    - A restore replaces the passkeys with the PIN alone and no gesture, as it replaces
+      the vault. A file with no passkeys leaves them as they are.
+    - Restoring an older backup winds the signature counters back. A site that checks
+      them may take the key for a clone.
+    - A restore cut short leaves the region torn. The key formats it on its next start,
+      which also loses the `sudo` credential, until the restore runs again from the file.
+    - The C6 takes an nRF backup's items and leaves the passkeys in the file, named.
+
+    Losing the key with no backup still loses them, so every site keeps a second way in.
 
 **Accepted, not fixed** (maintainer's decision, 2026-10-13): this revision-2 chip will hold
 everything once the steps below are done. The glitch above stays open after them. Someone

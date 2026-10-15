@@ -25,7 +25,7 @@ use esp_storage::FlashStorage;
 use smart_leds::{RGB8, SmartLedsWrite, brightness};
 use static_cell::{ConstStaticCell, StaticCell};
 use vaultkey_core::device::{self, Device};
-use vaultkey_core::hal::{Clock, DeviceKey, Port, Ui};
+use vaultkey_core::hal::{Clock, DeviceKey, NoAttachment, Port, Ui};
 use vaultkey_core::proto::Proto;
 use vaultkey_core::store::{self, Layout, Store};
 use vaultkey_core::ui::State;
@@ -192,6 +192,7 @@ fn main() -> ! {
         trng,
         Uptime,
         ChipKey::detect(p.HMAC),
+        NoAttachment,
         KDF_COST,
         VAULT.init_with(store::Index::empty),
         BUF.take(),
