@@ -8,7 +8,6 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use ed25519_dalek::{Signer, SigningKey};
 use embedded_storage::nor_flash::{
     ErrorType, NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash,
 };
@@ -18,13 +17,12 @@ use sha2::Sha256;
 use vaultkey_core::device::{self, Device, Reach};
 use vaultkey_core::hal::{Clock, DeviceKey, Ui};
 use vaultkey_core::item::{Category, Class, Field, FieldKind, Item, Writer};
-use vaultkey_core::oath::{AUTH_SECRET_LEN, Algo, Digits, Name, Params};
+use vaultkey_core::oath::{Algo, Digits, Name, Params};
 use vaultkey_core::store::{self, Layout, MAX_ATTEMPTS, Store};
-use vaultkey_core::ui::State;
+use vaultkey_core::ui::{self, State};
 use vaultkey_core::vault::{self, Block, Cost, KDF_BLOCKS, Passphrase, Pin};
 use vaultkey_core::wire::{
-    AUTH_CHALLENGE_LEN, AUTH_SIGNED_PREFIX, BackupHead, Cmd, Fail, HAS_OPEN, HAS_SECRET, HAS_SEED,
-    OK, REACH_OPEN, REACH_SECRET, REACH_SEED,
+    BackupHead, Cmd, Fail, HAS_OPEN, HAS_SECRET, HAS_SEED, OK, REACH_OPEN, REACH_SECRET, REACH_SEED,
 };
 
 // --- the hardware, faked -------------------------------------------------------------
@@ -298,6 +296,8 @@ enum Finger {
     DoubleTap {
         gap: u64,
     },
+    /// One tap whose contact opens for 15 ms in the middle: one press, bouncing.
+    BouncyTap,
     /// Down before the request arrives, and never let go.
     Taped,
 }
@@ -309,6 +309,8 @@ struct Button {
     finger: Finger,
     down: Vec<(u64, u64)>,
     asked: u32,
+    /// When the request is withdrawn, if it ever is.
+    withdrawn_at: Option<u64>,
 }
 
 impl Button {
@@ -318,6 +320,15 @@ impl Button {
             finger,
             down: Vec::new(),
             asked: 0,
+            withdrawn_at: None,
+        }
+    }
+
+    /// The same finger, on a request withdrawn at `ms` on the clock.
+    fn withdrawn_at(self, ms: u64) -> Self {
+        Button {
+            withdrawn_at: Some(ms),
+            ..self
         }
     }
 }
@@ -335,6 +346,7 @@ impl Ui for Button {
             Finger::DoubleTap { gap } => {
                 vec![(from, from + 200), (from + 200 + gap, from + 400 + gap)]
             }
+            Finger::BouncyTap => vec![(from, from + 100), (from + 115, from + 300)],
             Finger::Away | Finger::Taped => Vec::new(),
         };
     }
@@ -345,6 +357,10 @@ impl Ui for Button {
                 .down
                 .iter()
                 .any(|(a, b)| (*a..*b).contains(&self.clock.peek()))
+    }
+
+    fn withdrawn(&self) -> bool {
+        self.withdrawn_at.is_some_and(|t| self.clock.peek() >= t)
     }
 }
 
@@ -629,6 +645,10 @@ fn only_valid_values_exist() {
         Category::from_wire(250).is_none(),
         "a category this firmware does not know is refused, not defaulted"
     );
+    assert!(
+        Category::from_wire(201).is_none() && Cmd::from_wire(0x19).is_none(),
+        "vkey auth's category and command are gone, and nothing took their numbers"
+    );
 }
 
 #[test]
@@ -641,7 +661,6 @@ fn wire_codes_round_trip() {
         Cmd::Delete,
         Cmd::ItemGet,
         Cmd::Rename,
-        Cmd::Respond,
         Cmd::PinStatus,
         Cmd::PinSet,
         Cmd::PinUnlock,
@@ -972,6 +991,59 @@ fn a_tap_never_wipes_and_never_exports_a_seed() {
         ["rfc"],
         "and the vault is still there"
     );
+}
+
+#[test]
+fn a_bounce_in_one_press_is_not_two_taps() {
+    let flash = MemFlash::blank();
+    let clock = Ticker::default();
+    let mut dev = flash.key_with(Button::new(&clock, Finger::BouncyTap), clock, Unbound);
+    dev.pin_set(pin("12345678")).expect("sets the PIN");
+    put(
+        &mut dev,
+        "rfc",
+        Category::Login,
+        &totp_item(b"12345678901234567890"),
+        false,
+    )
+    .expect("stores");
+    assert_eq!(
+        dev.export_begin(passphrase("correct horse battery staple")),
+        Err(Fail::Refused),
+        "the contact opening for 15 ms mid-press is not a release"
+    );
+    code(&mut dev, "rfc", 59).expect("and the bouncing tap still approves a code");
+}
+
+#[test]
+fn a_withdrawn_tap_wait_ends_refused_and_at_once() {
+    let clock = Ticker::default();
+    let mut button = Button::new(&clock, Finger::Away).withdrawn_at(1_000);
+    assert!(!ui::await_confirmation(&mut button, &clock, 30_000));
+    assert!(
+        clock.peek() < 2_000,
+        "the wait ends when the request goes, not at its deadline: {} ms",
+        clock.peek()
+    );
+}
+
+#[test]
+fn a_withdrawn_hold_never_completes() {
+    // Down from 100 ms for ten seconds; withdrawn two seconds into the hold.
+    let clock = Ticker::default();
+    let mut button = Button::new(&clock, Finger::Hold(10_000)).withdrawn_at(2_100);
+    assert!(
+        !ui::await_hold(&mut button, &clock, 30_000, 5_000),
+        "a hold that goes on past five seconds after the request was withdrawn is no wipe"
+    );
+}
+
+#[test]
+fn a_withdrawn_second_tap_window_ends_refused() {
+    // First tap 100..300 ms, second 700..900 ms; withdrawn between them.
+    let clock = Ticker::default();
+    let mut button = Button::new(&clock, Finger::DoubleTap { gap: 400 }).withdrawn_at(500);
+    assert!(!ui::await_double_tap(&mut button, &clock, 30_000));
 }
 
 #[test]
@@ -1350,120 +1422,6 @@ fn a_backup_refuses_the_wrong_passphrase_and_a_reordered_file() {
         import(&mut other, "correct horse battery staple", head, &swapped),
         Err(Fail::BadBackup),
         "an item's position is under its tag: a reordered file is a changed file"
-    );
-}
-
-// --- vkey auth ----------------------------------------------------------------------------
-
-fn chip(flash: &MemFlash, finger: Finger, key: [u8; 32]) -> Key<ChipKey> {
-    let clock = Ticker::default();
-    flash.key_with(Button::new(&clock, finger), clock, ChipKey(key))
-}
-
-const SEED: [u8; AUTH_SECRET_LEN] = [4u8; AUTH_SECRET_LEN];
-const CHALLENGE: [u8; AUTH_CHALLENGE_LEN] = [5u8; AUTH_CHALLENGE_LEN];
-
-fn auth_item() -> Vec<u8> {
-    pack(
-        Category::Auth,
-        &[(Class::Secret, FieldKind::Concealed, "seed", &SEED)],
-    )
-}
-
-fn respond<K: DeviceKey>(dev: &mut Key<K>, n: &str) -> Result<Vec<u8>, Fail> {
-    let mut out = [0u8; 64];
-    dev.respond(name(n), &CHALLENGE, &mut out)?;
-    Ok(out.to_vec())
-}
-
-fn expected_response() -> Vec<u8> {
-    let key = SigningKey::from_bytes(&SEED);
-    let mut msg = Vec::from(*AUTH_SIGNED_PREFIX);
-    msg.extend_from_slice(&CHALLENGE);
-    key.sign(&msg).to_bytes().to_vec()
-}
-
-#[test]
-fn an_auth_item_answers_a_tap_without_the_pin() {
-    let flash = MemFlash::blank();
-    let mut dev = chip(&flash, Finger::Tap, [1u8; 32]);
-    dev.pin_set(pin("12345678")).expect("sets the PIN");
-    put(&mut dev, "hifes", Category::Auth, &auth_item(), false).expect("stores the seed");
-    dev.lock();
-
-    assert_eq!(
-        respond(&mut dev, "hifes").expect("signs while locked"),
-        expected_response(),
-        "a login is proven by the finger on the board, not by the PIN"
-    );
-    assert_eq!(
-        get(&mut dev, "hifes", Reach::Seed),
-        Err(Fail::Locked),
-        "and the seed itself still never comes out, at any reach"
-    );
-}
-
-#[test]
-fn a_locked_key_names_no_item_that_is_not_an_auth_secret() {
-    let flash = MemFlash::blank();
-    let mut dev = chip(&flash, Finger::Tap, [1u8; 32]);
-    dev.pin_set(pin("12345678")).expect("sets the PIN");
-    put(
-        &mut dev,
-        "github.com",
-        Category::Login,
-        &login_item("me", "pw"),
-        false,
-    )
-    .expect("stores");
-    dev.lock();
-
-    assert_eq!(
-        respond(&mut dev, "github.com"),
-        Err(Fail::NotFound),
-        "an item that is not an auth secret reads as absent while locked: a different \
-         answer would tell a stranger which names exist"
-    );
-}
-
-#[test]
-fn an_auth_item_needs_a_chip_key_to_exist() {
-    let flash = MemFlash::blank();
-    let mut dev = tapping(&flash); // no chip key burned
-    dev.pin_set(pin("12345678")).expect("sets the PIN");
-    assert_eq!(
-        put(&mut dev, "hifes", Category::Auth, &auth_item(), false),
-        Err(Fail::Incompatible),
-        "without the eFuse key there is nothing to seal an auth secret under"
-    );
-}
-
-#[test]
-fn an_auth_item_is_not_re_sealed_by_a_pin_change() {
-    let flash = MemFlash::blank();
-    let mut dev = chip(&flash, Finger::Tap, [1u8; 32]);
-    dev.pin_set(pin("12345678")).expect("sets the PIN");
-    put(&mut dev, "hifes", Category::Auth, &auth_item(), false).expect("stores the seed");
-    put(
-        &mut dev,
-        "github.com",
-        Category::Login,
-        &login_item("me", "hunter2"),
-        false,
-    )
-    .expect("stores");
-
-    dev.pin_change(pin("12345678"), pin("87654321"))
-        .expect("changes the PIN");
-    assert_eq!(
-        respond(&mut dev, "hifes").expect("still signs"),
-        expected_response(),
-        "its key is the chip's, not the PIN's: a PIN change must leave it alone"
-    );
-    assert_eq!(
-        value(&mut dev, "github.com", Reach::Secret, "password"),
-        Some(b"hunter2".to_vec()),
-        "while everything else was re-sealed under the new PIN"
     );
 }
 

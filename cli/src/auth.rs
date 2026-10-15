@@ -1,47 +1,45 @@
-//! `vkey auth`: `sudo` and the lock screen with a tap on the key, through `pam_exec`.
+//! `vkey auth`: `sudo` and the lock screen with a tap on the key, through `pam_u2f`.
 //!
 //! ```text
-//! sudo vkey auth enable     once: a secret on the key, its public key here, PAM told
-//! vkey auth                 what PAM runs at every login
+//! sudo vkey auth enable     once: a credential for this host's logins, PAM told
 //! sudo vkey auth disable    all of it undone
 //! ```
 //!
-//! The scheme of `pam_u2f`. The key holds an Ed25519 seed that never leaves it; this
-//! host keeps only the public key, in `/etc/vkey/auth/<user>`, readable by anyone and
-//! writable by root. A login sends a fresh random challenge, the key signs it after a
-//! tap, and the signature is checked here. Nothing is written at login, so `sudo`,
-//! which runs this as root, and a lock screen running as the user read the same file.
-//! The key answers without its PIN - the seed is sealed under the chip key alone - so
-//! the tap on this board is the whole proof. Anything that goes wrong is a refusal, and
-//! PAM asks for the password as it always did.
+//! The key is a FIDO2 authenticator (the nRF52840's passkeys), so a login is the scheme
+//! every other key uses, `pam_u2f`'s (maintainer's decision, 2026-10-03). `enable` makes
+//! a credential for `pam://<host>` after a tap and tries it after another, as
+//! `pamu2fcfg` would if the 1.1.0 that distributions ship accepted a key that attests
+//! with the credential's own key (`crate::fido`). Its public half goes into
+//! `/etc/u2f_mappings`, which is root's: nothing running as the user can enrol a key of
+//! its own. One `sufficient` line in each PAM service then lets a tap in. With no key,
+//! or no tap before the key gives up (30 s), PAM asks for the password as it always did.
+//! It replaced, 2026-10-15, an Ed25519 scheme of vkey's own over `pam_exec`, which
+//! needed a chip key the nRF52840 does not have (restorable from 4bd49f3).
 
-use std::fs::{self, DirBuilder};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 
-use data_encoding::HEXLOWER;
-use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
-use zeroize::Zeroizing;
+use data_encoding::BASE64;
 
-use crate::device::{
-    AUTH_CHALLENGE_LEN, AUTH_SECRET_LEN, AUTH_SIGNATURE_LEN, AUTH_SIGNED_PREFIX, Category, Class,
-    Device, Error, FieldKind,
-};
-use crate::file;
-use crate::item::{Item, OwnedField};
-use crate::prompt::with_unlock;
+use crate::device::Error;
+use crate::{fido, file};
 
-/// What an auth entry says when someone tries to use it like the others.
-pub const USED_BY_AUTH: &str = "this entry answers `vkey auth` logins; it has nothing to show";
+/// Where distributions install the module - Debian's and Ubuntu's multiarch directories,
+/// Fedora's and Arch's. Without it the line would lock nobody out, but let nobody in.
+const PAM_U2F: [&str; 4] = [
+    "/usr/lib/x86_64-linux-gnu/security/pam_u2f.so",
+    "/usr/lib/aarch64-linux-gnu/security/pam_u2f.so",
+    "/usr/lib64/security/pam_u2f.so",
+    "/usr/lib/security/pam_u2f.so",
+];
 
-const KEY_DIR: &str = "/etc/vkey/auth";
-/// Where PAM finds the binary: root's copy, never the user's `~/.local/bin`.
-const INSTALLED: &str = "/usr/local/bin/vkey";
-/// The one line `enable` adds. `sufficient`: a good signature lets the user in, anything
-/// else falls through to the password. `seteuid`: under `sudo` the check runs as root,
-/// out of reach of whatever runs as the user; for a lock screen that is the user
-/// already, it changes nothing.
-const PAM_LINE: &str = "auth sufficient pam_exec.so quiet stdout seteuid /usr/local/bin/vkey auth";
+/// Who may log in with which credential: `user:keyHandle,publicKey,type,options`, one
+/// line per user.
+const MAPPINGS: &str = "/etc/u2f_mappings";
+/// The one line `enable` adds. `sufficient`: a good assertion lets the user in, anything
+/// else falls through to the password. `cue`: PAM says to tap the key.
+const PAM_LINE: &str = "auth sufficient pam_u2f.so authfile=/etc/u2f_mappings cue";
 /// The PAM services that get the line, when this host has them: `sudo`, and the lock
 /// screens of COSMIC, GNOME, KDE, sway and Hyprland.
 const SERVICES: [&str; 6] = [
@@ -54,118 +52,23 @@ const SERVICES: [&str; 6] = [
 ];
 /// A copy of each PAM file as it was before `enable` first touched it.
 const BEFORE: &str = ".before-vkey";
+/// What the scheme this replaced kept on the host: a public key per user.
+const OLD_KEYS: &str = "/etc/vkey/auth";
+/// And the copy of vkey its PAM line ran, which nothing runs any more.
+const OLD_BINARY: &str = "/usr/local/bin/vkey";
 
-/// A user's enrolment: the entry on the key, and its public key.
-struct Enrolled {
-    name: String,
-    key: VerifyingKey,
-}
-
-impl Enrolled {
-    fn path(user: &str) -> PathBuf {
-        Path::new(KEY_DIR).join(user)
-    }
-
-    fn read(user: &str) -> Result<Enrolled, Error> {
-        let path = Self::path(user);
-        for p in path.ancestors() {
-            root_owned(p)?;
-        }
-        let text = fs::read_to_string(&path)?;
-        let bad = || Error::Value(format!("{} is malformed", path.display()));
-        let mut lines = text.lines();
-        let (Some(name), Some(key), None) = (lines.next(), lines.next(), lines.next()) else {
-            return Err(bad());
-        };
-        let key: [u8; 32] = HEXLOWER
-            .decode(key.as_bytes())
-            .ok()
-            .and_then(|k| k.try_into().ok())
-            .ok_or_else(bad)?;
-        Ok(Enrolled {
-            name: name.to_string(),
-            key: VerifyingKey::from_bytes(&key).map_err(|_| bad())?,
-        })
-    }
-
-    fn write(&self, user: &str) -> Result<(), Error> {
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o755)
-            .create(KEY_DIR)?;
-        let text = format!("{}\n{}\n", self.name, HEXLOWER.encode(self.key.as_bytes()));
-        file::replace(&Self::path(user), text.as_bytes(), 0o644)
-    }
-}
-
-/// What `pam_exec` runs for `PAM_USER`: exit 0 lets the user in.
-pub fn verify(port: Option<&str>) -> Result<u8, Error> {
-    let user = user_from("PAM_USER", "PAM_USER is not set: this runs from pam_exec")?;
-    trusted(&std::env::current_exe()?)?;
-    let enrolled = Enrolled::read(&user)?;
-    let mut dev = Device::open(port)?;
-    let challenge = random()?;
-    println!("vkey: tap the key, or wait ten seconds for the password");
-    let signature = dev.respond(&enrolled.name, &challenge)?;
-    if !verifies(&enrolled.key, &challenge, &signature) {
-        return Err(Error::Value("the key's signature does not verify".into()));
-    }
-    Ok(0)
-}
-
-/// Whether `signature` is the key's answer to `challenge`.
-pub fn verifies(
-    key: &VerifyingKey,
-    challenge: &[u8; AUTH_CHALLENGE_LEN],
-    signature: &[u8; AUTH_SIGNATURE_LEN],
-) -> bool {
-    let mut msg = AUTH_SIGNED_PREFIX.to_vec();
-    msg.extend_from_slice(challenge);
-    key.verify_strict(&msg, &Signature::from_bytes(signature))
-        .is_ok()
-}
-
-/// `sudo vkey auth enable`: everything a tap-login needs, for the user who ran sudo.
-pub fn enable(dev: &mut Device) -> Result<u8, Error> {
+/// `sudo vkey auth enable`: a credential on the key for the user who ran sudo, its
+/// public half in the mapping, the line in PAM.
+pub fn enable() -> Result<u8, Error> {
     let user = sudo_user()?;
-    let name = format!("{user}@{}", hostname()?);
-    crate::device::name(&name)?;
-    // The login secret is sealed under the chip key alone. A board without one refuses
-    // it as `Incompatible`, which reads as "wipe it" - asked first, before anything on
-    // this host is written.
-    if !dev.pin_status()?.chip_bound {
-        return Err(Error::Value(
-            "this key has no chip key, so it cannot hold a login secret; nothing was enabled"
-                .into(),
-        ));
-    }
-
-    install_self()?;
-
-    // A fresh seed every time: its public key is kept here and the seed forgotten, so
-    // one already on the key under this name could not be matched to a public key.
-    let seed = Zeroizing::new(random()?);
-    let key = SigningKey::from_bytes(&seed).verifying_key();
-    // One secret field, and the category is what makes the device seal it under the
-    // chip key rather than the PIN's.
-    let item = Item::new(Category::Auth).with(OwnedField::new(
-        Class::Secret,
-        FieldKind::Concealed,
-        "seed",
-        &*seed,
-    ));
-    with_unlock(dev, |d| d.put(&name, &item, true))?;
-    drop(seed);
-
-    let challenge = random()?;
-    eprintln!("tap the key to check it...");
-    let signature = dev.respond(&name, &challenge)?;
-    if !verifies(&key, &challenge, &signature) {
-        return Err(Error::Value(
-            "the key's signature does not verify; nothing was enabled".into(),
-        ));
-    }
-    Enrolled { name, key }.write(&user)?;
+    let mapping = enrol(&user)?;
+    let existing = read_or_empty(Path::new(MAPPINGS))?;
+    file::replace(
+        Path::new(MAPPINGS),
+        with_mapping(&existing, &user, &mapping).as_bytes(),
+        0o644,
+    )?;
+    forget_old(&user)?;
 
     let mut armed = Vec::new();
     let mut manual = Vec::new();
@@ -189,32 +92,112 @@ pub fn enable(dev: &mut Device) -> Result<u8, Error> {
             path.display()
         );
     }
-    println!("without the key, or with no tap for ten seconds, the password works as before");
+    println!(
+        "without the key the password works as before; with the key in and no tap, the\n\
+         password prompt comes once the key gives up waiting, after 30 s"
+    );
     Ok(0)
 }
 
-/// `sudo vkey auth disable`: the line out of every PAM file, the public key off this host,
-/// the secret off the key.
-pub fn disable(dev: &mut Device) -> Result<u8, Error> {
+/// `sudo vkey auth disable`: the line out of every PAM file and the user out of the
+/// mapping. The credential stays on the key, unused, until authenticatorReset.
+pub fn disable() -> Result<u8, Error> {
     let user = sudo_user()?;
-    let name = format!("{user}@{}", hostname()?);
     for service in SERVICES {
         let path = Path::new("/etc/pam.d").join(service);
         if path.exists() {
             remove_line(&path)?;
         }
     }
-    match fs::remove_file(Enrolled::path(&user)) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
+    let path = Path::new(MAPPINGS);
+    if path.exists() {
+        let left = without_mapping(&read_or_empty(path)?, &user);
+        if left.is_empty() {
+            fs::remove_file(path)?;
+        } else {
+            file::replace(path, left.as_bytes(), 0o644)?;
+        }
     }
-    match with_unlock(dev, |d| d.delete(&name)) {
-        Ok(()) | Err(Error::NotFound) => {}
-        Err(e) => return Err(e),
-    }
-    println!("disabled: {user} logs in with the password alone, and '{name}' is off the key");
+    forget_old(&user)?;
+    println!("disabled: {user} logs in with the password alone");
     Ok(0)
+}
+
+/// A credential for `user` on the key, made and then tried with a login exactly as
+/// `pam_u2f` will ask for it - a tap each - and its mapping line, in the shape
+/// `pamu2fcfg` writes: `user:<id, base64>,<x and y, base64>,es256,+presence`. Nothing on
+/// this host changes until both taps have answered.
+fn enrol(user: &str) -> Result<String, Error> {
+    if !PAM_U2F.iter().any(|p| Path::new(p).exists()) {
+        return Err(Error::Value(
+            "pam_u2f is missing:  sudo apt install libpam-u2f".into(),
+        ));
+    }
+    // What pam_u2f asserts with when no origin is given: pam:// and gethostname().
+    let rp = format!("pam://{}", hostname()?);
+    let mut key = fido::Key::open()?;
+    eprintln!("tap the key when its light turns amber, to make the credential");
+    let credential = key.make_credential(&rp, user)?;
+    eprintln!("and once more, to try it the way a login will");
+    key.get_assertion(&rp, &credential.id)?;
+    Ok(format!(
+        "{user}:{},{},es256,+presence",
+        BASE64.encode(&credential.id),
+        BASE64.encode(&credential.public)
+    ))
+}
+
+fn hostname() -> Result<String, Error> {
+    let name = fs::read_to_string("/proc/sys/kernel/hostname")?;
+    Ok(name.trim().to_string())
+}
+
+/// `existing` with `user`'s line replaced by `mapping`, every other user's kept.
+fn with_mapping(existing: &str, user: &str, mapping: &str) -> String {
+    let mut out = without_mapping(existing, user);
+    out.push_str(mapping);
+    out.push('\n');
+    out
+}
+
+/// `existing` without `user`'s line.
+fn without_mapping(existing: &str, user: &str) -> String {
+    let mine = format!("{user}:");
+    let mut out = String::new();
+    for line in existing.lines().filter(|l| !l.starts_with(&mine)) {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// What the scheme this replaced left for `user`: the public key goes, the directory
+/// with it once empty. Its copy of vkey is pointed out rather than deleted - this run
+/// cannot tell whether someone put a binary there for another reason.
+fn forget_old(user: &str) -> Result<(), Error> {
+    let key = Path::new(OLD_KEYS).join(user);
+    if key.exists() {
+        fs::remove_file(&key)?;
+        for dir in [OLD_KEYS, "/etc/vkey"] {
+            // Only when empty: `remove_dir` refuses anything else, and that is fine.
+            fs::remove_dir(dir).ok();
+        }
+    }
+    if Path::new(OLD_BINARY).exists() {
+        println!(
+            "{OLD_BINARY} was the old scheme's copy for PAM and nothing runs it now:\n  \
+             sudo rm {OLD_BINARY}"
+        );
+    }
+    Ok(())
+}
+
+fn read_or_empty(path: &Path) -> Result<String, Error> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Whether `line` is the one that brings in the password check: `vkey` goes right above
@@ -231,19 +214,16 @@ fn is_anchor(line: &str) -> bool {
     }
 }
 
-/// A line `enable` put there, in this or an earlier form.
+/// A line `enable` put there: this one, or the old scheme's `pam_exec` of `vkey auth`.
 fn is_ours(line: &str) -> bool {
-    line.contains("pam_exec.so") && line.contains("vkey auth")
+    line.trim() == PAM_LINE || (line.contains("pam_exec.so") && line.contains("vkey auth"))
 }
 
-/// The line added above the anchor, replacing any earlier form of it; the file as it was
-/// kept once beside it. False when there is no anchor, and then nothing is written.
-fn add_line(path: &Path) -> Result<bool, Error> {
-    let text = fs::read_to_string(path)?;
+/// `text` with the line above the anchor, any earlier form of it gone. None when there
+/// is no anchor.
+fn with_line(text: &str) -> Option<String> {
     let lines: Vec<&str> = text.lines().filter(|l| !is_ours(l)).collect();
-    let Some(at) = lines.iter().position(|l| is_anchor(l)) else {
-        return Ok(false);
-    };
+    let at = lines.iter().position(|l| is_anchor(l))?;
     let mut out = String::new();
     for (i, line) in lines.iter().enumerate() {
         if i == at {
@@ -253,6 +233,16 @@ fn add_line(path: &Path) -> Result<bool, Error> {
         out.push_str(line);
         out.push('\n');
     }
+    Some(out)
+}
+
+/// The line added to the file at `path`, the file as it was kept once beside it. False
+/// when there is no anchor, and then nothing is written.
+fn add_line(path: &Path) -> Result<bool, Error> {
+    let text = fs::read_to_string(path)?;
+    let Some(out) = with_line(&text) else {
+        return Ok(false);
+    };
     if out != text {
         let mut before = path.as_os_str().to_owned();
         before.push(BEFORE);
@@ -277,29 +267,14 @@ fn remove_line(path: &Path) -> Result<(), Error> {
     file::replace(path, out.as_bytes(), 0o644)
 }
 
-/// This binary copied to where PAM runs it, unless it already is that copy.
-fn install_self() -> Result<(), Error> {
-    let me = std::env::current_exe()?;
-    if fs::canonicalize(&me)? == Path::new(INSTALLED) {
-        return Ok(());
-    }
-    file::replace(Path::new(INSTALLED), &fs::read(&me)?, 0o755)
-}
-
 /// The user who ran sudo: the one whose logins the key will answer.
 fn sudo_user() -> Result<String, Error> {
     if fs::metadata("/proc/self")?.uid() != 0 {
         return Err(Error::Value("this changes PAM: run it with sudo".into()));
     }
-    user_from(
-        "SUDO_USER",
-        "run it through sudo as the user who logs in, not as root itself",
-    )
-}
-
-/// A login name out of the environment, safe as a file name: no path, no hidden file.
-fn user_from(var: &str, missing: &str) -> Result<String, Error> {
-    let user = std::env::var(var).map_err(|_| Error::Value(missing.into()))?;
+    let user = std::env::var("SUDO_USER").map_err(|_| {
+        Error::Value("run it through sudo as the user who logs in, not as root itself".into())
+    })?;
     let ok = !user.is_empty()
         && !user.starts_with('.')
         && user
@@ -314,37 +289,52 @@ fn user_from(var: &str, missing: &str) -> Result<String, Error> {
     }
 }
 
-fn hostname() -> Result<String, Error> {
-    Ok(fs::read_to_string("/proc/sys/kernel/hostname")?
-        .trim()
-        .to_string())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// A challenge, or a seed: one random draw of this size.
-fn random() -> Result<[u8; AUTH_CHALLENGE_LEN], Error> {
-    const _: () = assert!(AUTH_SECRET_LEN == AUTH_CHALLENGE_LEN, "one draw fits both");
-    let mut b = [0u8; AUTH_CHALLENGE_LEN];
-    getrandom::getrandom(&mut b).map_err(|e| Error::Value(format!("no randomness: {e}")))?;
-    Ok(b)
-}
+    const SUDO: &str = "#%PAM-1.0\n\
+        session    required   pam_limits.so\n\
+        auth sufficient pam_exec.so quiet stdout seteuid /usr/local/bin/vkey auth\n\
+        @include common-auth\n\
+        @include common-account\n";
 
-/// Owned by root and writable by nobody else.
-fn root_owned(path: &Path) -> Result<(), Error> {
-    let m = fs::metadata(path)?;
-    if m.uid() != 0 || m.mode() & 0o022 != 0 {
-        return Err(Error::Value(format!(
-            "{} must belong to root and be writable by root alone",
-            path.display()
-        )));
+    #[test]
+    fn the_line_replaces_the_old_scheme_above_the_password_check() {
+        let out = with_line(SUDO).expect("has an anchor");
+        assert!(!out.contains("pam_exec.so"), "the old line is gone:\n{out}");
+        assert!(
+            out.contains(&format!("{PAM_LINE}\n@include common-auth\n")),
+            "right above the password check:\n{out}"
+        );
+        assert_eq!(
+            with_line(&out).as_deref(),
+            Some(out.as_str()),
+            "and twice is once"
+        );
     }
-    Ok(())
-}
 
-/// This binary and every directory above it root's alone: `sudo` runs it as root, and a
-/// copy the user can replace would hand root to whatever runs as the user.
-fn trusted(exe: &Path) -> Result<(), Error> {
-    for p in exe.ancestors() {
-        root_owned(p)?;
+    #[test]
+    fn a_file_without_the_password_check_is_left_alone() {
+        assert_eq!(with_line("auth required pam_unix.so\n"), None);
     }
-    Ok(())
+
+    #[test]
+    fn a_mapping_replaces_only_its_own_user() {
+        let existing = "alice:aaa,bbb,es256,+presence\nhifes:old,old,es256,+presence\n";
+        let out = with_mapping(existing, "hifes", "hifes:new,new,es256,+presence");
+        assert_eq!(
+            out,
+            "alice:aaa,bbb,es256,+presence\nhifes:new,new,es256,+presence\n"
+        );
+        assert_eq!(
+            without_mapping(&out, "hifes"),
+            "alice:aaa,bbb,es256,+presence\n"
+        );
+        assert_eq!(
+            without_mapping("hifesx:k,k\n", "hifes"),
+            "hifesx:k,k\n",
+            "a user whose name merely starts with another's is someone else"
+        );
+    }
 }

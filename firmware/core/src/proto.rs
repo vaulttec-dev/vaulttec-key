@@ -18,9 +18,8 @@ use crate::oath::{NAME_MAX, Name, len_u8};
 use crate::store::MAX_ENTRIES;
 use crate::vault::{Passphrase, Pin};
 use crate::wire::{
-    AUTH_CHALLENGE_LEN, AUTH_SIGNATURE_LEN, BAD_CMD, BAD_LEN, BackupHead, Cmd, FLAG_REPLACE, Fail,
-    MAGIC, MAX_PAYLOAD, OK, PinStatus, REACH_OPEN, REACH_SECRET, REACH_SEED, frame_head,
-    scan_magic,
+    BAD_CMD, BAD_LEN, BackupHead, Cmd, FLAG_REPLACE, Fail, MAGIC, MAX_PAYLOAD, OK, PinStatus,
+    REACH_OPEN, REACH_SECRET, REACH_SEED, frame_head, scan_magic,
 };
 
 /// ~5 s of silence mid-frame resynchronises the framer instead of leaving it stuck.
@@ -238,20 +237,6 @@ impl<P: Port, C: Clock> Proto<P, C> {
                         code[n] = period;
                         self.respond(OK, &code[..=n]);
                     }
-                    Err(f) => self.fail(f),
-                }
-            }
-
-            Cmd::Respond => {
-                let Some((name, rest)) = take_name(p) else {
-                    return self.reject(Malformed::Len);
-                };
-                let Ok(challenge) = <&[u8; AUTH_CHALLENGE_LEN]>::try_from(rest) else {
-                    return self.reject(Malformed::Len);
-                };
-                let mut out = [0u8; AUTH_SIGNATURE_LEN];
-                match dev.respond(name, challenge, &mut out) {
-                    Ok(()) => self.respond(OK, &out),
                     Err(f) => self.fail(f),
                 }
             }

@@ -893,11 +893,8 @@ impl Shell {
         self.known
             .retain(|name, _| entries.iter().any(|e| &e.name == name));
         for e in &entries {
-            // An auth item refuses to be read at all, and an env one holds a file
-            // rather than a login: neither has a login column or a code.
-            if matches!(e.category, Category::Auth | Category::Env)
-                || self.known.contains_key(&e.name)
-            {
+            // An env item holds a file rather than a login: no login column, no code.
+            if e.category == Category::Env || self.known.contains_key(&e.name) {
                 continue;
             }
             let (open, shape) = self.dev()?.get_with_shape(&e.name, Reach::Open)?;
@@ -1194,10 +1191,8 @@ impl Shell {
         // What an item does when used is decided by what it holds, not by a kind it was
         // filed under: a login with a seed field gives a code, and one without gives
         // its password. The open fields come first either way; they need no gesture.
-        match stored.category {
-            Category::Auth => return Err(Error::Value(crate::auth::USED_BY_AUTH.into())),
-            Category::Env => return self.use_env(&name),
-            _ => {}
+        if stored.category == Category::Env {
+            return self.use_env(&name);
         }
         // The shape comes back with the open fields and costs no gesture, so the shell
         // knows whether a code is what this item is for before asking for a tap.
@@ -1666,17 +1661,13 @@ impl Shell {
             .ask(&format!("name (Enter keeps '{name}'): "), Field::Plain)
             .map(|n| n.to_string());
 
-        match category {
-            // Nothing to edit but the name: the seed was drawn at random and is never
-            // shown.
-            Category::Auth => {}
-            Category::Env => {
-                if let Some((text, blob)) = self.env_input()? {
-                    self.after_prompt(|d| d.put(&name, &blob.item(), true))?;
-                    self.env_preview(&text);
-                }
+        if category == Category::Env {
+            if let Some((text, blob)) = self.env_input()? {
+                self.after_prompt(|d| d.put(&name, &blob.item(), true))?;
+                self.env_preview(&text);
             }
-            _ => self.edit_fields(&name)?,
+        } else {
+            self.edit_fields(&name)?;
         }
 
         let name = match new_name {

@@ -143,9 +143,8 @@ pub enum Category {
     CryptoWallet = 115,
     /// A project's `.env`, which 1Password has no category for.
     Env = 200,
-    /// An Ed25519 seed for `vkey auth`. Sealed under the chip key, never the DEK, and
-    /// the one category whose item the device refuses to hand back at all.
-    Auth = 201,
+    // 201 was `vkey auth`'s Ed25519 seed, removed 2026-10-15 (restorable from 4bd49f3).
+    // Never reused: old backups and an old vault may still hold one.
 }
 
 impl Category {
@@ -175,7 +174,6 @@ impl Category {
             114 => Some(Self::SshKey),
             115 => Some(Self::CryptoWallet),
             200 => Some(Self::Env),
-            201 => Some(Self::Auth),
             _ => None,
         }
     }

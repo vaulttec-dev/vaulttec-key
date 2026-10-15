@@ -32,6 +32,8 @@ usbd-serial = "0.2"
 usbd-ctaphid = { version = "0.5", default-features = false }
 ctaphid-dispatch = { version = "0.4", default-features = false }
 ctaphid-app = "0.2"
+# The slot through which the CTAPHID pipe raises the flag of a request the host cancels.
+ref-swap = "0.1.2"
 heapless-bytes = "0.5"
 # Passkeys: Trussed holds the keys in a littlefs of its own, fido-authenticator speaks
 # CTAP2 over it. Only the mechanisms fido-authenticator's bounds name, no logging.

@@ -680,6 +680,21 @@ Milestones, one commit each, each leaving a key that works:
    - `ui::await_release`, which takes one "not pressed" sample for a release. A bounce in
      the middle of a press could then count as two taps, and two taps at blue let a
      backup out. It gets the same debounce `released` already has.
+
+   **Accepted 2026-10-15**:
+   - `vkey auth` kept its name and became `pam_u2f`, as decided on 2026-10-03. The
+     Ed25519 scheme is gone, restorable from 4bd49f3 (`docs/threat-model.md`).
+   - `sudo` took a tap, the lock screen took a tap, and the password worked with the key
+     out.
+   - `enable` makes the credential over its own CTAP2: `pamu2fcfg` 1.1.0 calls
+     `fido_cred_verify`, which demands an attestation certificate this key does not have.
+     Its mapping line has `pamu2fcfg`'s shape, checked against the pam-u2f 1.1.0 source.
+   - A CTAPHID_CANCEL during a touch wait answers KEEPALIVE_CANCEL in 0.2 s, and the next
+     request goes through.
+   - The withdrawn-wait and bounce tests pass on the host. The bounce test fails against
+     the old `await_release`, so it catches what it is there for.
+   - `check --wipe-everything` passed, then the restore from the `.vkb` through the new
+     host-side reseal, the 1Password sync and `selftest`.
 5. **The passkeys in the `.vkb`**: backup and restore carry the Trussed filesystem, sealed
    under the passphrase like the items.
 

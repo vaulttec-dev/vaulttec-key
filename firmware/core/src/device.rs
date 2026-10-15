@@ -6,32 +6,25 @@
 //! that a backup needs - a whole secret leaving the key is one act with one gesture.
 //! Categories are labels; classes are the boundary.
 
-use ed25519_dalek::{Signer, SigningKey};
 use embedded_storage::nor_flash::NorFlash;
 use rand_core::{CryptoRng, RngCore};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::hal::{Clock, DeviceKey, Ui};
 use crate::item::{Category, Class, Item, Writer};
-use crate::oath::{self, AUTH_SECRET_LEN, NAME_MAX, Name, Params, len_u8};
+use crate::oath::{self, NAME_MAX, Name, Params, len_u8};
 use crate::store::{Header, ITEM_BUF_LEN, Index, MAX_ATTEMPTS, Slot, Store, StoredName};
 use crate::ui;
 use crate::vault::{
     self, BACKUP_AAD, Block, Cost, KDF_BLOCKS, KEY_LEN, Keys, NONCE_LEN, Passphrase, Pin, SALT_LEN,
 };
-use crate::wire::{
-    AUTH_CHALLENGE_LEN, AUTH_SIGNATURE_LEN, AUTH_SIGNED_PREFIX, BackupHead, Fail, HAS_OPEN,
-    HAS_SECRET, HAS_SEED, PinStatus,
-};
+use crate::wire::{BackupHead, Fail, HAS_OPEN, HAS_SECRET, HAS_SEED, PinStatus};
 
 /// Unlocked and idle this long, the device forgets the key on its own. Two minutes:
 /// long enough to finish a login, short enough that a key left on the desk is a
 /// locked key.
 const AUTOLOCK_MS: u64 = 120_000;
 const TOUCH_TIMEOUT_MS: u64 = 30_000;
-/// A login waits for the tap this long and no longer: the password prompt behind it is
-/// the other way in, and nobody should wait half a minute to reach it.
-const AUTH_TOUCH_TIMEOUT_MS: u64 = 10_000;
 /// A wipe after five seconds of red: no reflex reaches it.
 const WIPE_HOLD_MS: u64 = 5_000;
 
@@ -317,8 +310,6 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
 
     /// Verifies the old PIN, re-seals every item under the new one, writes all of it as
     /// a single image. A host that found the device unlocked still cannot take it over.
-    /// Auth items are sealed under the chip key, not the PIN: they are carried across
-    /// untouched.
     pub fn pin_change(&mut self, old: Pin<'_>, new: Pin<'_>) -> Result<(), Fail> {
         self.pin_unlock(old)?; // loads the index too
         let old_dek = self.dek()?;
@@ -348,14 +339,6 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
             .map_err(|_| Fail::Internal)?;
         for i in 0..self.index.len() {
             let slot = *self.index.get(i).ok_or(Fail::Internal)?;
-            // An auth item's key does not change with the PIN.
-            if slot.category == Category::Auth.wire() {
-                let (_, carry) = self.buf.split_at_mut(ITEM_BUF_LEN);
-                self.store
-                    .save_keep(&slot, carry)
-                    .map_err(|_| Fail::Internal)?;
-                continue;
-            }
             let n = {
                 let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
                 self.store
@@ -419,15 +402,6 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         vault::open_in_place(key, aad, buf)
     }
 
-    /// The key an item of this category is sealed under: the chip key alone for an auth
-    /// secret, the PIN's for everything else. The one place that decides.
-    fn item_key(&mut self, dek: &[u8; KEY_LEN], category: u8) -> Result<Dek, Fail> {
-        if category == Category::Auth.wire() {
-            return vault::auth_key(&mut self.key).ok_or(Fail::Incompatible);
-        }
-        Ok(Zeroizing::new(*dek))
-    }
-
     /// Stores an item. The PIN is enough, like every write: nothing comes out.
     pub fn put(
         &mut self,
@@ -453,8 +427,7 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         {
             return Err(Fail::Full);
         }
-        let key = self.item_key(&dek, category.wire())?;
-        let r = self.write_item(&key, name, category.wire(), plain, at);
+        let r = self.write_item(&dek, name, category.wire(), plain, at);
         self.buf.zeroize();
         r?;
         self.touch();
@@ -535,15 +508,11 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
     }
 
     /// The item called `name`, opened into the working half of the buffer: how many
-    /// plaintext bytes, sitting at `NONCE_LEN`. Never an auth item, which only
-    /// `respond` opens.
+    /// plaintext bytes, sitting at `NONCE_LEN`.
     fn open_named(&mut self, dek: &[u8; KEY_LEN], name: Name<'_>) -> Result<(usize, u8), Fail> {
         self.load()?;
         let i = self.index.find(name).ok_or(Fail::NotFound)?;
         let slot = *self.index.get(i).ok_or(Fail::Internal)?;
-        if slot.category == Category::Auth.wire() {
-            return Err(Fail::BadArg);
-        }
         let n = {
             let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
             self.store
@@ -648,73 +617,6 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         Ok((len, params.period.get()))
     }
 
-    /// The host's challenge signed with the auth item called `name`, after a tap - the
-    /// same gesture as a code. The one command that needs no PIN: the secret is sealed
-    /// under the chip key, it never comes out, and a login is proven by the finger on
-    /// this board. Leaves the PIN session as it was, and spends no attempt.
-    pub fn respond(
-        &mut self,
-        name: Name<'_>,
-        challenge: &[u8; AUTH_CHALLENGE_LEN],
-        out: &mut [u8; AUTH_SIGNATURE_LEN],
-    ) -> Result<(), Fail> {
-        self.load()?;
-        // Any other category reads as absent: without the PIN, which names exist is
-        // nobody's to learn, and a different answer for "exists, but not auth" would
-        // tell.
-        let i = self
-            .index
-            .find(name)
-            .filter(|&i| {
-                self.index
-                    .get(i)
-                    .is_some_and(|s| s.category == Category::Auth.wire())
-            })
-            .ok_or(Fail::NotFound)?;
-        let slot = *self.index.get(i).ok_or(Fail::Internal)?;
-        let key = vault::auth_key(&mut self.key).ok_or(Fail::Incompatible)?;
-        let r = self.sign_with(&key, &slot, name, challenge, out);
-        self.buf.zeroize();
-        r
-    }
-
-    fn sign_with(
-        &mut self,
-        key: &[u8; KEY_LEN],
-        slot: &Slot,
-        name: Name<'_>,
-        challenge: &[u8; AUTH_CHALLENGE_LEN],
-        out: &mut [u8; AUTH_SIGNATURE_LEN],
-    ) -> Result<(), Fail> {
-        let n = {
-            let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
-            self.store
-                .read_item(slot, work)
-                .map_err(|_| Fail::Internal)?
-        };
-        let opened = {
-            let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
-            Self::open_in(key, name, slot.category, &mut work[..n]).ok_or(Fail::Internal)?
-        };
-        if !ui::await_confirmation(&mut self.ui, &self.clock, AUTH_TOUCH_TIMEOUT_MS) {
-            return Err(Fail::Refused);
-        }
-        let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
-        let item = Item::parse(&work[NONCE_LEN..NONCE_LEN + opened]).ok_or(Fail::Internal)?;
-        let seed: &[u8; AUTH_SECRET_LEN] = item
-            .first(Class::Secret)
-            .ok_or(Fail::Internal)?
-            .value()
-            .try_into()
-            .map_err(|_| Fail::Internal)?;
-        let signing = SigningKey::from_bytes(seed);
-        let mut msg = [0u8; AUTH_SIGNED_PREFIX.len() + AUTH_CHALLENGE_LEN];
-        msg[..AUTH_SIGNED_PREFIX.len()].copy_from_slice(AUTH_SIGNED_PREFIX);
-        msg[AUTH_SIGNED_PREFIX.len()..].copy_from_slice(challenge);
-        *out = signing.sign(&msg).to_bytes();
-        Ok(())
-    }
-
     /// An item, gone.
     pub fn delete(&mut self, name: Name<'_>) -> Result<(), Fail> {
         self.dek()?;
@@ -745,8 +647,7 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
             return Err(Fail::Exists);
         }
         let slot = *self.index.get(at).ok_or(Fail::Internal)?;
-        let key = self.item_key(&dek, slot.category)?;
-        let r = self.rename_into(&key, &slot, from, to, at);
+        let r = self.rename_into(&dek, &slot, from, to, at);
         self.buf.zeroize();
         r?;
         self.touch();
@@ -849,7 +750,6 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         }
         let slot = *self.index.get(at).ok_or(Fail::Internal)?;
         let name = StoredName::of(slot.name());
-        let item_key = self.item_key(&dek, slot.category)?;
 
         let n = {
             let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
@@ -859,8 +759,7 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         };
         let opened = {
             let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
-            Self::open_in(&item_key, name.get(), slot.category, &mut work[..n])
-                .ok_or(Fail::Internal)?
+            Self::open_in(&dek, name.get(), slot.category, &mut work[..n]).ok_or(Fail::Internal)?
         };
         // The plaintext moves back to make room for the prefix, which goes after the
         // nonce that `seal_in_place` writes over.
@@ -967,19 +866,11 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
                 body.len(),
             )
         };
-        let item_key = self.item_key(dek, category)?;
         let resealed = {
             let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
             work.copy_within(body_at..body_at + body_len, NONCE_LEN);
-            Self::seal_in(
-                &item_key,
-                &mut self.rng,
-                name.get(),
-                category,
-                work,
-                body_len,
-            )
-            .ok_or(Fail::Internal)?
+            Self::seal_in(dek, &mut self.rng, name.get(), category, work, body_len)
+                .ok_or(Fail::Internal)?
         };
         let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
         self.store

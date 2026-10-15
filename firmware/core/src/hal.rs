@@ -26,6 +26,12 @@ pub trait Ui {
     fn set(&mut self, state: crate::ui::State);
     /// True while the button is held.
     fn pressed(&self) -> bool;
+    /// True once whoever asked for the gesture has withdrawn the request: the wait ends
+    /// refused, as if its time were up, and never as a press. Only a board serving
+    /// requests that can be cancelled - passkeys - says anything but no.
+    fn withdrawn(&self) -> bool {
+        false
+    }
 }
 
 /// A secret only this chip has, mixed into the key derivation so that a copy of the

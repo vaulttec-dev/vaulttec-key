@@ -28,14 +28,14 @@ use trussed::serde_extensions::{ExtensionDispatch, ExtensionId, ExtensionImpl};
 use trussed::service::ServiceResources;
 use trussed::types::{Context, CoreContext};
 use trussed::{ClientImplementation, Platform, Service};
-use trussed_core::Error;
 use trussed_core::api::{reply, request};
 use trussed_core::types::reboot;
+use trussed_core::{Error, InterruptFlag};
 use trussed_fs_info::FsInfoExtension;
 use trussed_hkdf::HkdfExtension;
 use trussed_staging::{StagingBackend, StagingContext};
-use vaultkey_core::hal::Clock;
-use vaultkey_core::ui;
+use vaultkey_core::hal::{Clock, Ui};
+use vaultkey_core::ui::{self, State};
 
 use crate::{CTAP_MESSAGE, Entropy, FS_LEN, Panel, Region, Uptime, UsbStack};
 
@@ -272,10 +272,14 @@ type Client = ClientImplementation<'static, Syscall, Extensions>;
 /// Set while the request being served is authenticatorReset.
 static RESET: AtomicBool = AtomicBool::new(false);
 
+/// Raised by the CTAPHID pipe when the host cancels the request being served; the
+/// dispatch sets it working before each call and idle after.
+static CANCEL: InterruptFlag = InterruptFlag::new();
+
 /// User presence is the vault's own gesture on the same button and light: a fresh tap
 /// while the light is amber, through `vaultkey_core::ui`, so a button already held when
 /// the request arrives does not count. Erasing every passkey takes the wipe's hold
-/// instead, because a tap never wipes.
+/// instead, because a tap never wipes. A request the host cancels ends the wait refused.
 #[derive(Clone, Copy)]
 struct Touch {
     panel: Panel,
@@ -288,7 +292,7 @@ impl UserPresence for Touch {
         _: &mut T,
         timeout_ms: u32,
     ) -> fido_authenticator::Result<()> {
-        let mut panel = self.panel;
+        let mut panel = Cancellable(self.panel);
         let timeout_ms = u64::from(timeout_ms);
         self.usb.borrow_mut().awaiting_touch = true;
         let confirmed = if RESET.load(Ordering::Relaxed) {
@@ -299,9 +303,29 @@ impl UserPresence for Touch {
         self.usb.borrow_mut().awaiting_touch = false;
         if confirmed {
             Ok(())
+        } else if CANCEL.is_interrupted() {
+            Err(fido_authenticator::Error::KeepaliveCancel)
         } else {
             Err(fido_authenticator::Error::UserActionTimeout)
         }
+    }
+}
+
+/// The panel as a passkey's wait sees it: the same button and light, and a request the
+/// host can withdraw.
+struct Cancellable(Panel);
+
+impl Ui for Cancellable {
+    fn set(&mut self, state: State) {
+        self.0.set(state);
+    }
+
+    fn pressed(&self) -> bool {
+        self.0.pressed()
+    }
+
+    fn withdrawn(&self) -> bool {
+        CANCEL.is_interrupted()
     }
 }
 
@@ -313,6 +337,10 @@ pub(crate) struct Passkeys(Authenticator<Touch, Client>);
 impl App<'static> for Passkeys {
     fn commands(&self) -> &'static [Command] {
         &[Command::Cbor]
+    }
+
+    fn interrupt(&self) -> Option<&'static InterruptFlag> {
+        Some(&CANCEL)
     }
 
     fn call(

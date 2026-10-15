@@ -171,8 +171,7 @@ The boards:
 ### Firmware design
 
 - Core crates: RustCrypto `aes-gcm`, `argon2`, `hmac`, `sha1`, `sha2`, `subtle`,
-  `zeroize`; `ed25519-dalek` (built on RustCrypto's `signature` and `sha2`) for `vkey
-  auth`; `crc`. Not own crypto. Toolchain: stable rustup, no compiler fork.
+  `zeroize`; `crc`. Not own crypto. Toolchain: stable rustup, no compiler fork.
   - nRF52840: `nrf52840-hal`, `cortex-m`, `cortex-m-rt` (`set-vtor`, `paint-stack`),
     `usb-device`, `usbd-serial`, `usbd-ctaphid`, `ctaphid-dispatch`, `static_cell`,
     `heapless`; for passkeys `trussed`, `trussed-staging`, `fido-authenticator`,
@@ -219,17 +218,16 @@ The boards:
   because the device has nowhere else to keep them, and a code's shape is not a secret.
   The CLI turns an `otpauth://` URI into that on the way in and back into a URI on the way
   out (`totp::seed_field`, `totp::seed_uri`).
-- The one exception is `Auth` (2026-09-14, maintainer's decision): a 32-byte Ed25519 seed
-  for `vkey auth` (`sudo` and the lock screen via `pam_exec`), sealed under
-  `DeviceKey::mac("vaultkey/auth-key/v1")` — the eFuse key alone, never the DEK — so
-  `Respond` signs `AUTH_SIGNED_PREFIX | challenge` after a tap while locked, spending no
-  attempt. Refused on an unbound chip. Which key an item is under is decided in one place,
-  `Device::item_key`; a PIN change carries `Auth` items across untouched. A login waits 10 s for the tap
-  (`AUTH_TOUCH_TIMEOUT_MS`), then PAM asks for the password. The host keeps only the public
-  key, `/etc/vkey/auth/<user>`, and writes nothing at login. `sudo vkey auth enable` is the
-  one place the CLI writes system files: `/usr/local/bin/vkey`, the public key, and one
-  `sufficient` line in the PAM services of `SERVICES` (`cli/src/auth.rs`), each original
-  kept as `*.before-vkey`; `disable` undoes it.
+- Every item is sealed under the DEK. `vkey auth` (`sudo` and the lock screen with a tap)
+  is `pam_u2f` over the nRF52840's FIDO2 since 2026-10-15: `sudo vkey auth enable` makes
+  a `pam://<host>` credential and tries it, two taps, over its own CTAP2
+  (`cli/src/fido.rs`, because `pamu2fcfg` 1.1.0 refuses a self-attesting key), writes its
+  public half to
+  `/etc/u2f_mappings` (root's) and one `sufficient` line in the PAM services of
+  `SERVICES` (`cli/src/auth.rs`), each original kept as `*.before-vkey`; `disable` undoes
+  it. That is the one place the CLI writes system files. The Ed25519 scheme before it
+  (category 201 sealed under the chip key, command `Respond` 0x19) is gone, restorable
+  from 4bd49f3; both numbers stay unused, and a restore leaves such an item in the file.
 - A TOTP seed leaves the device two ways. The backup (`ExportBegin`/`ExportNext`, after a
   double tap; 2026-09-09) reseals every item under a key derived from a passphrase
   (Argon2id, `Passphrase` 12–128 bytes, without the chip key, so the file opens on another

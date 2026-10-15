@@ -11,7 +11,7 @@
 //! vkey backup vault.vkb                   # everything into one file, sealed on the key; two taps
 //! vkey restore vault.vkb                  # everything back, onto this or another key
 //! vkey check --wipe-everything            # lifecycle test; ERASES the device
-//! sudo vkey auth enable                   # sudo and the lock screen with a tap
+//! sudo vkey auth enable                   # sudo and the lock screen with a tap (pam_u2f)
 //! vkey install                            # copy this binary to ~/.local/bin
 //! ```
 //!
@@ -25,6 +25,7 @@ mod backup;
 mod boards;
 mod check;
 mod device;
+mod fido;
 mod file;
 mod import;
 mod install;
@@ -189,10 +190,10 @@ enum Cmd {
         #[arg(long)]
         wipe_everything: bool,
     },
-    /// sudo and the lock screen with a tap: `sudo vkey auth enable`; bare, what PAM runs
+    /// sudo and the lock screen with a tap, through `pam_u2f`: `sudo vkey auth enable`
     Auth {
         #[command(subcommand)]
-        cmd: Option<AuthCmd>,
+        cmd: AuthCmd,
     },
     /// Copy this binary to ~/.local/bin/vkey
     Install,
@@ -200,10 +201,10 @@ enum Cmd {
 
 #[derive(Subcommand, Clone, Copy)]
 enum AuthCmd {
-    /// A login secret on the key, its public key here, and the PAM lines for sudo and
-    /// the lock screen; PIN and a tap
+    /// A credential on the key for this host's logins (a tap), its public half in
+    /// `/etc/u2f_mappings`, and the `pam_u2f` line for sudo and the lock screen
     Enable,
-    /// The PAM lines out, the public key and the login secret gone
+    /// The `pam_u2f` lines out and the user out of `/etc/u2f_mappings`
     Disable,
 }
 
@@ -293,11 +294,16 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<u8, Error> {
     match cli.cmd {
         Some(Cmd::Install) => return install::install().map(|()| 0),
+        // pamu2fcfg talks to the key over FIDO itself; vkey's port is not needed.
+        Some(Cmd::Auth {
+            cmd: AuthCmd::Enable,
+        }) => return auth::enable(),
+        Some(Cmd::Auth {
+            cmd: AuthCmd::Disable,
+        }) => return auth::disable(),
         Some(Cmd::Setup { erase, board }) => {
             return cmd_setup(cli.port.as_deref(), board.as_deref(), erase);
         }
-        // What PAM runs: straight to the key, no probing, no shell on the way.
-        Some(Cmd::Auth { cmd: None }) => return auth::verify(cli.port.as_deref()),
         _ => {}
     }
 
@@ -314,15 +320,7 @@ fn run(cli: Cli) -> Result<u8, Error> {
     };
 
     match cmd {
-        Cmd::Install | Cmd::Setup { .. } | Cmd::Auth { cmd: None } => {
-            unreachable!("handled above")
-        }
-        Cmd::Auth {
-            cmd: Some(AuthCmd::Enable),
-        } => auth::enable(&mut dev),
-        Cmd::Auth {
-            cmd: Some(AuthCmd::Disable),
-        } => auth::disable(&mut dev),
+        Cmd::Install | Cmd::Setup { .. } | Cmd::Auth { .. } => unreachable!("handled above"),
 
         Cmd::Info => run_info(&mut dev, &version),
 
@@ -415,11 +413,7 @@ fn run_list(dev: &mut Device, long: bool) -> Result<u8, Error> {
             continue;
         }
         // The open reach costs the PIN and no gesture, so a whole vault can be listed
-        // this way; an auth item refuses to be read at all and is reported as it lists.
-        if e.category == Category::Auth {
-            println!("{}\t{}\t\t", e.name, item::category_name(e.category));
-            continue;
-        }
+        // this way.
         let (open, shape) = dev.get_with_shape(&e.name, Reach::Open)?;
         let login = open
             .by_label("username")
@@ -807,9 +801,6 @@ fn run_get(dev: &mut Device, version: &str, name: &str, copy: bool) -> Result<u8
             .find(|e| e.name == name)
             .ok_or(Error::NotFound)
     })?;
-    if stored.category == Category::Auth {
-        return Err(Error::Value(auth::USED_BY_AUTH.into()));
-    }
 
     let (open, shape) = dev.get_with_shape(name, Reach::Open)?;
 

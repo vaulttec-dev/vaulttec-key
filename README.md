@@ -10,7 +10,8 @@ single-binary host CLI, and a press of the board's button for every secret that 
 > and keep the recovery codes your services give you.
 
 > **Two boards** (2026-10-13). Development now targets the Makerdiary nRF52840 MDK USB Dongle
-> (`firmware/boards/nrf52840-mdk-dongle`), the board passkeys will come to. It runs the same
+> (`firmware/boards/nrf52840-mdk-dongle`), which also holds passkeys (FIDO2, since
+> 2026-10-15) and answers `sudo` through them. It runs the same
 > core and passes the full lifecycle test. Its bootloader is now our own fork, which runs
 > only signed firmware and serves no flash back, and APPROTECT closes its debug port. This
 > revision-2 chip can still be glitched open, though, and it has no chip key
@@ -55,17 +56,17 @@ the device under routine use — only an explicit export under a double tap read
 - A TOTP secret leaves the key in the clear only under an explicit double tap (`vkey export <name>`).
   Routine use returns only codes. `vkey backup` reseals every item under a
   backup passphrase without revealing secrets.
-- Everything, `list` included, needs the PIN — except a `vkey auth` login, a tap alone; the key
-  re-locks after two idle minutes. Secrets and
+- Everything, `list` included, needs the PIN — except a passkey or a `vkey auth` login on the
+  nRF52840, a tap alone; the key re-locks after two idle minutes. Secrets and
   PINs are never arguments or environment variables — hidden prompt or stdin.
 
 ## What it does not do
 
 Read [docs/threat-model.md](docs/threat-model.md) **before** you depend on this.
 
-- **Nothing against phishing.** A TOTP code works on a fake site just as on the real one; that is a
-  property of TOTP. WebAuthn resists it, and this hardware cannot: the C6's USB is a fixed
-  Serial/JTAG port with no HID.
+- **Phishing, for TOTP and passwords.** A TOTP code works on a fake site just as on the real one;
+  that is a property of TOTP. The browser binds a passkey to its site, and only the nRF52840
+  board has passkeys: the C6's USB is a fixed Serial/JTAG port with no HID.
 - **Nothing for the code or password you just received** — it crosses the host: terminal, optionally
   the clipboard. The clipboard is cleared after 30 s, but a clipboard manager has already kept its own
   copy, and the reveal stays in the terminal's scrollback until the window closes. Details in the
@@ -136,29 +137,34 @@ touches what a CSV brought, and an entry under a name no source offers is left a
 
 ## sudo and the lock screen with a tap
 
-With the key plugged in, `sudo` and the lock screen take a tap instead of your password;
-without it, or with no tap for ten seconds, they ask for the password as always. The key
-signs a fresh challenge with a secret that never leaves it; the host keeps only its public
-key. It needs no PIN, so a stolen laptop with the key still in it opens with a tap — read
-[the trade-off](docs/threat-model.md#vkey-auth--sudo-and-the-lock-screen-with-a-tap-no-pin)
+With the nRF52840 key plugged in, `sudo` and the lock screen take a tap instead of your
+password; without it they ask for the password as always, and with it but no tap, once the
+key gives up after 30 s. This is `pam_u2f`, the scheme every FIDO2 key uses: the key makes
+a credential for this host, the host keeps only its public half. It needs no PIN, so a
+stolen laptop with the key still in it opens with a tap — read
+[the trade-off](docs/threat-model.md#vkey-auth--sudo-and-the-lock-screen-with-a-tap-through-pam_u2f)
 first.
 
 ```bash
-sudo vkey auth enable     # PIN, then a tap: sudo and the lock screen are set up
-sudo vkey auth disable    # back to the password alone
+sudo apt install libpam-u2f
+sudo "$(command -v vkey)" auth enable    # two taps: sudo and the lock screen are set up
+sudo "$(command -v vkey)" auth disable   # back to the password alone
 ```
 
-`enable` copies `vkey` to `/usr/local/bin`, and adds one line to the PAM files of `sudo` and
-of the lock screens this host has — COSMIC, GNOME, KDE, sway, Hyprland — keeping each
-original as `*.before-vkey`. A file it does not recognise it leaves alone and prints the
-line to add by hand.
+`enable` makes a credential on the key (a tap), tries it the way a login will (another
+tap), writes it to `/etc/u2f_mappings` (root's), and adds
+one line to the PAM files of `sudo` and of the lock screens this host has — COSMIC, GNOME,
+KDE, sway, Hyprland — keeping each original as `*.before-vkey`. A file it does not
+recognise it leaves alone and prints the line to add by hand. Keep a root shell open in
+another terminal until `sudo` and the lock screen have both worked, with the tap and with
+the password.
 
 ## Gestures and capacity
 
 | Gesture | LED | What it releases |
 |---|---|---|
-| Tap | amber | one TOTP code, the secret fields of one item, one `.env`, or one `vkey auth` login |
-| Hold 5 s | red | factory wipe: every secret and the PIN |
+| Tap | amber | one TOTP code, the secret fields of one item, one `.env`, one passkey, or one `vkey auth` login |
+| Hold 5 s | red | factory wipe: every secret and the PIN; on the nRF52840, erasing every passkey (within 10 s of plugging in) |
 | Double tap | blue | the encrypted backup file, or an export / seed readout |
 
 A tap never wipes and never exports, so a hostile host cannot swap a code request for a

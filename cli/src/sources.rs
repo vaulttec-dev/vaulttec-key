@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::device::{Category, Device, Error, Reach, Stored};
+use crate::device::{Device, Error, Reach, Stored};
 use crate::file;
 use crate::import::Summary;
 use crate::prompt::SyncUi;
@@ -297,13 +297,10 @@ pub(crate) fn prune(
     Ok(())
 }
 
-/// An item worth pinging the device with to hold off its auto-lock: any but an auth
-/// secret, which refuses to be read at all, out of a listing already in hand.
+/// An item worth pinging the device with to hold off its auto-lock, out of a listing
+/// already in hand.
 pub(crate) fn survivor(entries: &[Stored]) -> Option<String> {
-    entries
-        .iter()
-        .find(|e| e.category != Category::Auth)
-        .map(|e| e.name.clone())
+    entries.first().map(|e| e.name.clone())
 }
 
 /// Every name the key holds. A listing that does not come back reads as empty, which

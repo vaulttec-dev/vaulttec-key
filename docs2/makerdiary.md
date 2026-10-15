@@ -163,8 +163,13 @@ nRF52840 lacks, so the firmware refuses it (`Incompatible`). pam_u2f needs no ch
 Other schemes, not chosen: `pam_yubico` (Yubico OTP or HMAC-SHA1 challenge-response,
 legacy), `pam_p11`/sssd smartcard (PIV certificates, enterprise setup).
 
-The current Ed25519 `vkey auth` stays only while the C6 is in use, and is isolated so it can
-be cut in one change. Its whole surface (2026-10-03):
+**Done 2026-10-15** (roadmap phase 6, milestone 4): `sudo vkey auth enable` makes the
+credential over its own CTAP2 (`pamu2fcfg` 1.1.0 refuses a key that attests with the
+credential's own key) and writes `/etc/u2f_mappings` and the PAM lines; the Ed25519 scheme below was
+cut in that change, restorable from 4bd49f3.
+
+The Ed25519 `vkey auth` was isolated so it could be cut in one change. Its whole surface
+(2026-10-03):
 
 | Where | What |
 |---|---|
@@ -237,7 +242,8 @@ Pins from the Makerdiary wiki (still to be **measured with a probe**, per projec
   YubiKey physically. Pot only after final flashing and APPROTECT, leaving the button and
   USB free.
 - **`vkey auth` does not migrate.** Its key is sealed under the C6 eFuse key; it must be
-  re-created and `vkey auth enable` repeated. Items move over a `.vkb` backup (passphrase
+  re-created and `vkey auth enable` repeated. (Done 2026-10-15 the other way: `vkey auth`
+  is now `pam_u2f` over this board's FIDO2.) Items move over a `.vkb` backup (passphrase
   only, no chip key). The Secure Boot signing key held in vkey needs a plan before the move.
 - **FIDO2 is the biggest piece of code in the project** (CTAP2.1, COSE, P-256, resident
   keys, PIN protocol). Every line is attack surface.
@@ -271,7 +277,7 @@ vkey alone, no Trussed yet: the same core as the C6, behind the four HAL traits.
 | Ui | button P0.18, LEDs P0.23/P0.22/P0.24, all active low, from the wiki; amber = red + green |
 | Flash | `Nvmc` over 0x97000..0xEC000 behind a wrapper that fences after every erase and write, split into the vault's region and Trussed's (`Region`), each refusing access past its end |
 | Entropy | the RNG peripheral, bias correction on |
-| DeviceKey | none: `bound() == false`, PIN only, `vkey auth` refused |
+| DeviceKey | none: `bound() == false`, PIN only; `vkey auth` is `pam_u2f` since 2026-10-15 and needs none |
 
 Measured on the build: 72 KiB of code, 154 KiB of statics, ≈101 KiB left for the stack.
 

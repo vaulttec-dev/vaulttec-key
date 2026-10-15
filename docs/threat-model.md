@@ -43,8 +43,9 @@ and every guarantee below that rests on the eFuse key, JTAG being off or Secure 
   an image signed with another key, and it ran the signed vkey. Whoever holds the button
   can still write the application region, so a bad copy leaves the board in the
   bootloader until a signed image is copied.
-- **`vkey auth` does not exist here.** Its secret is sealed under the chip key, and the
-  CLI refuses to enable it.
+- **`vkey auth` is a passkey here** (since 2026-10-15): `pam_u2f` over the board's FIDO2,
+  in place of the old scheme, which needed a chip key. Its section below says what that
+  costs.
 - **The bootloader fork's signing key lives on this board.** It is the `.env`
   `vkey-signing-nrf`, made by `bootloader/signing-key.sh` on 2026-10-14 (fingerprint
   `a1700ebd539b0bfc`), with a `.vkb` as its second copy. That copy was proven twice, each
@@ -162,8 +163,8 @@ before the burn became `Incompatible` and was wiped.
 
 | Gesture | Action | LED |
 |---|---|---|
-| Tap | code, the secret fields of an item, a `.env`, a `vkey auth` login | amber |
-| Hold 5 s | wipe | red |
+| Tap | code, the secret fields of an item, a `.env`, a passkey, a `vkey auth` login | amber |
+| Hold 5 s | wipe; on the nRF52840 also erasing every passkey | red |
 | Double tap, 800 ms window | encrypted backup, **and an export or seed readout** | blue |
 
 A tap never wipes and never exports; a hold never exports; a double tap never wipes. One
@@ -261,56 +262,50 @@ out, a duplicate name replaces, and entry versus blob the newer one from the fil
 Rejected: a flash-image copy as backup — PIN-encrypted, 8 digits fall offline in days, and
 it does not transfer while bound to the chip key.
 
-### `vkey auth` — sudo and the lock screen with a tap, no PIN
+### `vkey auth` — sudo and the lock screen with a tap, through `pam_u2f`
 
-`vkey auth` (2026-09-14) lets `sudo` and the lock screen accept a tap on the key instead
-of the Linux password, through `pam_exec`; with no key, or no tap within ten seconds (the
-firmware's own timeout for a login, shorter than a code's 30 s), PAM asks for the password
-as before. The scheme is `pam_u2f`'s. `sudo vkey auth enable` draws a 32-byte Ed25519 seed
-on the host, stores it on the key as an `Auth` entry, keeps the public key in
-`/etc/vkey/auth/<user>` (root, 0644) and zeroizes the seed. A login sends a fresh random
-challenge; the key signs `"vaultkey/auth/v1" | challenge` after a tap; the signature is
-verified here. The host holds no secret and writes nothing at login, so `sudo` (checked as
-root) and a lock screen running as the user (COSMIC's `cosmic-greeter`, `swaylock`) read the
-same file. A recorded signature is worthless: the next challenge is a different one.
-
-`enable` also copies the binary to `/usr/local/bin/vkey` and adds one line to each PAM
-service this host has among `sudo`, `cosmic-greeter`, `gdm-password`, `kde`, `swaylock`,
-`hyprlock` — above the line that brings in the password check, a copy of the file kept once
-as `*.before-vkey`, the new file renamed over the old. A file with no recognisable anchor is
-left alone and the line printed for the owner to place. `disable` takes the lines out,
-deletes the public key and the entry. This replaces the first version (same day), which
-kept a rotating expectation on the host instead of a public key: two state files, one of
-them in the user's home, and a user who had to edit PAM by hand. Writing `/etc/pam.d` from
-the CLI is the price of a setup a person can do; the line is `sufficient`, so what it adds
-is a way in, and the password stays one.
-
-**The deliberate exception to "everything needs the PIN".** An `Auth` record is sealed
-under `DeviceKey::mac("vaultkey/auth-key/v1")` — the eFuse key alone — not under the DEK, so
-`Respond` works while the device is locked and spends no attempt: `sudo` can never be what
-wipes the vault. On a chip without a burned key it is refused (`Incompatible`), because
-there it would be sealed under nothing. Adding, listing, renaming and deleting still need
-the PIN; a PIN change does not touch the record; a wipe removes it; a backup reseals it
-under the passphrase and a restore under the new chip, so the host's public key stays valid.
+Since 2026-10-15 `vkey auth` is the scheme every other key uses: `pam_u2f` over FIDO2, on
+the nRF52840's passkeys (maintainer's decision, 2026-10-03). `sudo vkey auth enable` makes
+a non-resident credential for `pam://<host>` after a tap, tries it with an assertion after
+a second tap, and only then writes its public half to `/etc/u2f_mappings` (root's, 0644),
+replacing only that user's line. It speaks CTAP2 itself (`cli/src/fido.rs`) rather than
+run `pamu2fcfg`: the 1.1.0 that distributions ship demands an attestation certificate, and
+this key attests with the credential's own key. Each PAM service this host has among `sudo`, `cosmic-greeter`, `gdm-password`, `kde`,
+`swaylock`, `hyprlock` gets one line, `auth sufficient pam_u2f.so
+authfile=/etc/u2f_mappings cue`, above the one that brings in the password check. A copy
+of each file is kept once as `*.before-vkey`, and a file with no recognisable anchor is
+left alone with the line printed. `disable` takes the lines out and the user out of the
+mapping. The line is `sufficient`: what it adds is a way in, and the password stays one.
 
 | | |
 |---|---|
-| Given | A login needs this physical board and a finger on it; no secret on the host; a fresh challenge every time; no PIN attempt spent |
+| Given | A login needs this physical key and a fresh tap after the request; the host holds a public key only; no vkey PIN, locked or not, and no attempt spent |
 | Laptop and key stolen together | The lock screen opens with a tap. A powered-off laptop is protected by disk encryption, not by this. Carry the key separately, do not leave it in the port |
-| Malware running as the user | Can start `sudo` and wait for a reflex tap. The LED is the same amber as a code; a tap you did not ask for is the thing to refuse |
-| A locked key | Answers `NotFound` to every name that is not an auth entry, so it names no service without the PIN; whether `<user>@<host>` is enrolled is not secret |
+| Malware running as the user | Can start `sudo` and wait for a reflex tap. The light is the same amber as a code or a passkey; a tap you did not ask for is the thing to refuse |
+| Malware enrolling a key of its own | `/etc/u2f_mappings` is root's: adding a line needs root already |
 | Someone at the unlocked laptop while you are away, key in the port | Gets root with one tap where `sudo` used to want the password |
-| A `.vkb` backup | Now also carries the login seed: with the passphrase and any chip-bound board it signs for your `sudo` too |
-| A user-writable binary | PAM runs `vkey` as root; `vkey auth` refuses unless its executable and every directory above it are root's alone, hence `/usr/local/bin/vkey` |
-| The public key file | Not secret. Replacing it needs root, and `vkey auth` refuses it unless it and every directory above it are root's alone |
-| The port busy (the `vkey` shell open) | The login fails and PAM falls back to the password |
-| A `vkey auth` killed mid-wait (Ctrl+C) | The key still signs the old challenge; the next login may read that signature, fail it once and fall back to the password. Nothing is left broken |
+| A copy of the board's flash (the revision-2 glitch) | The credential's key is wrapped by fido-authenticator's key, which sits unsealed in Trussed's filesystem: whoever reads the flash can answer this host's logins, given the host |
+| A `.vkb` backup | Holds the login once milestone 5 puts the passkeys into it: with the passphrase, another board then answers this host's `sudo` too |
+| The key in, nobody tapping | The password prompt comes when the key gives up, after 30 s; the old scheme gave up after 10 |
+| A FIDO PIN on the key | Its own, not vkey's; the credential is made without one, so a login does not ask for it |
 | The login screen after boot | COSMIC's greeter shares the `cosmic-greeter` service, so a tap may log in there too; the keyring, unlocked only by the password, then stays locked |
+
+**The scheme before, removed 2026-10-15** (restorable from commit `4bd49f3`:
+`cli/src/auth.rs`, `Respond`, `Category::Auth`, `vault::auth_key`). An Ed25519 seed on the
+key, sealed under the chip key alone, answered a fresh challenge after a tap through
+`pam_exec` of `/usr/local/bin/vkey auth`. It needed a burned chip key, which the nRF52840
+does not have, and `pam_u2f` does the same with a credential the key's FIDO side already
+makes. What it leaves:
+- an older `.vkb` may hold its seed; a restore leaves that item in the file and names it;
+- a vault that still holds one (only the C6 ever did) cannot open it on newer firmware,
+  because it was sealed under the chip key: `vkey rm <user>@<host>` before a backup;
+- `/usr/local/bin/vkey`, which `enable` points out and leaves for the owner to delete;
+- category 201 and command byte 0x19 stay unused, so an older CLI never means something else.
 
 Rejected: presence of the USB device as proof (any ESP32 shows `303a:1001`); PIN plus tap
 (a second password to type buys nothing over the one it replaces); HMAC challenge-response
-with a rotating expectation (the first version: state to write at every login and two copies
-of it); a PAM `cdylib` (`pam_exec` needs no C and no `unsafe`).
+with a rotating expectation (state to write at every login); a PAM `cdylib`; keeping a
+scheme of our own beside `pam_u2f`.
 
 ## What it does not protect against
 

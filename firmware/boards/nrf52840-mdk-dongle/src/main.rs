@@ -29,7 +29,9 @@ use nrf52840_hal::nvmc::{Nvmc, NvmcError};
 use nrf52840_hal::pac;
 use nrf52840_hal::rng::Rng;
 use nrf52840_hal::usbd::{UsbPeripheral, Usbd};
+use ref_swap::OptionRefSwap;
 use static_cell::{ConstStaticCell, StaticCell};
+use trussed_core::InterruptFlag;
 use usb_device::UsbError;
 use usb_device::bus::UsbBusAllocator;
 use usb_device::device::{StringDescriptors, UsbDevice, UsbDeviceBuilder, UsbVidPid};
@@ -196,6 +198,10 @@ const CTAP_MESSAGE: usize = 3072;
 /// CTAPHID requests on their way to the FIDO side, and its answers back: one message each
 /// way.
 static CTAP_CHANNEL: Channel<CTAP_MESSAGE> = Channel::new();
+
+/// Where the pipe finds the flag of the request being served, to raise it when the host
+/// sends `CTAPHID_CANCEL`: the dispatch puts the app's flag here for the length of a call.
+static CTAP_CANCEL: OptionRefSwap<'static, InterruptFlag> = OptionRefSwap::new(None);
 
 /// The protocol's side of the stack, and FIDO's: requests that come through CTAPHID are
 /// answered while vkey's line is quiet.
@@ -620,7 +626,7 @@ fn main() -> ! {
         .split()
         .expect("the CTAPHID channel is split once, here");
     // CBOR announced in INIT, or hosts never send CTAP2.
-    let ctaphid = CtapHid::new(bus, requester, 0).implements_ctap2();
+    let ctaphid = CtapHid::with_interrupt(bus, requester, Some(&CTAP_CANCEL), 0).implements_ctap2();
     let usb = UsbDeviceBuilder::new(bus, UsbVidPid(USB_VID, USB_PID))
         .strings(&[StringDescriptors::default()
             .manufacturer("vaulttecdev")
@@ -677,7 +683,7 @@ fn main() -> ! {
 
     let port = Usb {
         stack: usb,
-        fido: Dispatch::new(responder),
+        fido: Dispatch::with_interrupt(responder, Some(&CTAP_CANCEL)),
         passkeys: fido::start(passkeys, rng, panel, usb),
         last_rx: 0,
     };

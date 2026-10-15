@@ -13,10 +13,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serialport::{SerialPort, SerialPortType};
 pub use vaultkey_core::item::{Category, Class, FieldKind, VALUE_MAX};
-pub use vaultkey_core::oath::{AUTH_SECRET_LEN, Algo, Digits, NAME_MAX, Name, Params};
+pub use vaultkey_core::oath::{Algo, Digits, NAME_MAX, Name, Params};
 pub use vaultkey_core::store::MAX_ATTEMPTS;
 pub use vaultkey_core::vault::{PASS_MIN, PIN_LEN, Passphrase, Pin};
-pub use vaultkey_core::wire::{AUTH_CHALLENGE_LEN, AUTH_SIGNATURE_LEN, AUTH_SIGNED_PREFIX};
 use vaultkey_core::wire::{
     BAD_LEN, Cmd, FLAG_REPLACE, Fail, HAS_SECRET, HAS_SEED, MAGIC, OK, REACH_OPEN, REACH_SECRET,
     REACH_SEED, frame_head, scan_magic,
@@ -658,20 +657,6 @@ impl Device {
             (String::from_utf8_lossy(&body).into_owned(), 30)
         };
         Ok(Code { text, period })
-    }
-
-    /// `challenge` signed with the auth secret `name`, after a tap; no PIN needed.
-    pub fn respond(
-        &mut self,
-        name: &str,
-        challenge: &[u8; AUTH_CHALLENGE_LEN],
-    ) -> Result<[u8; AUTH_SIGNATURE_LEN], Error> {
-        let mut p = name_bytes(name)?;
-        p.extend_from_slice(challenge);
-        let body = self.request(Cmd::Respond, &p)?;
-        body.as_slice()
-            .try_into()
-            .map_err(|_| Error::Device(BAD_LEN))
     }
 
     pub fn delete(&mut self, name: &str) -> Result<(), Error> {

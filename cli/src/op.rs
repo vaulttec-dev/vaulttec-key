@@ -1096,13 +1096,7 @@ pub fn export_item(
         .into_iter()
         .find(|e| e.name == name)
         .ok_or(Error::NotFound)?;
-    let Some(category) = op_category(stored.category) else {
-        return Err(Error::Value(
-            "an auth secret is not written back: it is this machine's login, and 1Password \
-             has no use for it"
-                .into(),
-        ));
-    };
+    let category = op_category(stored.category);
 
     // What reach the item needs is what it holds: a seed costs the double tap, and
     // nothing else does. Asking for the seed reach on an item without one would cost a
