@@ -17,6 +17,7 @@ use cortex_m::peripheral::SCB;
 use cortex_m::peripheral::syst::SystClkSource;
 use cortex_m_rt::{entry, exception};
 use critical_section::Mutex;
+use ctaphid_dispatch::{Channel, DEFAULT_MESSAGE_SIZE as CTAP_MESSAGE, Dispatch};
 use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_storage::nor_flash::{ErrorType, NorFlash, ReadNorFlash};
 use nrf52840_hal::clocks::{Clocks, ExternalOscillator, Internal, LfOscStopped};
@@ -29,6 +30,7 @@ use static_cell::{ConstStaticCell, StaticCell};
 use usb_device::UsbError;
 use usb_device::bus::UsbBusAllocator;
 use usb_device::device::{StringDescriptors, UsbDevice, UsbDeviceBuilder, UsbVidPid};
+use usbd_ctaphid::CtapHid;
 use usbd_serial::SerialPort;
 use vaultkey_core::device::{self, Device};
 use vaultkey_core::hal::{Clock, DeviceKey, Port, Ui};
@@ -134,37 +136,82 @@ impl Clock for Uptime {
     }
 }
 
-/// USB CDC-ACM, polled: every read and write services the bus first. Nothing runs from
-/// an interrupt, so the bus waits while the key computes - Argon2, a flash write - and
-/// the host's bulk transfers simply wait with it.
-struct Usb {
+/// The USB device with its two interfaces - CDC-ACM for vkey's protocol and CTAPHID for
+/// FIDO (docs2/roadmap.md, phase 6) - polled from the main loop: nothing runs from an
+/// interrupt. The bus is served wherever the key waits - for the next request (`Usb`) and
+/// for the button (`Panel`), which together cover all but Argon2 and flash writes, when
+/// the host's transfers simply wait. Shared by both through one `RefCell`, borrowed only
+/// for a poll, a read or a write.
+struct UsbStack {
     dev: UsbDevice<'static, Bus>,
     serial: SerialPort<'static, Bus>,
+    ctaphid: CtapHid<'static, 'static, 'static, Bus, CTAP_MESSAGE>,
+}
+
+impl UsbStack {
+    fn poll(&mut self) {
+        self.dev.poll(&mut [&mut self.serial, &mut self.ctaphid]);
+        // The pipe times out a request whose packets stop arriving; it compares wrapping
+        // millisecond stamps, so the low half of the uptime is all it needs.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a wrapping stamp, on purpose"
+        )]
+        self.ctaphid.check_timeout(Uptime.now_ms() as u32);
+    }
+}
+
+static USB_STACK: StaticCell<RefCell<UsbStack>> = StaticCell::new();
+
+/// CTAPHID requests on their way to the FIDO side, and its answers back: one message each
+/// way, up to the 7609 bytes CTAPHID can carry.
+static CTAP_CHANNEL: Channel<CTAP_MESSAGE> = Channel::new();
+
+/// The protocol's side of the stack, and FIDO's: requests that come through CTAPHID are
+/// answered while vkey's line is quiet.
+struct Usb {
+    stack: &'static RefCell<UsbStack>,
+    fido: Dispatch<'static, 'static, CTAP_MESSAGE>,
+    /// When vkey's last byte arrived.
+    last_rx: u64,
 }
 
 impl Usb {
     /// How long a write may make no progress before the host counts as gone.
     const STALL_MS: u64 = 1000;
-
-    fn poll(&mut self) {
-        self.dev.poll(&mut [&mut self.serial]);
-    }
+    /// How long vkey's line must be silent before FIDO is served. A frame's bytes come
+    /// in back to back, so this never lands in the middle of one, and a CTAP request
+    /// that waits for a touch never holds up a frame half read.
+    const QUIET_MS: u64 = 50;
 }
 
 impl Port for Usb {
     fn read_byte(&mut self) -> Option<u8> {
-        self.poll();
-        let mut byte = [0u8];
-        matches!(self.serial.read(&mut byte), Ok(1)).then_some(byte[0])
+        let byte = {
+            let mut usb = self.stack.borrow_mut();
+            usb.poll();
+            let mut byte = [0u8];
+            matches!(usb.serial.read(&mut byte), Ok(1)).then_some(byte[0])
+        };
+        let now = Uptime.now_ms();
+        if byte.is_some() {
+            self.last_rx = now;
+        } else if now - self.last_rx > Self::QUIET_MS {
+            // No FIDO application yet: the pipe answers INIT and PING itself, and
+            // anything that reaches the dispatch is refused as an unknown command.
+            self.fido.poll(&mut []);
+        }
+        byte
     }
 
     // A host that stopped reading has nobody to tell: what it does not take is dropped.
     fn write(&mut self, data: &[u8]) {
+        let mut usb = self.stack.borrow_mut();
         let mut rest = data;
         let mut since = Uptime.now_ms();
         while !rest.is_empty() {
-            self.poll();
-            match self.serial.write(rest) {
+            usb.poll();
+            match usb.serial.write(rest) {
                 Ok(n) if n > 0 => {
                     rest = &rest[n..];
                     since = Uptime.now_ms();
@@ -180,10 +227,11 @@ impl Port for Usb {
     }
 
     fn flush(&mut self) {
+        let mut usb = self.stack.borrow_mut();
         let since = Uptime.now_ms();
         loop {
-            self.poll();
-            match self.serial.flush() {
+            usb.poll();
+            match usb.serial.flush() {
                 Err(UsbError::WouldBlock) if Uptime.now_ms() - since <= Self::STALL_MS => {}
                 _ => return,
             }
@@ -275,6 +323,9 @@ impl DeviceKey for NoChipKey {
 struct Panel {
     // embedded-hal reads a pin through `&mut`, and `Ui::pressed` takes `&self`.
     button: RefCell<Pin<Input<PullUp>>>,
+    /// Served on every look at the button: a tap wait lasts seconds, and a host whose
+    /// requests go unanswered that long resets the device.
+    usb: &'static RefCell<UsbStack>,
     red: Pin<Output<PushPull>>,
     green: Pin<Output<PushPull>>,
     blue: Pin<Output<PushPull>>,
@@ -298,6 +349,11 @@ impl Ui for Panel {
     }
 
     fn pressed(&self) -> bool {
+        // The protocol never holds the stack while the key waits for the button; if it
+        // ever did, this poll is skipped rather than borrowed twice.
+        if let Ok(mut usb) = self.usb.try_borrow_mut() {
+            usb.poll();
+        }
         let Ok(low) = self.button.borrow_mut().is_low();
         low
     }
@@ -411,22 +467,18 @@ fn main() -> ! {
     cp.SYST.enable_counter();
     cp.SYST.enable_interrupt();
 
-    let port0 = p0::Parts::new(p.P0);
-    let mut panel = Panel {
-        button: RefCell::new(port0.p0_18.into_pullup_input().degrade()),
-        red: port0.p0_23.into_push_pull_output(Level::High).degrade(),
-        green: port0.p0_22.into_push_pull_output(Level::High).degrade(),
-        blue: port0.p0_24.into_push_pull_output(Level::High).degrade(),
-    };
-    panel.set(State::Idle);
-
     // USB runs from the crystal, not the internal oscillator. The classes take their
     // endpoints before the device is built.
     let clocks = CLOCKS.init(Clocks::new(p.CLOCK).enable_ext_hfosc());
     let bus = USB_BUS.init(UsbBusAllocator::new(Usbd::new(UsbPeripheral::new(
         p.USBD, clocks,
     ))));
+    // The serial class first, so it keeps interface 0 and the port its by-id name.
     let serial = SerialPort::new(bus);
+    let (requester, responder) = CTAP_CHANNEL
+        .split()
+        .expect("the CTAPHID channel is split once, here");
+    let ctaphid = CtapHid::new(bus, requester, 0);
     let usb = UsbDeviceBuilder::new(bus, UsbVidPid(USB_VID, USB_PID))
         .strings(&[StringDescriptors::default()
             .manufacturer("vaulttecdev")
@@ -434,8 +486,25 @@ fn main() -> ! {
         .expect("one language")
         .max_packet_size_0(64)
         .expect("64 bytes is a valid control packet size")
-        .device_class(usbd_serial::USB_CLASS_CDC)
+        // Two functions on one device: the CDC class announces itself with an interface
+        // association, which the device class has to say is there.
+        .composite_with_iads()
         .build();
+    let usb: &'static RefCell<UsbStack> = USB_STACK.init(RefCell::new(UsbStack {
+        dev: usb,
+        serial,
+        ctaphid,
+    }));
+
+    let port0 = p0::Parts::new(p.P0);
+    let mut panel = Panel {
+        button: RefCell::new(port0.p0_18.into_pullup_input().degrade()),
+        usb,
+        red: port0.p0_23.into_push_pull_output(Level::High).degrade(),
+        green: port0.p0_22.into_push_pull_output(Level::High).degrade(),
+        blue: port0.p0_24.into_push_pull_output(Level::High).degrade(),
+    };
+    panel.set(State::Idle);
 
     let store = Store::new(Flash(Nvmc::new(p.NVMC, vault_region())), LAYOUT);
     let mut dev = Device::new(
@@ -450,6 +519,11 @@ fn main() -> ! {
         BUF.take(),
     );
 
-    let mut proto = Proto::new(Usb { dev: usb, serial }, Uptime, info.as_str());
+    let port = Usb {
+        stack: usb,
+        fido: Dispatch::new(responder),
+        last_rx: 0,
+    };
+    let mut proto = Proto::new(port, Uptime, info.as_str());
     proto.run(&mut dev)
 }

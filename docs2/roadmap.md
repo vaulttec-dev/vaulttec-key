@@ -581,11 +581,12 @@ nRF; `check --wipe-everything` green on the C6.
 
 ## Phase 6 - passkeys (FIDO2)
 
-- **USB moves to interrupts.** CTAPHID must send keepalives while it waits for a touch, and
-  a composite device (CDC for vkey + CTAPHID) must serve both interfaces during any wait.
-  This is also the real fix for "USB unserviced during the tap wait".
-- **Runtime: RTIC (Nitrokey's choice) or Embassy.** Before choosing, check whether its
-  macro-generated `unsafe` trips the board's `unsafe_code = "deny"`.
+- ~~**USB moves to interrupts.**~~ CTAPHID must send keepalives while it waits for a touch,
+  and a composite device (CDC for vkey + CTAPHID) must serve both interfaces during any
+  wait. That is now done by polling during every wait, not by an interrupt: see "No
+  runtime and no interrupt" below. It is also the fix for "USB unserviced during the tap
+  wait".
+- ~~**Runtime: RTIC (Nitrokey's choice) or Embassy.**~~ Neither: see "No runtime" below.
 - **Trussed + `fido-authenticator`**, with littlefs at 0xD8000..0xEC000 and P-256 from
   `p256-cortex-m4`. Re-measure the fit and the stack high-water mark.
 - **Then Linux login moves to `pam_u2f`**, and the old `vkey auth` is removed, recorded in
@@ -595,7 +596,58 @@ nRF; `check --wipe-everything` green on the C6.
   it.
 
 Acceptance: registration and login on webauthn.io and with `fido2-token`; `pam_u2f` with
-`sudo`; `selftest` green; core changes pass `check` on the C6.
+`sudo`; `selftest` green. Core changes pass `check --wipe-everything` on the nRF, followed by
+a restore from the `.vkb` and a 1Password sync; the C6 is left alone (2026-10-14).
+
+**What is available (checked 2026-10-15).** The whole stack is on crates.io, recent, and
+agrees with the firmware's own versions: `trussed` 0.2, `fido-authenticator` 0.3,
+`usbd-ctaphid` 0.5, `ctaphid-dispatch` 0.4 and `littlefs2` 0.8, on `usb-device` 0.3.2 and
+`heapless` 0.9. littlefs and `p256-cortex-m4` are C and assembly, built with the host's
+clang.
+
+**No runtime and no interrupt (decided 2026-10-15).**
+- `nrf-usbd` never enables the USBD interrupt, and enabling it means stealing the
+  peripheral back in `unsafe`.
+- Polling from `SysTick` fails as well: `usb-device`'s types are not `Send`, so they cannot
+  sit in a static behind a critical section without an `unsafe impl`.
+
+So the device is polled in the main context, wherever the key waits:
+- for the next request (the protocol's port);
+- on every look at the button, which covers a tap wait of seconds;
+- in milestone 3, while Trussed waits for user presence.
+
+The bus waits only through Argon2 and flash writes, as it does today. There is no RTIC or
+Embassy, and no new `unsafe`.
+
+**The passkey backup is a deliberate export into the `.vkb`** (maintainer, 2026-10-15).
+FIDO's rule is non-exportable credentials plus a second key. There is no second key, so
+the passkeys go into the backup under its passphrase like every other item, and
+`docs/threat-model.md` says what that costs.
+
+Milestones, one commit each, each leaving a key that works:
+
+1. **USB served during waits.** CDC alone, behaviour unchanged: the button check polls the
+   device too. Acceptance: `selftest`, and a tap wait of several seconds that no longer
+   stalls the bus.
+2. **A composite device.** CDC plus CTAPHID (`usbd-ctaphid`) answering INIT and PING. The
+   board's port serves the FIDO dispatch whenever vkey's line has been quiet for 50 ms, so
+   a request that waits for a touch never holds up a vkey frame half read. The core is not
+   touched. Acceptance: `fido2-token -L` lists the key, and vkey works.
+
+**The core stays as it is through this phase.** A change there rebuilds the C6's image
+too, and its `vaultkey.signed.bin` can only be signed again with the C6's own key, which
+lives on the C6. The C6 is left alone (2026-10-14), so the hook would refuse the commit.
+Everything FIDO needs lives in the nRF's board folder, or that conflict goes to the
+maintainer first.
+3. **Trussed and `fido-authenticator`.** littlefs on 0xD8000..0xEC000. The factory's stale
+   staging bytes sit at 0xE0000..0xEA000, so a mount that fails formats instead of assuming
+   blank flash. User presence is the amber tap, on the same button and LED as vkey.
+   Acceptance: registration and login on webauthn.io and with `fido2-token`, and the fit
+   and the stack high-water mark measured.
+4. **`pam_u2f` for `sudo` and the lock screen**, and `vkey auth` removed, recorded in
+   `docs/` with the commit it can be restored from.
+5. **The passkeys in the `.vkb`**: backup and restore carry the Trussed filesystem, sealed
+   under the passphrase like the items.
 
 ---
 
@@ -610,7 +662,7 @@ Acceptance: registration and login on webauthn.io and with `fido2-token`; `pam_u
 | Phase 5 | ~~wiping the C6 after migration~~ - the C6 is a test board, not a fallback, and neither board holds real secrets (2026-10-14) |
 | Phase 5 | ~~chip key option A or B~~ - neither on this revision-2 chip: the boot-time glitch reads either (2026-10-15) |
 | Phase 6 | ~~passkey backup~~ - a deliberate export into the `.vkb`, outside FIDO's no-export rule (2026-10-15) |
-| Phase 6 | RTIC or Embassy, and the `unsafe` rule if the runtime needs it |
+| Phase 6 | ~~RTIC or Embassy~~ - neither: USB is polled wherever the key waits, so no new `unsafe` (2026-10-15) |
 
 ## Sources
 

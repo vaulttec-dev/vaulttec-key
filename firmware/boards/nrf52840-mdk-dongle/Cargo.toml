@@ -26,6 +26,9 @@ embedded-hal = "1.0"
 embedded-storage = "0.3"
 usb-device = "0.3"
 usbd-serial = "0.2"
+# CTAPHID, the HID interface FIDO2 speaks (docs2/roadmap.md, phase 6), beside the CDC one.
+usbd-ctaphid = { version = "0.5", default-features = false }
+ctaphid-dispatch = { version = "0.4", default-features = false }
 static_cell = "2"
 # The INFO text, built at boot; already in the tree through usb-device.
 heapless = "0.8"
