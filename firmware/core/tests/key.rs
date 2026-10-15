@@ -187,9 +187,7 @@ impl MemFlash {
 
     /// Power on with a finger on the button and, maybe, a chip key.
     fn key_with<K: DeviceKey>(&self, button: Button, clock: Ticker, key: K) -> Key<K> {
-        // The Argon2 memory, the index and the buffer outlive the device, as on the
-        // board.
-        let mem = Box::leak(vec![Block::new(); KDF_BLOCKS].into_boxed_slice());
+        // The index and the buffer outlive the device, as on the board.
         let index = Box::leak(Box::new(store::Index::empty()));
         let buf: Box<[u8; device::BUF_LEN]> = vec![0u8; device::BUF_LEN]
             .into_boxed_slice()
@@ -202,7 +200,6 @@ impl MemFlash {
             Repeatable(7),
             clock,
             key,
-            mem,
             COST,
             index,
             buf,

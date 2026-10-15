@@ -17,7 +17,7 @@ use crate::oath::{self, AUTH_SECRET_LEN, NAME_MAX, Name, Params, len_u8};
 use crate::store::{Header, ITEM_BUF_LEN, Index, MAX_ATTEMPTS, Slot, Store, StoredName};
 use crate::ui;
 use crate::vault::{
-    self, BACKUP_AAD, Block, Cost, KEY_LEN, Keys, NONCE_LEN, Passphrase, Pin, SALT_LEN,
+    self, BACKUP_AAD, Block, Cost, KDF_BLOCKS, KEY_LEN, Keys, NONCE_LEN, Passphrase, Pin, SALT_LEN,
 };
 use crate::wire::{
     AUTH_CHALLENGE_LEN, AUTH_SIGNATURE_LEN, AUTH_SIGNED_PREFIX, BackupHead, Fail, HAS_OPEN,
@@ -42,6 +42,21 @@ pub const BUF_LEN: usize = 2 * ITEM_BUF_LEN;
 
 /// A resident copy of the data key that scrubs itself when dropped.
 type Dek = Zeroizing<[u8; KEY_LEN]>;
+
+/// Argon2's working memory, 128 KiB on the stack for one derivation: it exists only
+/// while `f` runs, and `vault` scrubs it before handing the key back. Never inlined, so
+/// the frame that holds it is gone before the key waits for its next request. A board
+/// can then run other deep work in that same RAM between derivations - the nRF52840's
+/// passkeys - where a static would hold it for the life of the program.
+#[inline(never)]
+#[expect(
+    clippy::large_stack_arrays,
+    reason = "on the stack on purpose: there is no heap, and a static would hold the 128 KiB for good"
+)]
+fn with_kdf_memory<T>(f: impl FnOnce(&mut [Block]) -> T) -> T {
+    let mut mem = [Block::new(); KDF_BLOCKS];
+    f(&mut mem)
+}
 
 /// Which classes a request may have. The device never returns a field outside it, and
 /// the gesture is decided by the highest class in it.
@@ -88,8 +103,6 @@ pub struct Device<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: D
     rng: R,
     clock: C,
     key: K,
-    /// The Argon2 working memory, owned by the board for the life of the program.
-    mem: &'m mut [Block],
     /// What a new vault and a new backup are derived at: the board's measure of about a
     /// second. An existing vault opens at the cost its header records.
     cost: Cost,
@@ -134,15 +147,10 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         rng: R,
         clock: C,
         key: K,
-        mem: &'m mut [Block],
         cost: Cost,
         index: &'m mut Index,
         buf: &'m mut [u8; BUF_LEN],
     ) -> Self {
-        assert!(
-            mem.len() >= cost.m_kib as usize,
-            "the Argon2 memory holds the board's own cost"
-        );
         let now = clock.now_ms();
         Device {
             store,
@@ -150,7 +158,6 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
             rng,
             clock,
             key,
-            mem,
             cost,
             index,
             buf,
@@ -230,7 +237,8 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
     }
 
     fn derive(&mut self, pin: Pin<'_>, salt: &[u8; SALT_LEN], cost: Cost) -> Result<Keys, Fail> {
-        vault::derive(pin, salt, cost, &mut self.key, self.mem).ok_or(Fail::Internal)
+        let key = &mut self.key;
+        with_kdf_memory(|mem| vault::derive(pin, salt, cost, key, mem)).ok_or(Fail::Internal)
     }
 
     /// A header for `pin`, and the resident key switched to match. The caller writes it;
@@ -798,7 +806,8 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         let mut salt = [0u8; SALT_LEN];
         self.rng.fill_bytes(&mut salt);
         let cost = self.cost;
-        let key = vault::backup_key(pass, &salt, cost, self.mem).ok_or(Fail::Internal)?;
+        let key = with_kdf_memory(|mem| vault::backup_key(pass, &salt, cost, mem))
+            .ok_or(Fail::Internal)?;
         self.backup = Some(Session::Export {
             key,
             slot: 0,
@@ -887,7 +896,8 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
     pub fn import_begin(&mut self, pass: Passphrase<'_>, head: BackupHead) -> Result<(), Fail> {
         self.dek()?;
         self.load()?;
-        let key = vault::backup_key(pass, &head.salt, head.cost, self.mem).ok_or(Fail::Internal)?;
+        let key = with_kdf_memory(|mem| vault::backup_key(pass, &head.salt, head.cost, mem))
+            .ok_or(Fail::Internal)?;
         self.store
             .save_begin(self.index.header.as_ref())
             .map_err(|_| Fail::Internal)?;

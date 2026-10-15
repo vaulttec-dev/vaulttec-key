@@ -29,7 +29,7 @@ use vaultkey_core::hal::{Clock, DeviceKey, Port, Ui};
 use vaultkey_core::proto::Proto;
 use vaultkey_core::store::{self, Layout, Store};
 use vaultkey_core::ui::State;
-use vaultkey_core::vault::{Block, Cost, KDF_BLOCKS};
+use vaultkey_core::vault::Cost;
 
 // The ESP-IDF second-stage bootloader wants an application descriptor in the image.
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -59,12 +59,8 @@ const _: () = assert!(
 const KDF_COST: Cost =
     Cost::from_wire(128, 48).expect("128 KiB and 48 passes is a cost Argon2 runs");
 
-/// Argon2 working memory, in RAM for the life of the program: the key derivation has
-/// no allocator, and 128 KiB does not belong on the stack.
-static KDF_MEM: ConstStaticCell<[Block; KDF_BLOCKS]> =
-    ConstStaticCell::new([Block::new(); KDF_BLOCKS]);
-
-/// Where every item sits in the image, ~10 KiB: same reason, same place. The bodies
+/// Where every item sits in the image, ~10 KiB, in RAM for the life of the program: the
+/// firmware has no allocator, and the stack carries Argon2's 128 KiB. The bodies
 /// stay in flash. Filled in at boot rather than a `const`: a constant with padding in
 /// it is not "all zeros" to the linker, and this one would be copied out of the
 /// firmware image byte for byte.
@@ -196,7 +192,6 @@ fn main() -> ! {
         trng,
         Uptime,
         ChipKey::detect(p.HMAC),
-        KDF_MEM.take(),
         KDF_COST,
         VAULT.init_with(store::Index::empty),
         BUF.take(),

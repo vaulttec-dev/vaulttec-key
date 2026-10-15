@@ -360,7 +360,10 @@ fn backup(
 ) -> Result<(), Error> {
     const PASS: &str = "correct horse battery staple";
     let dir = std::env::temp_dir().join(format!("vkey-check-{}.vkb", std::process::id()));
-    println!("  >>> tap {} ONCE when the light turns blue", rep.button);
+    println!(
+        "  >>> blue asks for two taps, but this step proves one is refused: tap {} only ONCE",
+        rep.button
+    );
     rep.expect(
         "backup refused for one tap",
         &backup::export(d, &dir, passphrase(PASS)?),

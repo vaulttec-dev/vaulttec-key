@@ -120,8 +120,9 @@ This is a security device. The rules below are not recommendations.
   yields free attempts. In flash this is one word write without an erase.
 - **A claim in the protocol must hold in the code.** Advertising a guarantee only half the
   paths enforce is worse than not advertising it.
-- **Irreversible actions get their own gesture.** Code, password and a `vkey auth` login — a tap (amber); wipe —
-  hold 5 s (red); backup — double tap (blue). A tap never wipes and never exports; a hold
+- **Irreversible actions get their own gesture.** Code, password, a `vkey auth` login and
+  a passkey on the nRF52840 — a tap (amber); wipe, and erasing every passkey
+  (authenticatorReset) — hold 5 s (red); backup — double tap (blue). A tap never wipes and never exports; a hold
   never exports; a double tap never wipes. Password on a tap is the maintainer's decision of
   2026-09-08 — do not reintroduce a separate hold. A new command with consequences gets a
   new gesture, not an existing one.
@@ -149,15 +150,19 @@ folder's business.
 
 The boards:
 
-- **`nrf52840-mdk-dongle`**, the primary. USB CDC-ACM from the firmware (`1209:0001`),
-  polled; our UF2 bootloader fork (installed 2026-10-14, below) is how it is flashed: hold
+- **`nrf52840-mdk-dongle`**, the primary. USB from the firmware (`1209:0001`), polled:
+  CDC-ACM for vkey and CTAPHID for passkeys (Trussed + `fido-authenticator` in
+  `src/fido.rs`, their littlefs at 0xD8000..0xEC000). The stack sits at the bottom of RAM,
+  200 KiB, so an overflow resets the chip ("lockup" in `vkey info`). Our UF2 bootloader fork (installed 2026-10-14, below) is how it is flashed: hold
   the button while plugging in, copy `images/vaultkey.signed.uf2` to `UF2BOOT`, replug. It
   runs only images signed with the key in `bootloader/signing-key.pem`; the app ends by
   its signature slot at 0x96000. No chip key, so it holds no real secrets yet. `vkey
   info` prints the chip's build code, UICR `APPROTECT` and last reset cause. Notes,
   measurements and factory state: `docs2/makerdiary.md`; the plan: `docs2/roadmap.md`.
 - **`esp32c6-zero`**, the test board (2026-10-14): nothing is built for it, and it takes
-  `check --wipe-everything` for core changes. Secure Boot v2 is burned, so before its
+  `check --wipe-everything` for core changes. Its signed app image left the repository on
+  2026-10-15, when the core changed while the C6 was left alone; `vkey setup` refuses a
+  Secure Boot chip until `tools/sign-vaultkey.sh` runs on it again. Secure Boot v2 is burned, so before its
   first wipe a `.vkb` holding `vkey-signing` (its Secure Boot key) must exist: losing that
   key ends its updates for good. USB is a fixed Serial/JTAG (`303a:1001`), HID is impossible, so passkey will never exist
   here; one port carries both the protocol and logs — hence the `VTC2` magic word in
@@ -168,9 +173,12 @@ The boards:
 - Core crates: RustCrypto `aes-gcm`, `argon2`, `hmac`, `sha1`, `sha2`, `subtle`,
   `zeroize`; `ed25519-dalek` (built on RustCrypto's `signature` and `sha2`) for `vkey
   auth`; `crc`. Not own crypto. Toolchain: stable rustup, no compiler fork.
-  - nRF52840: `nrf52840-hal`, `cortex-m`, `cortex-m-rt` (`set-vtor`), `usb-device`,
-    `usbd-serial`, `static_cell`, `heapless`; target `thumbv7em-none-eabihf`. No radio
-    driver (`radio_base` below).
+  - nRF52840: `nrf52840-hal`, `cortex-m`, `cortex-m-rt` (`set-vtor`, `paint-stack`),
+    `usb-device`, `usbd-serial`, `usbd-ctaphid`, `ctaphid-dispatch`, `static_cell`,
+    `heapless`; for passkeys `trussed`, `trussed-staging`, `fido-authenticator`,
+    `littlefs2`; target `thumbv7em-none-eabihf`. littlefs and `p256-cortex-m4` are C,
+    built by the host's clang with the headers in `c-headers/`. No radio driver
+    (`radio_base` below).
   - C6: `esp-hal` (features `esp32c6`, `rt`, `unstable`), `esp-storage`,
     `esp-hal-smartled`, `esp-println` (`jtag-serial`), `esp-backtrace`; target
     `riscv32imac-unknown-none-elf`; no espup. Not `esp-idf-hal`, not `esp-radio`.
@@ -187,6 +195,9 @@ The boards:
   the real firmware with the counter erased was costed: a fortnight for six digits, four years
   for eight). A backup passphrase is 12–128 bytes, and the CLI asks for five or six random
   words, because 128 KiB of Argon2id does not make up for a phrase a person invented.
+  Argon2's 128 KiB is taken on the stack for one derivation (`device::with_kdf_memory`,
+  never inlined), not held in a static (2026-10-15): passkeys on the nRF52840 need the
+  same RAM between derivations.
 - **A field's class decides what may leave the device**, not the item's category
   (2026-09-19, maintainer's decision; `docs/items-v2.md`). An item is a name, a category
   and up to 32 fields; a field is `class | kind | section | label | value`, the value up
@@ -355,9 +366,9 @@ when the reason disappears, the compiler says the `expect` is no longer needed.
 
 One exception, the maintainer's decision of 2026-10-04: `nrf52840-mdk-dongle` carries its
 own copy of the table with `unsafe_code = "deny"`, because its flash driver takes the
-vault region as a `&'static mut [u8]` and memory-mapped flash cannot be named in safe code.
-The one `unsafe` is `vault_region` in its `main.rs`, under `#[expect]` and a `SAFETY`
-comment. `tools/checks.sh` fails if that copy differs from the workspace's in anything
+data region (the vault and Trussed's filesystem) as a `&'static mut [u8]` and
+memory-mapped flash cannot be named in safe code. The one `unsafe` is `data_region` in its
+`main.rs`, under `#[expect]` and a `SAFETY` comment. `tools/checks.sh` fails if that copy differs from the workspace's in anything
 else.
 
 Invalid state does not exist as a value: `Pin`, `Name`, `Params`, `Entry`, `Record` are

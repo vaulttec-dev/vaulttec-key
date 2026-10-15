@@ -106,10 +106,11 @@ filesystem and claims up to 100 passkeys; the FIDO-only Nitrokey Passkey firmwar
   reference). The CLI speaks Nordic DFU to it. `NRF_DFU_APP_DATA_AREA_SIZE` must cover the
   vault and littlefs, 0x97000..0xEC000 (340 KiB): otherwise an update erases the secrets.
   Open: where the DFU signing key (ECDSA P-256) lives.
-- **RAM: decided after the stack is measured on the board.** `MAX_ENTRIES` stays 256
-  (100–200 entries expected). If RAM is short, the candidates are the item size (8 → 4 KiB
-  frees ≈12 KiB) and, last, Argon2 memory (128 → 64 KiB frees 64 KiB but halves the cost of
-  each PIN guess after a flash dump, and C6 backups open only if both boards change).
+- **RAM: decided 2026-10-15, once passkeys ran out of it.** `MAX_ENTRIES` stays 256 and
+  Argon2 keeps 128 KiB, since every `.vkb` made so far needs it to open. What changed is
+  where the 128 KiB lives: on the stack, for one derivation at a time
+  (`device::with_kdf_memory`), not in a static. Argon2 and a passkey request never run at
+  once, so they take turns in the same RAM. "Passkeys on the board" below has the numbers.
 
 ### Fit check, measured 2026-10-03
 
@@ -268,15 +269,16 @@ vkey alone, no Trussed yet: the same core as the C6, behind the four HAL traits.
 | Port | USB CDC-ACM through `usb-device` + `usbd-serial`, polled from the main loop; VID/PID `1209:0001`, pid.codes' test pair |
 | Clock | SysTick exception, 1 ms. Not a counter read on demand: the auto-lock compares times only when the next request comes, so a counter that wraps between requests would keep an idle key unlocked |
 | Ui | button P0.18, LEDs P0.23/P0.22/P0.24, all active low, from the wiki; amber = red + green |
-| Flash | `Nvmc` over 0x97000..0xD8000 behind a wrapper that fences after every erase and write |
+| Flash | `Nvmc` over 0x97000..0xEC000 behind a wrapper that fences after every erase and write, split into the vault's region and Trussed's (`Region`), each refusing access past its end |
 | Entropy | the RNG peripheral, bias correction on |
 | DeviceKey | none: `bound() == false`, PIN only, `vkey auth` refused |
 
 Measured on the build: 72 KiB of code, 154 KiB of statics, ≈101 KiB left for the stack.
 
 Rules changed for it (maintainer's decision 2026-10-04): the board has its own lint table
-with `unsafe_code = "deny"` for the one `unsafe` in `vault_region`; `tools/checks.sh`
-keeps the rest identical. Core changes that came with it: the image copy's size moved from
+with `unsafe_code = "deny"` for the one `unsafe` in `vault_region` (`data_region` since
+2026-10-15, when Trussed's region joined the vault's); `tools/checks.sh` keeps the rest
+identical. Core changes that came with it: the image copy's size moved from
 the `STATE_SECTORS` constant into `Layout::state_sectors` (C6 keeps 53), and the test
 flash refuses a third write to a word between erases, the nRF52840's limit.
 
@@ -295,6 +297,35 @@ Known gaps, by design until the board is in hand:
   `board.toml`) and finds nothing. The same search finds 24 references to USB, 10 to the
   flash controller and 4 to the RNG. It catches direct addressing only, not a base plus
   offset from a neighbouring peripheral.
+
+### Passkeys on the board (2026-10-15)
+
+Trussed 0.2 and `fido-authenticator` 0.3 run in `src/fido.rs`, served from the protocol
+port's idle reads like the rest of USB (roadmap, phase 6):
+
+| What | Measured |
+|---|---|
+| Image | 267 748 B, 261 KiB of it code |
+| Statics | 46 KiB: the vault's index and buffer, USB with 3 KiB CTAP buffers, Trussed's channel, 4 KiB of RAM filesystem |
+| Stack | 200 KiB, at the bottom of RAM so an overflow locks the core up and resets the chip instead of running into the statics |
+| Deepest key derivation | ≈166 KiB, 128 KiB of it Argon2's memory |
+| Deepest passkey request | ≤ ≈154 KiB, from the image's call graph (frame sizes summed along the deepest direct calls, so an upper bound) |
+
+How it got there:
+- The first build kept Argon2's 128 KiB in a static, which left 64 KiB of stack. A CBOR
+  getInfo locked the core up: the stack ran off the bottom of RAM, where the layout above
+  turned it into a reset. Trussed's request loop alone has 10-25 KiB frames.
+- Nothing smaller fits in the board folder: Argon2 cannot shrink, because every `.vkb`
+  needs 128 KiB to open. So the core takes that memory on the stack for one derivation,
+  and passkeys use the same RAM between derivations (maintainer's decision, 2026-10-15).
+- `opt-level = "z"` barely moved the frames and slows Argon2, so the profile stays `s`.
+  What did help: `fido::start` is never inlined, so boot-time temporaries leave `main`'s
+  frame (27 → 9 KiB), and CTAP messages are capped at 3072 bytes, not 7609.
+- The C parts (littlefs, p256-cortex-m4) are built by the host's clang (18 here), with
+  the two C library headers they include in `c-headers/`. `C_INCLUDE_PATH` in
+  `.cargo/config.toml` also reaches the host C a build script compiles, such as
+  littlefs's bindgen run. The image is then only the same bytes on machines with the
+  same clang.
 
 ## Factory state (board arrived 2026-10-13)
 

@@ -1,3 +1,9 @@
 # Build from inside this folder so this file applies: `cargo build --release`.
 [build]
 target = "thumbv7em-none-eabihf"
+
+# littlefs and p256-cortex-m4 are C, compiled by the host's clang. This target has no C
+# library, so the two headers they include come from c-headers/.
+[env]
+CC_thumbv7em_none_eabihf = "clang"
+C_INCLUDE_PATH = { value = "c-headers", relative = true }

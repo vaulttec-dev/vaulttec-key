@@ -6,7 +6,7 @@
 > on guarantees the device does not give.
 
 Last reviewed 2026-09-12; the nRF52840 board section added 2026-10-13, its signing key
-and bootloader fork 2026-10-14. Revisited on every
+and bootloader fork 2026-10-14, its passkeys 2026-10-15. Revisited on every
 hardware or firmware change. Reporting policy: [`SECURITY.md`](../SECURITY.md). Board
 details: [`docs/hardware.md`](hardware.md).
 
@@ -60,6 +60,31 @@ and every guarantee below that rests on the eFuse key, JTAG being off or Secure 
   owner still holds the key.
 - **A backup made on this board uses its own cost** (20 passes). It is still guarded by
   the passphrase's entropy, at less than half the C6's work per guess.
+- **Passkeys (FIDO2) live outside the vault** (since 2026-10-15, roadmap phase 6).
+  Trussed and fido-authenticator keep them in a littlefs of their own at
+  0xD8000..0xEC000:
+  - **They are not sealed under the PIN.** Trussed writes its keys as they are: the
+    passkeys' private keys, and the key that wraps the credential IDs of the
+    non-resident ones (`pam_u2f`'s among them). The glitch above reads them straight
+    off the flash. No PIN search is needed, so a passkey falls in the minutes the glitch
+    takes, where the vault takes hours more.
+  - **A tap is enough, locked or not.** Registration and login take the vault's tap
+    (amber, a fresh press after the request), never the vkey PIN. A FIDO PIN, if one is
+    set through a browser or `fido2-token`, belongs to fido-authenticator. It gates what a
+    site asks it to gate and encrypts nothing.
+  - **Nothing leaves over USB.** No CTAP command returns a private key. U2F (CTAP1) is
+    not served at all: its presence check polls every 250 ms, and a tap that must start
+    after the request cannot answer that.
+  - **Erasing them takes the wipe's gesture.** authenticatorReset erases every passkey,
+    so it needs the 5 s hold (red), not a tap, and fido-authenticator accepts it only in
+    the first 10 s after the key is plugged in. The vault's own wipe,
+    `check --wipe-everything` included, does not touch them: they sit in another region.
+  - **Origin binding.** The browser binds a passkey to its site's origin, so a look-alike
+    site gets nothing it can use: the property WebAuthn has and TOTP lacks. TOTP codes and
+    passwords from the vault stay as phishable as anywhere.
+  - **No backup yet.** Milestone 5 puts the passkeys into the `.vkb`, a deliberate break
+    from FIDO's rule that they never leave. Until then, losing the key loses them, so
+    every site keeps a second way in.
 
 **Accepted, not fixed** (maintainer's decision, 2026-10-13): this revision-2 chip will hold
 everything once the steps below are done. The glitch above stays open after them. Someone
@@ -121,7 +146,7 @@ An unlock is checked against the verifier; nothing derived from the PIN is store
 
 | Choice | Reason |
 |---|---|
-| Argon2id, 128 KiB, no allocator | Memory hardness costs an attacker more than PBKDF2 does — but 128 KiB is what the board can spare beside an 80 KiB vault and a 300 KiB stack, and it fits in the cache of any desktop core, so it buys time, not the memory bandwidth Argon2 is meant to charge for. Against the PIN that changes nothing (the counter and the eFuse key do the work); against a stolen `.vkb` it is the whole defence, hence the passphrase rule below |
+| Argon2id, 128 KiB, no allocator | Memory hardness costs an attacker more than PBKDF2 does — but 128 KiB is what the board can spare beside an 80 KiB vault and a 300 KiB stack (since 2026-10-15 it is taken on the stack for each derivation and scrubbed after it; the nRF52840 paints its stack at boot, so a reset mid-derivation leaves nothing behind), and it fits in the cache of any desktop core, so it buys time, not the memory bandwidth Argon2 is meant to charge for. Against the PIN that changes nothing (the counter and the eFuse key do the work); against a stolen `.vkb` it is the whole defence, hence the passphrase rule below |
 | Cost `t` in the vault header, bounded above | A forged header cannot park the key for hours |
 | Not `scrypt`, not `balloon-hash` | `scrypt` needs `alloc`; `balloon-hash` doubles the crypto crates |
 | PIN exactly 8 digits (0.9; was 6–8) | The counter can be erased through download mode, so the real cost of a guess is one firmware unlock, ~1.3 s. That is a fortnight for six digits, five months for seven and four years for eight — the only lever is length, because a slower KDF makes every honest unlock slower too. A PIN of the wrong length is refused before the wire and costs no attempt |
@@ -291,7 +316,7 @@ of it); a PAM `cdylib` (`pam_exec` needs no C and no `unsafe`).
 
 | Threat | Why not |
 |---|---|
-| Phishing | A TOTP code typed into a fake site works on the real one. That is a property of TOTP, not of the device; only WebAuthn/passkey stops phishing, and it is **not** here and never will be on this board |
+| Phishing | A TOTP code typed into a fake site works on the real one. That is a property of TOTP, not of the device; only WebAuthn/passkey stops phishing, and the C6 never will have it (no USB HID). The nRF52840 board has passkeys since 2026-10-15 (its section above) |
 | The code, password or `.env` you just received | It passes through USB, the terminal and optionally the clipboard; host malware sees it at that moment, and it outlives the moment in the terminal's scrollback and in a clipboard manager's history (below) |
 | A host fully compromised at the moment of use | It waits for your press and takes the result; with no display the device cannot show what you are confirming |
 | A breach at the service | TOTP is a shared secret: the service stores it too |
@@ -464,7 +489,8 @@ Suits: a second factor for personal accounts when you do not want secrets on a p
 in a cloud backup — **this is the main scenario**; and anyone who wants open hardware and
 control over the firmware.
 
-Does not suit: anyone expecting phishing protection (**get a passkey/WebAuthn key**);
+Does not suit: anyone expecting phishing protection from the C6 (**a passkey/WebAuthn
+key**, which the nRF52840 board now is, with the limits in its section);
 anyone expecting resistance to physical seizure of the key (**a certified key with an
 SE**); use as a sole factor or without the services' own recovery codes — the wipe after
 8 wrong PINs is final, and a backup exists only if one was made and the passphrase not

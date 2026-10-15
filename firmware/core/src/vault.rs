@@ -43,7 +43,8 @@ pub const PIN_LEN: usize = 8;
 pub const PASS_MIN: usize = 12;
 pub const PASS_MAX: usize = 128;
 
-/// How many 1 KiB blocks the board must hand over for the key derivation.
+/// Argon2's working memory in 1 KiB blocks: what the device takes on the stack for one
+/// derivation (`device::with_kdf_memory`).
 pub const KDF_BLOCKS: usize = 128;
 /// What the env key is sealed under in the image header: a random key of its own,
 /// wrapped by the dek, so a PIN change re-seals sixty bytes instead of every blob.
@@ -91,7 +92,7 @@ impl Cost {
 
 const _: () = assert!(
     KDF_BLOCKS == Cost::MAX.m_kib as usize,
-    "the board's buffer must hold the largest cost this firmware accepts"
+    "the derivation's memory must hold the largest cost this firmware accepts"
 );
 
 /// `PIN_LEN` ASCII digits, checked once at the edge. Anything else is not a PIN and

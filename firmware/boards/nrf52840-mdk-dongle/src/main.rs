@@ -9,6 +9,8 @@
 #![no_std]
 #![no_main]
 
+mod fido;
+
 use core::cell::{Cell, RefCell};
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
@@ -17,7 +19,8 @@ use cortex_m::peripheral::SCB;
 use cortex_m::peripheral::syst::SystClkSource;
 use cortex_m_rt::{entry, exception};
 use critical_section::Mutex;
-use ctaphid_dispatch::{Channel, DEFAULT_MESSAGE_SIZE as CTAP_MESSAGE, Dispatch};
+use ctaphid_dispatch::app::App;
+use ctaphid_dispatch::{Channel, Dispatch};
 use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_storage::nor_flash::{ErrorType, NorFlash, ReadNorFlash};
 use nrf52840_hal::clocks::{Clocks, ExternalOscillator, Internal, LfOscStopped};
@@ -37,7 +40,7 @@ use vaultkey_core::hal::{Clock, DeviceKey, Port, Ui};
 use vaultkey_core::proto::Proto;
 use vaultkey_core::store::{self, Layout, Store};
 use vaultkey_core::ui::State;
-use vaultkey_core::vault::{Block, Cost, KDF_BLOCKS};
+use vaultkey_core::vault::Cost;
 
 /// The first line of INFO; the version number lives in the core crate.
 const VERSION: &str = vaultkey_core::version!("nrf52840-mdk-dongle");
@@ -70,6 +73,10 @@ const USB_PID: u16 = 0x0001;
 const VAULT_BASE: u32 = 0x9_7000;
 const VAULT_LEN: u32 = 0x4_1000;
 
+/// Trussed's filesystem, the passkeys, right after the vault: 0xD8000..0xEC000, twenty
+/// sectors, below the bootloader at 0xF4000 and out of its reach like the vault.
+const FS_LEN: u32 = 0x1_4000;
+
 /// One attempt sector and two copies of 128 KiB: the sizes decided in
 /// docs2/makerdiary.md, smaller than the C6's because this chip has 1 MiB in all.
 const LAYOUT: Layout = Layout {
@@ -93,17 +100,18 @@ const CYCLES_PER_MS: u32 = 64_000;
 const KDF_COST: Cost =
     Cost::from_wire(128, 20).expect("128 KiB and 20 passes is a cost Argon2 runs");
 
-/// Argon2 working memory, in RAM for the life of the program: the key derivation has
-/// no allocator, and 128 KiB does not belong on the stack.
-static KDF_MEM: ConstStaticCell<[Block; KDF_BLOCKS]> =
-    ConstStaticCell::new([Block::new(); KDF_BLOCKS]);
-
-/// Where every item sits in the image, ~10 KiB: same reason, same place.
+/// Where every item sits in the image, ~10 KiB, in RAM for the life of the program:
+/// the firmware has no allocator. Argon2's 128 KiB is not here: the core takes it on
+/// the stack for each derivation, and passkeys use the same RAM between them.
 static VAULT: StaticCell<store::Index> = StaticCell::new();
 
 /// Two item-sized halves, 16 KiB: one to open or build an item in, one for the items
 /// carried across while the image is rewritten.
 static BUF: ConstStaticCell<[u8; device::BUF_LEN]> = ConstStaticCell::new([0; device::BUF_LEN]);
+
+/// The chip's RNG and its flash controller, each shared by the vault and Trussed.
+static ENTROPY: StaticCell<RefCell<Rng>> = StaticCell::new();
+static FLASH: StaticCell<RefCell<Flash>> = StaticCell::new();
 
 /// The clock tree outlives everything: USB holds a reference to it.
 static CLOCKS: StaticCell<Clocks<ExternalOscillator, Internal, LfOscStopped>> = StaticCell::new();
@@ -146,25 +154,47 @@ struct UsbStack {
     dev: UsbDevice<'static, Bus>,
     serial: SerialPort<'static, Bus>,
     ctaphid: CtapHid<'static, 'static, 'static, Bus, CTAP_MESSAGE>,
+    /// True while a passkey waits for its tap (`fido::Touch`).
+    awaiting_touch: bool,
+    /// When the last keepalive went out.
+    keepalive_ms: u64,
 }
 
 impl UsbStack {
+    /// CTAP2's keepalive interval: the host gives up on a request it hears nothing about.
+    const KEEPALIVE_MS: u64 = 100;
+
     fn poll(&mut self) {
+        // usb-device polls the classes only when the bus has an event, and an answer the
+        // FIDO side has just finished is not one: it has to be picked up here.
+        self.ctaphid.check_for_app_response();
         self.dev.poll(&mut [&mut self.serial, &mut self.ctaphid]);
+        let now = Uptime.now_ms();
         // The pipe times out a request whose packets stop arriving; it compares wrapping
         // millisecond stamps, so the low half of the uptime is all it needs.
         #[expect(
             clippy::cast_possible_truncation,
             reason = "a wrapping stamp, on purpose"
         )]
-        self.ctaphid.check_timeout(Uptime.now_ms() as u32);
+        self.ctaphid.check_timeout(now as u32);
+        // A CTAP request the FIDO side holds - waiting for a tap, or for its turn behind a
+        // vkey request - is announced as such. With none pending the pipe sends nothing.
+        if now - self.keepalive_ms >= Self::KEEPALIVE_MS {
+            self.keepalive_ms = now;
+            self.ctaphid.send_keepalive(self.awaiting_touch);
+        }
     }
 }
 
 static USB_STACK: StaticCell<RefCell<UsbStack>> = StaticCell::new();
 
+/// The largest CTAP message either way, announced in getInfo. CTAPHID could carry 7609
+/// bytes, but every buffer of this size sits once in RAM and again on the stack, which
+/// passkeys need more; CTAP2 asks for 1024, and no request here comes near 3072.
+const CTAP_MESSAGE: usize = 3072;
+
 /// CTAPHID requests on their way to the FIDO side, and its answers back: one message each
-/// way, up to the 7609 bytes CTAPHID can carry.
+/// way.
 static CTAP_CHANNEL: Channel<CTAP_MESSAGE> = Channel::new();
 
 /// The protocol's side of the stack, and FIDO's: requests that come through CTAPHID are
@@ -172,6 +202,7 @@ static CTAP_CHANNEL: Channel<CTAP_MESSAGE> = Channel::new();
 struct Usb {
     stack: &'static RefCell<UsbStack>,
     fido: Dispatch<'static, 'static, CTAP_MESSAGE>,
+    passkeys: &'static mut fido::Passkeys,
     /// When vkey's last byte arrived.
     last_rx: u64,
 }
@@ -197,9 +228,9 @@ impl Port for Usb {
         if byte.is_some() {
             self.last_rx = now;
         } else if now - self.last_rx > Self::QUIET_MS {
-            // No FIDO application yet: the pipe answers INIT and PING itself, and
-            // anything that reaches the dispatch is refused as an unknown command.
-            self.fido.poll(&mut []);
+            // Outside the stack's borrow: a passkey's tap wait polls the bus itself.
+            let passkeys: &mut dyn App<'static> = &mut *self.passkeys;
+            self.fido.poll(&mut [passkeys]);
         }
         byte
     }
@@ -239,25 +270,26 @@ impl Port for Usb {
     }
 }
 
-/// The vault region as the slice the flash driver wants. Taken once: two slices over
-/// the same flash would be two owners of it.
+/// The flash the firmware keeps data in - the vault, then Trussed's filesystem - as the
+/// slice the flash driver wants. Taken once: two slices over the same flash would be
+/// two owners of it.
 #[expect(
     unsafe_code,
     reason = "the flash driver takes its region as a &'static mut slice, and memory-mapped flash cannot be named in safe code"
 )]
-fn vault_region() -> &'static mut [u8] {
+fn data_region() -> &'static mut [u8] {
     static TAKEN: AtomicBool = AtomicBool::new(false);
     assert!(
         !TAKEN.swap(true, Ordering::Relaxed),
-        "the vault region is taken once"
+        "the data region is taken once"
     );
     let base = core::ptr::with_exposed_provenance_mut::<u8>(VAULT_BASE as usize);
-    // SAFETY: 0x97000..0xD8000 is flash outside the image - memory.x ends FLASH at
-    // 0x96000 - so nothing the compiler knows of lives there; it is page-aligned, as
-    // the driver asserts; and the flag above makes this the only reference to it. The
-    // flash controller rewrites these bytes on erase, which is why every access goes
-    // through `Flash` and its fences.
-    unsafe { core::slice::from_raw_parts_mut(base, VAULT_LEN as usize) }
+    // SAFETY: 0x97000..0xEC000 is flash outside the image - memory.x ends FLASH at
+    // 0x96000, and the bootloader starts at 0xF4000 - so nothing the compiler knows of
+    // lives there; it is page-aligned, as the driver asserts; and the flag above makes
+    // this the only reference to it. The flash controller rewrites these bytes on
+    // erase, which is why every access goes through `Flash` and its fences.
+    unsafe { core::slice::from_raw_parts_mut(base, (VAULT_LEN + FS_LEN) as usize) }
 }
 
 /// The flash controller over the vault region, with a compiler fence after every
@@ -300,6 +332,106 @@ impl NorFlash for Flash {
     }
 }
 
+/// One part of the data region - the vault's or Trussed's - over the one flash
+/// controller. Each sees its own bytes from offset 0, and an access past its end is
+/// refused, so neither can reach into the other.
+struct Region {
+    flash: &'static RefCell<Flash>,
+    base: u32,
+    len: u32,
+}
+
+impl Region {
+    /// Where `len` bytes at `offset` sit in the data region, if they fit in this part.
+    fn at(&self, offset: u32, len: u32) -> Result<u32, NvmcError> {
+        match offset.checked_add(len) {
+            Some(end) if end <= self.len => Ok(self.base + offset),
+            _ => Err(NvmcError::OutOfBounds),
+        }
+    }
+}
+
+/// A buffer's length as flash counts it; nothing here is anywhere near 4 GiB.
+fn flash_len(bytes: &[u8]) -> Result<u32, NvmcError> {
+    u32::try_from(bytes.len()).map_err(|_| NvmcError::OutOfBounds)
+}
+
+impl ErrorType for Region {
+    type Error = NvmcError;
+}
+
+impl ReadNorFlash for Region {
+    const READ_SIZE: usize = Flash::READ_SIZE;
+
+    fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), NvmcError> {
+        let at = self.at(offset, flash_len(bytes)?)?;
+        self.flash.borrow_mut().read(at, bytes)
+    }
+
+    fn capacity(&self) -> usize {
+        self.len as usize
+    }
+}
+
+impl NorFlash for Region {
+    const WRITE_SIZE: usize = Flash::WRITE_SIZE;
+    const ERASE_SIZE: usize = Flash::ERASE_SIZE;
+
+    fn erase(&mut self, from: u32, to: u32) -> Result<(), NvmcError> {
+        let len = to.checked_sub(from).ok_or(NvmcError::OutOfBounds)?;
+        let at = self.at(from, len)?;
+        self.flash.borrow_mut().erase(at, at + len)
+    }
+
+    fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), NvmcError> {
+        let at = self.at(offset, flash_len(bytes)?)?;
+        self.flash.borrow_mut().write(at, bytes)
+    }
+}
+
+/// The chip's RNG, for the vault and for Trussed alike: two handles on one peripheral,
+/// each borrowing it only for a draw. The core speaks `rand_core` 0.9, as the HAL does;
+/// Trussed speaks 0.6.
+#[derive(Clone, Copy)]
+struct Entropy(&'static RefCell<Rng>);
+
+impl rand_core::RngCore for Entropy {
+    fn next_u32(&mut self) -> u32 {
+        self.0.borrow_mut().random_u32()
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0.borrow_mut().random_u64()
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        self.0.borrow_mut().random(dest);
+    }
+}
+
+impl rand_core::CryptoRng for Entropy {}
+
+impl rand_core_06::RngCore for Entropy {
+    fn next_u32(&mut self) -> u32 {
+        self.0.borrow_mut().random_u32()
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0.borrow_mut().random_u64()
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        self.0.borrow_mut().random(dest);
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core_06::Error> {
+        self.0.borrow_mut().random(dest);
+        Ok(())
+    }
+}
+
+impl rand_core_06::CryptoRng for Entropy {}
+
 /// No chip key yet. This chip has no eFuse key, and its replacement - a secret in a
 /// flash page locked by the ACL until reset - is not built (docs2/makerdiary.md). The
 /// vault is protected by the PIN alone, and `vkey info` says so.
@@ -320,9 +452,8 @@ impl DeviceKey for NoChipKey {
 /// all active low, from the Makerdiary wiki. Confirmed on the board: P0.18 is a plain
 /// input, not the chip's reset, and the tap (amber) and the double tap (blue) worked
 /// under `vkey check`. Red alone, the 5 s hold, has not been watched yet.
-struct Panel {
-    // embedded-hal reads a pin through `&mut`, and `Ui::pressed` takes `&self`.
-    button: RefCell<Pin<Input<PullUp>>>,
+struct Controls {
+    button: Pin<Input<PullUp>>,
     /// Served on every look at the button: a tap wait lasts seconds, and a host whose
     /// requests go unanswered that long resets the device.
     usb: &'static RefCell<UsbStack>,
@@ -331,30 +462,40 @@ struct Panel {
     blue: Pin<Output<PushPull>>,
 }
 
+static CONTROLS: StaticCell<RefCell<Controls>> = StaticCell::new();
+
+/// The button and the light, for the vault and for passkeys alike: they take turns, as
+/// a passkey is only served while the vault waits for its next request.
+#[derive(Clone, Copy)]
+struct Panel(&'static RefCell<Controls>);
+
 impl Ui for Panel {
     fn set(&mut self, state: State) {
         // Three plain LEDs and no PWM: amber is red and green together.
         let (r, g, b) = match state {
             State::Idle => (false, false, false),
-            State::Waiting => (true, true, false), // amber: a tap approves a code or a password
+            // amber: a tap approves a code, a password or a passkey
+            State::Waiting => (true, true, false),
             State::Export => (false, false, true), // blue: two taps let a backup out
             State::Ok => (false, true, false),
             // Red both ways, told apart by how long it stays: held while a wipe counts
             // down, a blink when nothing was confirmed.
             State::Danger | State::Refused => (true, false, false),
         };
-        light(&mut self.red, r);
-        light(&mut self.green, g);
-        light(&mut self.blue, b);
+        let mut c = self.0.borrow_mut();
+        light(&mut c.red, r);
+        light(&mut c.green, g);
+        light(&mut c.blue, b);
     }
 
     fn pressed(&self) -> bool {
+        let mut c = self.0.borrow_mut();
         // The protocol never holds the stack while the key waits for the button; if it
         // ever did, this poll is skipped rather than borrowed twice.
-        if let Ok(mut usb) = self.usb.try_borrow_mut() {
+        if let Ok(mut usb) = c.usb.try_borrow_mut() {
             usb.poll();
         }
-        let Ok(low) = self.button.borrow_mut().is_low();
+        let Ok(low) = c.button.is_low();
         low
     }
 }
@@ -478,7 +619,8 @@ fn main() -> ! {
     let (requester, responder) = CTAP_CHANNEL
         .split()
         .expect("the CTAPHID channel is split once, here");
-    let ctaphid = CtapHid::new(bus, requester, 0);
+    // CBOR announced in INIT, or hosts never send CTAP2.
+    let ctaphid = CtapHid::new(bus, requester, 0).implements_ctap2();
     let usb = UsbDeviceBuilder::new(bus, UsbVidPid(USB_VID, USB_PID))
         .strings(&[StringDescriptors::default()
             .manufacturer("vaulttecdev")
@@ -494,26 +636,40 @@ fn main() -> ! {
         dev: usb,
         serial,
         ctaphid,
+        awaiting_touch: false,
+        keepalive_ms: 0,
     }));
 
     let port0 = p0::Parts::new(p.P0);
-    let mut panel = Panel {
-        button: RefCell::new(port0.p0_18.into_pullup_input().degrade()),
+    let mut panel = Panel(CONTROLS.init(RefCell::new(Controls {
+        button: port0.p0_18.into_pullup_input().degrade(),
         usb,
         red: port0.p0_23.into_push_pull_output(Level::High).degrade(),
         green: port0.p0_22.into_push_pull_output(Level::High).degrade(),
         blue: port0.p0_24.into_push_pull_output(Level::High).degrade(),
-    };
+    })));
     panel.set(State::Idle);
 
-    let store = Store::new(Flash(Nvmc::new(p.NVMC, vault_region())), LAYOUT);
+    let rng = Entropy(ENTROPY.init(RefCell::new(Rng::new(p.RNG))));
+    let flash: &'static RefCell<Flash> =
+        FLASH.init(RefCell::new(Flash(Nvmc::new(p.NVMC, data_region()))));
+    let vault = Region {
+        flash,
+        base: 0,
+        len: VAULT_LEN,
+    };
+    let passkeys = Region {
+        flash,
+        base: VAULT_LEN,
+        len: FS_LEN,
+    };
+
     let mut dev = Device::new(
-        store,
+        Store::new(vault, LAYOUT),
         panel,
-        Rng::new(p.RNG),
+        rng,
         Uptime,
         NoChipKey,
-        KDF_MEM.take(),
         KDF_COST,
         VAULT.init_with(store::Index::empty),
         BUF.take(),
@@ -522,6 +678,7 @@ fn main() -> ! {
     let port = Usb {
         stack: usb,
         fido: Dispatch::new(responder),
+        passkeys: fido::start(passkeys, rng, panel, usb),
         last_rx: 0,
     };
     let mut proto = Proto::new(port, Uptime, info.as_str());

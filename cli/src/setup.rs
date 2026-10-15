@@ -137,11 +137,26 @@ fn flash(
         .flags
         & SECURE_BOOT_EN
         != 0;
+    let state = if secure { "on" } else { "off" };
     log(&format!(
-        "  chip {chip}, board {}, secure boot {}",
-        board.name,
-        if secure { "on" } else { "off" }
+        "  chip {chip}, board {}, secure boot {state}",
+        board.name
     ));
+
+    let images: Vec<&'static Image> = board.images_for(secure).collect();
+    // Every place the board writes gets an image on this chip too, checked before
+    // anything is erased: a signed image the folder does not have yet would leave a
+    // Secure Boot chip with a bootloader and nothing to boot.
+    if let Some(gap) = board
+        .images
+        .iter()
+        .find(|i| !images.iter().any(|j| j.addr == i.addr))
+    {
+        return Err(Error::Value(format!(
+            "{}: no image at {:#x} for a chip with secure boot {state} - sign one first: tools/sign-vaultkey.sh",
+            board.name, gap.addr
+        )));
+    }
 
     if erase {
         log("  erasing the whole flash - every secret and the PIN are gone");
@@ -149,7 +164,6 @@ fn flash(
             .erase_flash()
             .map_err(|e| Error::Value(format!("erase failed: {e}")))?;
     }
-    let images: Vec<&'static Image> = board.images_for(secure).collect();
     let chip_id = flasher.chip();
     let mut progress = Progress {
         log,

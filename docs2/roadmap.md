@@ -588,7 +588,7 @@ nRF; `check --wipe-everything` green on the C6.
   wait".
 - ~~**Runtime: RTIC (Nitrokey's choice) or Embassy.**~~ Neither: see "No runtime" below.
 - **Trussed + `fido-authenticator`**, with littlefs at 0xD8000..0xEC000 and P-256 from
-  `p256-cortex-m4`. Re-measure the fit and the stack high-water mark.
+  `p256-cortex-m4`. Done 2026-10-15 (milestone 3).
 - **Then Linux login moves to `pam_u2f`**, and the old `vkey auth` is removed, recorded in
   `docs/` with the commit it can be restored from.
 - **This is done on the daily key** (no spare). Every update starts with a `.vkb` backup.
@@ -628,24 +628,58 @@ Milestones, one commit each, each leaving a key that works:
 
 1. **USB served during waits.** CDC alone, behaviour unchanged: the button check polls the
    device too. Acceptance: `selftest`, and a tap wait of several seconds that no longer
-   stalls the bus.
+   stalls the bus. **Accepted 2026-10-15** (`b446afd`): `selftest` green with a wait of
+   several seconds before the tap.
 2. **A composite device.** CDC plus CTAPHID (`usbd-ctaphid`) answering INIT and PING. The
    board's port serves the FIDO dispatch whenever vkey's line has been quiet for 50 ms, so
-   a request that waits for a touch never holds up a vkey frame half read. The core is not
-   touched. Acceptance: `fido2-token -L` lists the key, and vkey works.
-
-**The core stays as it is through this phase.** A change there rebuilds the C6's image
-too, and its `vaultkey.signed.bin` can only be signed again with the C6's own key, which
-lives on the C6. The C6 is left alone (2026-10-14), so the hook would refuse the commit.
-Everything FIDO needs lives in the nRF's board folder, or that conflict goes to the
-maintainer first.
+   a request that waits for a touch never holds up a vkey frame half read. Acceptance:
+   `fido2-token -L` lists the key, and vkey works. **Accepted 2026-10-15**: INIT and PING
+   answered by `b446afd`. A CBOR request got no answer until the pipe's finished answers
+   were picked up on every poll, not only on bus events. That fix ships with milestone 3.
 3. **Trussed and `fido-authenticator`.** littlefs on 0xD8000..0xEC000. The factory's stale
    staging bytes sit at 0xE0000..0xEA000, so a mount that fails formats instead of assuming
    blank flash. User presence is the amber tap, on the same button and LED as vkey.
    Acceptance: registration and login on webauthn.io and with `fido2-token`, and the fit
-   and the stack high-water mark measured.
+   and the stack measured. **Accepted 2026-10-15**:
+   - registration and login passed on webauthn.io in Chrome, with a discoverable
+     credential and a FIDO PIN Chrome had set;
+   - `fido2-token -L` and `-I` read the key;
+   - makeCredential and getAssertion, resident and not, passed through
+     `ctap2.py` with the signature checked against the credential's public key;
+   - keepalives say "touch needed" every 100 ms while the key waits;
+   - authenticatorReset was refused while only tapped and erased after the 5 s hold;
+   - `vkey check --wipe-everything` passed, then the restore from the `.vkb`, the
+     1Password sync and `selftest`. Its one FAIL, "backup refused for one tap", was the
+     maintainer tapping twice: the device rightly took the second tap. The prompt now
+     says why a blue light asks for one tap there.
+
+   What changed on the way, and what it leaves:
+   - **The core changed after all.** With Argon2's 128 KiB in a static, passkeys had 64 KiB
+     of stack and needed more than twice that; the first getInfo locked the core up. The
+     core now takes the 128 KiB on the stack for one derivation (`with_kdf_memory`), and
+     the stack is 200 KiB at the bottom of RAM, where an overflow resets the chip instead
+     of corrupting the statics (`docs2/makerdiary.md`, "Passkeys on the board"). The
+     C6's image changed with it. Its signed copy can only be made on the C6, which is
+     left alone, so it left the repository, and `vkey setup` refuses a Secure Boot chip
+     until it is signed again (maintainer's decision, 2026-10-15).
+   - **The stack is bounded, not measured.** Its high-water mark cannot be read without a
+     second `unsafe` or a probe. The bound comes from the image's call graph, and a lockup
+     in `vkey info`'s reset cause would show an overflow.
+   - **CTAP2 only.** U2F's MSG is refused. getInfo still lists `U2F_V2`, as
+     fido-authenticator always does. The AAGUID is its placeholder `AAGUID0123456789`,
+     since no attestation certificate is loaded.
+   - **CTAPHID_CANCEL is not honoured during the 30 s touch wait.** A browser that cancels
+     and asks again gets CHANNEL_BUSY until the wait ends: the first webauthn.io login
+     failed that way, the second passed. Ending the wait early from the board would mean
+     moving the core's clock, and a cancel during a reset's hold would then complete it,
+     so the fix is a cancel hook in the core's `ui` with host tests (milestone 4).
 4. **`pam_u2f` for `sudo` and the lock screen**, and `vkey auth` removed, recorded in
-   `docs/` with the commit it can be restored from.
+   `docs/` with the commit it can be restored from. Two core fixes ride along, because
+   this milestone changes the core anyway:
+   - the cancel hook above;
+   - `ui::await_release`, which takes one "not pressed" sample for a release. A bounce in
+     the middle of a press could then count as two taps, and two taps at blue let a
+     backup out. It gets the same debounce `released` already has.
 5. **The passkeys in the `.vkb`**: backup and restore carry the Trussed filesystem, sealed
    under the passphrase like the items.
 
@@ -663,6 +697,7 @@ maintainer first.
 | Phase 5 | ~~chip key option A or B~~ - neither on this revision-2 chip: the boot-time glitch reads either (2026-10-15) |
 | Phase 6 | ~~passkey backup~~ - a deliberate export into the `.vkb`, outside FIDO's no-export rule (2026-10-15) |
 | Phase 6 | ~~RTIC or Embassy~~ - neither: USB is polled wherever the key waits, so no new `unsafe` (2026-10-15) |
+| Phase 6 | ~~RAM for passkeys~~ - Argon2's memory moves to the stack in the core; the C6's stale signed image leaves the repository (2026-10-15) |
 
 ## Sources
 
