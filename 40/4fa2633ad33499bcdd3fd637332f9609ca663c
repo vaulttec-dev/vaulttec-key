@@ -1,0 +1,53 @@
+docs/makerdiary.md
+  s_211416f9294557::t_19933596cf18c9 1-354,356-368,370-388,390-442,444-472
+  s_211416f9294557::t_7d24161b8d11b5 355,369,389,443
+firmware/boards/nrf52840-mdk-dongle/src/fido.rs
+  s_211416f9294557::t_4fac21b721f6fa 1
+firmware/boards/nrf52840-mdk-dongle/Cargo.toml
+  s_211416f9294557::t_9a6ff0ff7f74c2 31
+CLAUDE.md
+  s_211416f9294557::t_1319c4f6dddf19 20,27,161,309,367
+firmware/boards/nrf52840-mdk-dongle/bootloader/signing-key.sh
+  s_211416f9294557::t_6776cc4eee57f6 15
+firmware/boards/nrf52840-mdk-dongle/bootloader/test/app_test.c
+  s_211416f9294557::t_f6d5d0e72da180 2
+docs/threat-model.md
+  s_211416f9294557::t_cd725f791ea895 121
+firmware/boards/nrf52840-mdk-dongle/src/main.rs
+  s_211416f9294557::t_db94db27c4ddc1 7,83,150,445,520
+cli/src/fido.rs
+  s_211416f9294557::t_f9b2d198846c30 4
+firmware/boards/nrf52840-mdk-dongle/bootloader/test/board.sh
+  s_211416f9294557::t_cfe0403b5277a5 3
+tools/build-bootloader.sh
+  s_211416f9294557::t_52f9502c23ce30 34,102
+README.md
+  s_211416f9294557::t_3fb598bb7ab6b4 19,270-271
+cli/.cargo/audit.toml
+  s_211416f9294557::t_e508e56945d24a 10
+firmware/boards/nrf52840-mdk-dongle/board.toml
+  s_211416f9294557::t_3a2d08a4a70337 31
+docs/roadmap.md
+  s_211416f9294557::t_19933596cf18c9 1-7,9-86,88-667,669-765
+  s_211416f9294557::t_66b1f660dd896f 8,87,668
+firmware/boards/nrf52840-mdk-dongle/bootloader/Dockerfile
+  s_211416f9294557::t_c44be4cc5fef4a 5
+firmware/boards/nrf52840-mdk-dongle/memory.x
+  s_211416f9294557::t_dc71733659cf20 2
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "404fa2633ad33499bcdd3fd637332f9609ca663c",
+  "prompts": {},
+  "sessions": {
+    "s_211416f9294557": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "676596db-a983-4b94-8e19-40dad5711989",
+        "model": "unknown"
+      },
+      "human_author": "VaultTec-Dev <vaulttec-dev@proton.me>"
+    }
+  }
+}
