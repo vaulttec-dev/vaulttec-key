@@ -2347,9 +2347,10 @@ impl Shell {
         Ok(())
     }
 
-    /// `cmd` run in the plain terminal: the frame goes, raw mode is left for as long as
-    /// it runs - sudo reads a password and ssh-keygen prints its own lines - and both
-    /// come back after. Its output stays in the transcript.
+    /// `cmd` run in the plain terminal: the frame goes and raw mode is left for as long
+    /// as it runs - sudo reads a password and ssh-keygen prints its own lines. Raw mode
+    /// comes back after; the frame is left down, as `choose` leaves it, for the main
+    /// loop to draw once. Its output stays in the transcript.
     fn outside(&mut self, cmd: &mut Command) -> Result<bool, Error> {
         let mut so = io::stdout();
         if self.frame_rows > 0 {
@@ -2359,8 +2360,6 @@ impl Shell {
         let _ = terminal::disable_raw_mode();
         let status = cmd.status();
         let _ = terminal::enable_raw_mode();
-        self.draw_frame(&mut so);
-        let _ = so.flush();
         Ok(status?.success())
     }
 
