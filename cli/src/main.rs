@@ -32,6 +32,7 @@ mod import;
 mod install;
 mod item;
 mod op;
+mod passkeys;
 mod prompt;
 mod setup;
 mod shell;
@@ -205,8 +206,23 @@ enum Cmd {
         #[command(subcommand)]
         cmd: CommitsCmd,
     },
+    /// The passkeys the key keeps, under its FIDO PIN (not vkey's PIN)
+    Passkey {
+        #[command(subcommand)]
+        cmd: PasskeyCmd,
+    },
     /// Copy this binary to ~/.local/bin/vkey
     Install,
+}
+
+#[derive(Subcommand, Clone, Copy)]
+enum PasskeyCmd {
+    /// Site and account of every passkey on the key
+    List,
+    /// One passkey erased from the key, picked from the list
+    Rm,
+    /// The FIDO PIN set, or changed
+    Pin,
 }
 
 #[derive(Subcommand, Clone, Copy)]
@@ -334,6 +350,11 @@ fn run_off_port(cli: &Cli) -> Option<Result<u8, Error>> {
         Cmd::Commits {
             cmd: CommitsCmd::Github,
         } => commits::github(),
+        Cmd::Passkey { cmd } => match cmd {
+            PasskeyCmd::List => passkeys::list(),
+            PasskeyCmd::Rm => passkeys::rm(),
+            PasskeyCmd::Pin => passkeys::pin(),
+        },
         Cmd::Setup { erase, board } => cmd_setup(cli.port.as_deref(), board.as_deref(), *erase),
         _ => return None,
     })
@@ -356,7 +377,11 @@ fn run(cli: Cli) -> Result<u8, Error> {
     };
 
     match cmd {
-        Cmd::Install | Cmd::Setup { .. } | Cmd::Auth { .. } | Cmd::Commits { .. } => {
+        Cmd::Install
+        | Cmd::Setup { .. }
+        | Cmd::Auth { .. }
+        | Cmd::Commits { .. }
+        | Cmd::Passkey { .. } => {
             unreachable!("handled above")
         }
 

@@ -2,10 +2,24 @@
 //! to make a credential and try it. `pamu2fcfg` would do the first half, but the 1.1.0
 //! that distributions ship insists on an attestation certificate, and this key attests
 //! with the credential's own key, as `WebAuthn` allows (docs/roadmap.md, phase 6).
+//!
+//! And the passkeys the key keeps, through credentialManagement under the key's FIDO
+//! PIN - its own, not vkey's: fido-authenticator keeps that PIN as a bare SHA-256, so
+//! one PIN for both would hand a flash dump the vault's PIN in seconds. PIN protocol 1:
+//! an ECDH agreement, its SHA-256 as the shared key, AES-256-CBC under a zero IV, and an
+//! HMAC-SHA-256 cut to 16 bytes.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::PathBuf;
+
+use aes::cipher::block_padding::NoPadding;
+use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
+use hmac::{Hmac, KeyInit, Mac};
+use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::{PublicKey, SecretKey};
+use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::boards::BOARDS;
 use crate::device::Error;
@@ -18,6 +32,30 @@ const CMD_KEEPALIVE: u8 = 0x3B;
 const CMD_ERROR: u8 = 0x3F;
 const MAKE_CREDENTIAL: u8 = 0x01;
 const GET_ASSERTION: u8 = 0x02;
+const GET_INFO: u8 = 0x04;
+const CLIENT_PIN: u8 = 0x06;
+const CREDENTIAL_MANAGEMENT: u8 = 0x0A;
+/// clientPin subcommands, and the one permission asked for.
+const PIN_KEY_AGREEMENT: i64 = 0x02;
+const PIN_SET: i64 = 0x03;
+const PIN_CHANGE: i64 = 0x04;
+const PIN_TOKEN_WITH_PERMISSIONS: i64 = 0x09;
+const PERMISSION_CREDENTIAL_MANAGEMENT: i64 = 0x04;
+const PIN_PROTOCOL: i64 = 1;
+/// credentialManagement subcommands.
+const RPS_BEGIN: u8 = 0x02;
+const RPS_NEXT: u8 = 0x03;
+const CREDENTIALS_BEGIN: u8 = 0x04;
+const CREDENTIALS_NEXT: u8 = 0x05;
+const DELETE_CREDENTIAL: u8 = 0x06;
+/// The status for "nothing stored": an empty list, not a failure.
+const NO_CREDENTIALS: u8 = 0x2E;
+/// COSE: ECDH-ES with HKDF-256, what a key-agreement key is labelled.
+const COSE_ECDH_ES_HKDF_256: i64 = -25;
+/// A FIDO PIN is 4 to 63 bytes, sent padded with zeros to 64.
+pub const FIDO_PIN_MIN: usize = 4;
+pub const FIDO_PIN_MAX: usize = 63;
+const PIN_PADDED: usize = 64;
 /// COSE: EC2 keys, P-256, ES256.
 const COSE_EC2: i64 = 2;
 const COSE_P256: i64 = 1;
@@ -28,6 +66,19 @@ pub struct Credential {
     pub id: Vec<u8>,
     pub public: [u8; 64],
 }
+
+/// A passkey the key keeps: the site it is for, the account on it, and its id, which is
+/// what deleting it takes.
+#[derive(Clone)]
+pub struct Passkey {
+    pub site: String,
+    pub user: String,
+    pub id: Vec<u8>,
+}
+
+/// What the FIDO PIN unlocked: a token that lets credentialManagement through until the
+/// key forgets it (a replug, or another PIN).
+pub struct Token(Zeroizing<Vec<u8>>);
 
 /// The key's CTAPHID interface on a channel of its own.
 pub struct Key {
@@ -118,20 +169,256 @@ impl Key {
         Ok(())
     }
 
+    /// Whether the key has a FIDO PIN, as getInfo's `clientPin` option says.
+    pub fn pin_is_set(&mut self) -> Result<bool, Error> {
+        let info = self
+            .cbor_status(GET_INFO, None)?
+            .map_err(|CtapError(status)| Error::Value(ctap_error(status)))?;
+        let Some(Cbor::Map(options)) = field(&info, 4) else {
+            return Ok(false);
+        };
+        Ok(options
+            .iter()
+            .any(|(k, v)| *k == text("clientPin") && *v == Cbor::Simple(21)))
+    }
+
+    /// The FIDO PIN set where there is none yet.
+    pub fn set_pin(&mut self, new: &str) -> Result<(), Error> {
+        let (platform, shared) = self.agree()?;
+        let new_enc = encrypt(&shared, &padded_pin(new)?)?;
+        let auth = authenticate(&*shared, &new_enc)?;
+        self.cbor(
+            CLIENT_PIN,
+            &Cbor::Map(vec![
+                (Cbor::Int(1), Cbor::Int(PIN_PROTOCOL)),
+                (Cbor::Int(2), Cbor::Int(PIN_SET)),
+                (Cbor::Int(3), platform),
+                (Cbor::Int(4), Cbor::Bytes(auth)),
+                (Cbor::Int(5), Cbor::Bytes(new_enc)),
+            ]),
+        )
+        .map(drop)
+    }
+
+    /// The FIDO PIN changed from `old` to `new`. A wrong `old` costs one of its retries.
+    pub fn change_pin(&mut self, old: &str, new: &str) -> Result<(), Error> {
+        let (platform, shared) = self.agree()?;
+        let new_enc = encrypt(&shared, &padded_pin(new)?)?;
+        let hash_enc = encrypt(&shared, &pin_hash(old))?;
+        let mut signed = new_enc.clone();
+        signed.extend_from_slice(&hash_enc);
+        let auth = authenticate(&*shared, &signed)?;
+        self.cbor(
+            CLIENT_PIN,
+            &Cbor::Map(vec![
+                (Cbor::Int(1), Cbor::Int(PIN_PROTOCOL)),
+                (Cbor::Int(2), Cbor::Int(PIN_CHANGE)),
+                (Cbor::Int(3), platform),
+                (Cbor::Int(4), Cbor::Bytes(auth)),
+                (Cbor::Int(5), Cbor::Bytes(new_enc)),
+                (Cbor::Int(6), Cbor::Bytes(hash_enc)),
+            ]),
+        )
+        .map(drop)
+    }
+
+    /// A token for credentialManagement and nothing else. A wrong PIN costs one of its
+    /// retries; three in a row want the key replugged.
+    pub fn token(&mut self, pin: &str) -> Result<Token, Error> {
+        let (platform, shared) = self.agree()?;
+        let hash_enc = encrypt(&shared, &pin_hash(pin))?;
+        let answer = self.cbor(
+            CLIENT_PIN,
+            &Cbor::Map(vec![
+                (Cbor::Int(1), Cbor::Int(PIN_PROTOCOL)),
+                (Cbor::Int(2), Cbor::Int(PIN_TOKEN_WITH_PERMISSIONS)),
+                (Cbor::Int(3), platform),
+                (Cbor::Int(6), Cbor::Bytes(hash_enc)),
+                (Cbor::Int(9), Cbor::Int(PERMISSION_CREDENTIAL_MANAGEMENT)),
+            ]),
+        )?;
+        let sealed = field(&answer, 2)
+            .and_then(Cbor::as_bytes)
+            .ok_or_else(|| Error::Value("the key's answer has no PIN token".into()))?;
+        Ok(Token(Zeroizing::new(decrypt(&shared, sealed)?)))
+    }
+
+    /// Every passkey the key keeps, site by site.
+    pub fn passkeys(&mut self, token: &Token) -> Result<Vec<Passkey>, Error> {
+        let mut out = Vec::new();
+        let Some(first) = self.manage(token, RPS_BEGIN, None)? else {
+            return Ok(out);
+        };
+        let total = field(&first, 5).and_then(Cbor::as_int).unwrap_or(1);
+        let mut sites = vec![first];
+        for _ in 1..total {
+            if let Some(next) = self.manage(token, RPS_NEXT, None)? {
+                sites.push(next);
+            }
+        }
+        for site in &sites {
+            let name = field(site, 3)
+                .and_then(|rp| text_field(rp, "id"))
+                .unwrap_or("?")
+                .to_string();
+            let hash = field(site, 4)
+                .and_then(Cbor::as_bytes)
+                .ok_or_else(|| Error::Value("the key named a site without its hash".into()))?;
+            let params = Cbor::Map(vec![(Cbor::Int(1), Cbor::Bytes(hash.to_vec()))]);
+            let Some(first) = self.manage(token, CREDENTIALS_BEGIN, Some(params))? else {
+                continue;
+            };
+            let total = field(&first, 9).and_then(Cbor::as_int).unwrap_or(1);
+            let mut creds = vec![first];
+            for _ in 1..total {
+                if let Some(next) = self.manage(token, CREDENTIALS_NEXT, None)? {
+                    creds.push(next);
+                }
+            }
+            for c in &creds {
+                let user = field(c, 6);
+                let shown = user
+                    .and_then(|u| text_field(u, "name"))
+                    .or_else(|| user.and_then(|u| text_field(u, "displayName")))
+                    .unwrap_or("")
+                    .to_string();
+                let id = field(c, 7)
+                    .and_then(|d| bytes_field(d, "id"))
+                    .ok_or_else(|| {
+                        Error::Value("the key listed a passkey without its id".into())
+                    })?;
+                out.push(Passkey {
+                    site: name.clone(),
+                    user: shown,
+                    id: id.to_vec(),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// The passkey with `id` erased from the key. What the site holds stays there: the
+    /// account still names this passkey until it is removed on the site too.
+    pub fn delete_passkey(&mut self, token: &Token, id: &[u8]) -> Result<(), Error> {
+        let params = Cbor::Map(vec![(
+            Cbor::Int(2),
+            Cbor::Map(vec![
+                (text("id"), Cbor::Bytes(id.to_vec())),
+                (text("type"), text("public-key")),
+            ]),
+        )]);
+        self.manage(token, DELETE_CREDENTIAL, Some(params))
+            .map(drop)
+    }
+
+    /// One credentialManagement subcommand. The first of a listing and every change
+    /// carry the token's HMAC over the subcommand and its parameters; the "next" ones
+    /// continue what was already allowed. None when the key holds nothing to list.
+    fn manage(
+        &mut self,
+        token: &Token,
+        sub: u8,
+        params: Option<Cbor>,
+    ) -> Result<Option<Cbor>, Error> {
+        let mut request = vec![(Cbor::Int(1), Cbor::Int(i64::from(sub)))];
+        if !matches!(sub, RPS_NEXT | CREDENTIALS_NEXT) {
+            let mut signed = vec![sub];
+            if let Some(p) = &params {
+                p.encode(&mut signed);
+            }
+            if let Some(p) = params {
+                request.push((Cbor::Int(2), p));
+            }
+            request.push((Cbor::Int(3), Cbor::Int(PIN_PROTOCOL)));
+            request.push((Cbor::Int(4), Cbor::Bytes(authenticate(&token.0, &signed)?)));
+        }
+        match self.cbor_status(CREDENTIAL_MANAGEMENT, Some(&Cbor::Map(request)))? {
+            Ok(answer) => Ok(Some(answer)),
+            Err(CtapError(NO_CREDENTIALS)) => Ok(None),
+            Err(CtapError(status)) => Err(Error::Value(ctap_error(status))),
+        }
+    }
+
+    /// A fresh ECDH agreement with the key: the platform's public half as COSE, and the
+    /// shared key, SHA-256 of the shared point's x.
+    fn agree(&mut self) -> Result<(Cbor, Zeroizing<[u8; 32]>), Error> {
+        let answer = self.cbor(
+            CLIENT_PIN,
+            &Cbor::Map(vec![
+                (Cbor::Int(1), Cbor::Int(PIN_PROTOCOL)),
+                (Cbor::Int(2), Cbor::Int(PIN_KEY_AGREEMENT)),
+            ]),
+        )?;
+        let key = field(&answer, 1)
+            .ok_or_else(|| Error::Value("the key sent no key-agreement key".into()))?;
+        let coord = |k: i64| {
+            field(key, k)
+                .and_then(Cbor::as_bytes)
+                .filter(|b| b.len() == 32)
+        };
+        let (Some(x), Some(y)) = (coord(-2), coord(-3)) else {
+            return Err(Error::Value(
+                "the key's key-agreement key is malformed".into(),
+            ));
+        };
+        let mut sec1 = vec![0x04];
+        sec1.extend_from_slice(x);
+        sec1.extend_from_slice(y);
+        let peer = PublicKey::from_sec1_bytes(&sec1)
+            .map_err(|_| Error::Value("the key's key-agreement key is not on P-256".into()))?;
+        // The scalar from the OS random source; the odd value outside the group is drawn
+        // again rather than reduced.
+        let secret = loop {
+            if let Ok(s) = SecretKey::from_slice(&*Zeroizing::new(random32()?)) {
+                break s;
+            }
+        };
+        let point = p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), peer.as_affine());
+        let shared = Zeroizing::new(<[u8; 32]>::from(Sha256::digest(point.raw_secret_bytes())));
+        let public = secret.public_key().to_encoded_point(false);
+        let (Some(px), Some(py)) = (public.x(), public.y()) else {
+            return Err(Error::Value("no public point".into()));
+        };
+        let platform = Cbor::Map(vec![
+            (Cbor::Int(1), Cbor::Int(COSE_EC2)),
+            (Cbor::Int(3), Cbor::Int(COSE_ECDH_ES_HKDF_256)),
+            (Cbor::Int(-1), Cbor::Int(COSE_P256)),
+            (Cbor::Int(-2), Cbor::Bytes(px.to_vec())),
+            (Cbor::Int(-3), Cbor::Bytes(py.to_vec())),
+        ]);
+        Ok((platform, shared))
+    }
+
     /// A CTAP2 command and its answer, the status byte checked.
     fn cbor(&mut self, command: u8, request: &Cbor) -> Result<Cbor, Error> {
+        self.cbor_status(command, Some(request))?
+            .map_err(|CtapError(status)| Error::Value(ctap_error(status)))
+    }
+
+    /// The answer, or the key's CTAP2 status when it refused: the transport failing is
+    /// the outer error, the key saying no the inner one.
+    fn cbor_status(
+        &mut self,
+        command: u8,
+        request: Option<&Cbor>,
+    ) -> Result<Result<Cbor, CtapError>, Error> {
         let mut payload = vec![command];
-        request.encode(&mut payload);
+        if let Some(r) = request {
+            r.encode(&mut payload);
+        }
         let answer = self.transact(CMD_CBOR, &payload)?;
         let (&status, body) = answer
             .split_first()
             .ok_or_else(|| Error::Value("the key answered with nothing".into()))?;
         if status != 0 {
-            return Err(Error::Value(ctap_error(status)));
+            return Ok(Err(CtapError(status)));
+        }
+        if body.is_empty() {
+            return Ok(Ok(Cbor::Map(Vec::new())));
         }
         Cbor::decode(body)
             .filter(|(_, rest)| rest.is_empty())
-            .map(|(v, _)| v)
+            .map(|(v, _)| Ok(v))
             .ok_or_else(|| Error::Value("the key's answer is not CBOR".into()))
     }
 
@@ -264,10 +551,83 @@ fn ctap_error(status: u8) -> String {
         0x2D => "the request was cancelled",
         0x2E => "the key has no such credential",
         0x2F => "nobody tapped the key in time",
+        0x31 => "wrong FIDO PIN",
+        0x32 => "the FIDO PIN is blocked: only a FIDO reset (every passkey gone) clears it",
+        0x33 | 0x34 => "three wrong FIDO PINs in a row: replug the key and try again",
+        0x35 => "the key has no FIDO PIN yet: set one in /settings → passkey PIN",
         0x36 => "the key's FIDO PIN is needed",
+        0x37 => "the key does not take that FIDO PIN (4 to 63 characters)",
         _ => "the key refused the request",
     };
     format!("{why} (CTAP2 status {status:#04x})")
+}
+
+/// A CTAP2 status other than success: the key answered, and said no.
+struct CtapError(u8);
+
+/// AES-256-CBC under the zero IV, as PIN protocol 1 has it; `data` is whole blocks.
+fn encrypt(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut buf = data.to_vec();
+    cbc::Encryptor::<aes::Aes256>::new(key.into(), &[0u8; 16].into())
+        .encrypt_padded::<NoPadding>(&mut buf, data.len())
+        .map_err(|_| Error::Value("not whole AES blocks".into()))?;
+    Ok(buf)
+}
+
+fn decrypt(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut buf = data.to_vec();
+    let len = cbc::Decryptor::<aes::Aes256>::new(key.into(), &[0u8; 16].into())
+        .decrypt_padded::<NoPadding>(&mut buf)
+        .map_err(|_| Error::Value("the key's ciphertext is not whole AES blocks".into()))?
+        .len();
+    buf.truncate(len);
+    Ok(buf)
+}
+
+/// HMAC-SHA-256 under `key`, its first 16 bytes: PIN protocol 1's `pinUvAuthParam`.
+fn authenticate(key: &[u8], data: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key)
+        .map_err(|_| Error::Value("no HMAC key".into()))?;
+    mac.update(data);
+    Ok(mac.finalize().into_bytes()[..16].to_vec())
+}
+
+/// The first 16 bytes of the PIN's SHA-256: what the key compares with what it stored.
+fn pin_hash(pin: &str) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(Sha256::digest(pin.as_bytes())[..16].to_vec())
+}
+
+/// A new PIN padded with zeros to 64 bytes; its length checked as the key will.
+fn padded_pin(pin: &str) -> Result<Zeroizing<Vec<u8>>, Error> {
+    if !(FIDO_PIN_MIN..=FIDO_PIN_MAX).contains(&pin.len()) {
+        return Err(Error::Value(format!(
+            "a FIDO PIN is {FIDO_PIN_MIN} to {FIDO_PIN_MAX} characters"
+        )));
+    }
+    let mut out = Zeroizing::new(vec![0u8; PIN_PADDED]);
+    out[..pin.len()].copy_from_slice(pin.as_bytes());
+    Ok(out)
+}
+
+/// The text under key `k` of a CBOR map keyed by text.
+fn text_field<'a>(map: &'a Cbor, k: &str) -> Option<&'a str> {
+    let Cbor::Map(entries) = map else {
+        return None;
+    };
+    entries.iter().find_map(|(key, v)| match (key, v) {
+        (Cbor::Text(name), Cbor::Text(t)) if name == k => Some(t.as_str()),
+        _ => None,
+    })
+}
+
+fn bytes_field<'a>(map: &'a Cbor, k: &str) -> Option<&'a [u8]> {
+    let Cbor::Map(entries) = map else {
+        return None;
+    };
+    entries.iter().find_map(|(key, v)| match (key, v) {
+        (Cbor::Text(name), Cbor::Bytes(b)) if name == k => Some(b.as_slice()),
+        _ => None,
+    })
 }
 
 fn random32() -> Result<[u8; 32], Error> {
@@ -499,5 +859,41 @@ mod tests {
     fn a_hostile_answer_nested_too_deep_is_refused() {
         let deep = [0x81u8; 64];
         assert_eq!(Cbor::decode(&deep), None);
+    }
+
+    #[test]
+    fn a_new_fido_pin_is_padded_to_64_and_held_to_its_length() {
+        let p = padded_pin("1234").expect("four is the shortest");
+        assert_eq!(p.len(), 64, "padded to 64");
+        assert_eq!(&p[..5], b"1234\0", "zeros after the PIN");
+        assert!(padded_pin("123").is_err(), "three is too short");
+        assert!(
+            padded_pin(&"9".repeat(64)).is_err(),
+            "64 leaves no zero to end it"
+        );
+    }
+
+    #[test]
+    fn aes_cbc_under_the_zero_iv_round_trips_whole_blocks() {
+        let key = [7u8; 32];
+        let data = [1u8; 32];
+        let sealed = encrypt(&key, &data).expect("whole blocks");
+        assert_ne!(sealed, data, "encrypted");
+        assert_eq!(decrypt(&key, &sealed).expect("opens"), data, "back again");
+        assert!(
+            encrypt(&key, &[0u8; 15]).is_err(),
+            "a partial block is refused"
+        );
+    }
+
+    #[test]
+    fn the_pin_auth_is_the_hmac_cut_to_16_bytes() {
+        let full = <Hmac<Sha256> as KeyInit>::new_from_slice(b"k")
+            .expect("any key")
+            .chain_update(b"data")
+            .finalize()
+            .into_bytes();
+        assert_eq!(authenticate(b"k", b"data").expect("hmac"), full[..16]);
+        assert_eq!(pin_hash("1234").len(), 16, "the PIN hash is cut to 16 too");
     }
 }

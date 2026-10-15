@@ -145,7 +145,7 @@ fn offer_to_github(key: &Path) -> Result<(), Error> {
         || !prompt::yes_no("add the key to GitHub, so the commits show as verified?")
     {
         println!(
-            "to add it later:  vkey commits github  (or /settings → github)\n  public key: {}",
+            "to add it later:  vkey commits github  (or /settings → commits → github)\n  public key: {}",
             pub_path(key).display()
         );
         return Ok(());

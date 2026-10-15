@@ -212,94 +212,69 @@ fn pick<T: Copy>(label: &str, options: &[(T, &str, &str)], danger_from: usize) -
     chosen.map(|i| options[i].0)
 }
 
-/// An off/on switch on one line, starting where the setting is now: ← → (or Tab,
-/// Space, h, l) move it, Enter keeps what it shows, Esc or Ctrl-C leaves it. Only the
-/// answer stays on screen. Works inside the shell's raw mode and on a plain terminal.
-pub fn switch(label: &str, on: bool) -> Option<bool> {
-    // Columns before the label: "  ▸ ", " off ", " ", " on ", " ", " ".
-    const SWITCH: usize = 16;
+/// What `switch` came back with: the switch set to a side, or one of the actions
+/// listed under it, by its place in the list.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Flip {
+    To(bool),
+    Action(usize),
+}
+
+/// An off/on switch, starting where the setting is now, with actions that belong to it
+/// on the lines under it - each `(name, description)`. ← → (or Tab, Space, h, l) move
+/// the switch, ↑ ↓ go between it and the actions, Enter takes what is highlighted, Esc
+/// or Ctrl-C leaves it all. Only the answer stays on screen. Works inside the shell's
+/// raw mode and on a plain terminal.
+pub fn switch(label: &str, on: bool, actions: &[(&str, &str)]) -> Option<Flip> {
     let was_raw = terminal::is_raw_mode_enabled().unwrap_or(false);
     if !was_raw && terminal::enable_raw_mode().is_err() {
         return None;
     }
     let mut so = io::stdout();
-    // The switch first, then as much of the label as the width leaves: the line never
-    // wraps, so a redraw is always one line.
-    let draw = |so: &mut io::Stdout, sel: bool| -> usize {
-        let width = terminal::size()
-            .map_or(80, |(c, _)| usize::from(c))
-            .saturating_sub(1);
-        let _ = queue!(
-            so,
-            MoveToColumn(0),
-            Clear(ClearType::CurrentLine),
-            SetForegroundColor(ACCENT),
-            Print("  ▸ "),
-            ResetColor
-        );
-        for (value, name) in [(false, " off "), (true, " on ")] {
-            let picked = value == sel;
-            let _ = queue!(
-                so,
-                SetForegroundColor(if picked { ACCENT } else { DIM }),
-                SetAttribute(if picked {
-                    Attribute::Reverse
-                } else {
-                    Attribute::Reset
-                }),
-                Print(name),
-                SetAttribute(Attribute::Reset),
-                ResetColor,
-                Print(" ")
-            );
-        }
-        let room = width.saturating_sub(SWITCH);
-        let shown: String = label.chars().take(room).collect();
-        let len = SWITCH + shown.chars().count();
-        let _ = queue!(so, Print(" "), Print(shown));
-        let _ = so.flush();
-        len
-    };
     let mut sel = on;
-    let mut drawn = draw(&mut so, sel);
+    // 0 is the switch, 1.. the actions.
+    let mut row = 0;
+    let mut drawn = draw_switch(&mut so, label, sel, row, actions);
     let chosen = loop {
         let Ok(event) = event::read() else {
             continue;
         };
         let key = match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => key,
-            // A narrower window rewraps the line already drawn into more rows, with the
-            // cursor on the last: up to the first of them, clear, draw to the new width.
+            // A narrower window rewraps the lines already drawn into more rows, with
+            // the cursor at the end of the last: up to the first of them, then redraw.
             Event::Resize(cols, _) => {
-                let up = drawn.saturating_sub(1) / usize::from(cols.max(1));
-                if let Ok(up @ 1..) = u16::try_from(up) {
-                    let _ = queue!(so, MoveUp(up));
-                }
-                let _ = queue!(so, MoveToColumn(0), Clear(ClearType::FromCursorDown));
-                drawn = draw(&mut so, sel);
+                let cols = usize::from(cols.max(1));
+                let rows: usize = drawn.iter().map(|n| n.saturating_sub(1) / cols + 1).sum();
+                up_and_clear(&mut so, rows);
+                drawn = draw_switch(&mut so, label, sel, row, actions);
                 continue;
             }
             _ => continue,
         };
         match (key.code, key.modifiers) {
-            (KeyCode::Enter, _) => break Some(sel),
+            (KeyCode::Enter, _) if row == 0 => break Some(Flip::To(sel)),
+            (KeyCode::Enter, _) => break Some(Flip::Action(row - 1)),
             (KeyCode::Esc, _) | (KeyCode::Char('c' | 'd'), KeyModifiers::CONTROL) => break None,
             (KeyCode::Left | KeyCode::Char('h'), _) => sel = false,
             (KeyCode::Right | KeyCode::Char('l'), _) => sel = true,
             (KeyCode::Tab | KeyCode::BackTab | KeyCode::Char(' '), _) => sel = !sel,
+            (KeyCode::Up | KeyCode::Char('k'), _) => row = row.saturating_sub(1),
+            (KeyCode::Down | KeyCode::Char('j'), _) => row = (row + 1).min(actions.len()),
             _ => {}
         }
-        drawn = draw(&mut so, sel);
+        up_and_clear(&mut so, drawn.len());
+        drawn = draw_switch(&mut so, label, sel, row, actions);
     };
     let answer = match chosen {
-        Some(true) => "on",
-        Some(false) => "off",
+        Some(Flip::To(true)) => "on",
+        Some(Flip::To(false)) => "off",
+        Some(Flip::Action(i)) => actions[i].0,
         None => "never mind",
     };
+    up_and_clear(&mut so, drawn.len());
     let _ = queue!(
         so,
-        MoveToColumn(0),
-        Clear(ClearType::CurrentLine),
         SetForegroundColor(ACCENT),
         Print("  ▸ "),
         ResetColor,
@@ -315,6 +290,82 @@ pub fn switch(label: &str, on: bool) -> Option<bool> {
         let _ = terminal::disable_raw_mode();
     }
     chosen
+}
+
+/// From the last of `rows` rows up to the first, cleared downwards.
+fn up_and_clear(so: &mut io::Stdout, rows: usize) {
+    if let Ok(up @ 1..) = u16::try_from(rows.saturating_sub(1)) {
+        let _ = queue!(so, MoveUp(up));
+    }
+    let _ = queue!(so, MoveToColumn(0), Clear(ClearType::FromCursorDown));
+}
+
+/// The switch line and the action lines, each cut to the width so none wraps; the
+/// cursor stays at the end of the last. Their lengths, for the next redraw.
+fn draw_switch(
+    so: &mut io::Stdout,
+    label: &str,
+    sel: bool,
+    row: usize,
+    actions: &[(&str, &str)],
+) -> Vec<usize> {
+    // Columns before the label: "  ▸ ", " off ", " ", " on ", " ", " ".
+    const SWITCH: usize = 16;
+    let width = terminal::size()
+        .map_or(80, |(c, _)| usize::from(c))
+        .saturating_sub(1);
+    let marker = if row == 0 { "  ▸ " } else { "    " };
+    let _ = queue!(so, SetForegroundColor(ACCENT), Print(marker), ResetColor);
+    for (value, name) in [(false, " off "), (true, " on ")] {
+        let picked = value == sel;
+        let _ = queue!(
+            so,
+            SetForegroundColor(if picked { ACCENT } else { DIM }),
+            SetAttribute(if picked {
+                Attribute::Reverse
+            } else {
+                Attribute::Reset
+            }),
+            Print(name),
+            SetAttribute(Attribute::Reset),
+            ResetColor,
+            Print(" ")
+        );
+    }
+    let shown: String = label.chars().take(width.saturating_sub(SWITCH)).collect();
+    let mut lens = vec![SWITCH + shown.chars().count()];
+    let _ = queue!(so, Print(" "), Print(shown));
+    let name_w = actions
+        .iter()
+        .map(|(n, _)| n.chars().count())
+        .max()
+        .unwrap_or(0);
+    for (i, (name, desc)) in actions.iter().enumerate() {
+        let here = row == i + 1;
+        let line: String = format!(
+            "{}{name:<name_w$}  {desc}",
+            if here { "  ▸ " } else { "    " }
+        )
+        .chars()
+        .take(width)
+        .collect();
+        lens.push(line.chars().count());
+        let _ = queue!(
+            so,
+            Print("\r\n"),
+            SetForegroundColor(if here { ACCENT } else { DIM }),
+            SetAttribute(if here {
+                Attribute::Bold
+            } else {
+                Attribute::Reset
+            }),
+            Print(line),
+            SetAttribute(Attribute::Reset),
+            ResetColor
+        );
+    }
+    let _ = so.flush();
+    lens
 }
 
 /// A yes/no question that starts on "no": destructive answers take a keystroke.

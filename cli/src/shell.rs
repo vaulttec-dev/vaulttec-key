@@ -30,7 +30,9 @@ use crate::device::{
 };
 use crate::item::{Item, category_name};
 use crate::prompt::{ACCENT, DIM, PinPrompt, WARN_AT, copy_secret, copy_to_clipboard};
-use crate::{auth, backup, commits, import, op, prompt, setup, sources, totp};
+use crate::{
+    auth, backup, boards, commits, fido, import, op, passkeys, prompt, setup, sources, totp,
+};
 
 /// Commands live behind `/`; a bare word is the name of an entry to use.
 const COMMANDS: &[(&str, &str)] = &[
@@ -71,8 +73,8 @@ const SETTINGS: &[(&str, &str)] = &[
         "sign every git commit with a tap - turn on or off",
     ),
     (
-        "github",
-        "sign in to GitHub and add the signing key, so commits show as verified",
+        "passkey-pin",
+        "set or change the passkeys' FIDO PIN - its own, not vkey's PIN",
     ),
     (
         "wipe",
@@ -88,7 +90,7 @@ const DANGER: usize = 2;
 /// Reached from the list with a, e, d and i, never offered as commands: an entry has
 /// one place, and the list is it. They still resolve when typed, so the transcript's
 /// `❯ /rm name` is a line that would work.
-const LIST_COMMANDS: &[&str] = &["add", "edit", "rm", "import"];
+const LIST_COMMANDS: &[&str] = &["add", "edit", "rm", "import", "passkeys", "passkey-rm"];
 const SETTLE: Duration = Duration::from_millis(120);
 
 // The palette Claude Code uses: one warm accent (ACCENT and DIM live in prompt.rs),
@@ -437,6 +439,8 @@ enum Tab {
     All,
     Totp,
     Of(Category),
+    /// The passkeys the key's FIDO side keeps: not vault entries, and not in any vault.
+    Passkey,
 }
 
 /// The level above the tabs: the 1Password vaults the entries came from, then one of
@@ -461,6 +465,7 @@ impl Tab {
             Tab::All => "all",
             Tab::Totp => "totp",
             Tab::Of(c) => category_name(c),
+            Tab::Passkey => "passkey",
         }
     }
 }
@@ -532,6 +537,9 @@ pub struct Shell {
     /// Rows of the frame on screen, and the terminal width it was drawn for.
     frame_rows: u16,
     drawn_width: u16,
+    /// The passkeys, once the FIDO PIN opened them: its token and what it listed.
+    /// Forgotten with the vault's lock.
+    passkeys: Option<(fido::Token, Vec<fido::Passkey>)>,
 }
 
 pub fn run(dev: Device, version: Option<String>) -> Result<u8, Error> {
@@ -555,6 +563,7 @@ pub fn run(dev: Device, version: Option<String>) -> Result<u8, Error> {
         menu: None,
         frame_rows: 0,
         drawn_width: 0,
+        passkeys: None,
     };
     shell.main_loop()
 }
@@ -779,6 +788,7 @@ impl Shell {
         // width leaves.
         let legend = match (self.letters_act(), listing) {
             _ if listing && self.at_vaults() => " Enter open · type to search ",
+            _ if listing && self.tab == Tab::Passkey => " d erase · ← → tab ",
             (true, true) if !self.vaults.is_empty() => {
                 " Enter use · type to search · a e d i · ← → tab · Esc vaults "
             }
@@ -985,7 +995,7 @@ impl Shell {
     /// How to name the button on the board in front of the user; the board says what is
     /// printed on it.
     fn button(&self) -> String {
-        crate::boards::button(self.version.as_deref())
+        boards::button(self.version.as_deref())
     }
 
     /// After an unplug the port is gone and the board rebooted locked; come back on
@@ -2325,16 +2335,74 @@ impl Shell {
     /// The off/on switch below the transcript, starting where the setting stands; true
     /// only when it was moved and confirmed.
     fn flipped(&mut self, label: &str, on: bool) -> bool {
+        self.switch(label, on, &[]) == Some(prompt::Flip::To(!on))
+    }
+
+    /// `prompt::switch` below the transcript; "nothing changed" when the answer leaves
+    /// the switch where it was and takes no action.
+    fn switch(&mut self, label: &str, on: bool, actions: &[(&str, &str)]) -> Option<prompt::Flip> {
         if self.frame_rows > 0 {
             let mut so = io::stdout();
             self.erase_frame(&mut so);
             let _ = so.flush();
         }
-        if prompt::switch(label, on) == Some(!on) {
-            return true;
+        let flip = prompt::switch(label, on, actions);
+        if matches!(flip, None | Some(prompt::Flip::To(_))) && flip != Some(prompt::Flip::To(!on)) {
+            self.line(DIM, "  nothing changed");
         }
-        self.line(DIM, "  nothing changed");
-        false
+        flip
+    }
+
+    /// The passkey tab, opened: the FIDO PIN asked, the passkeys listed and kept with
+    /// its token until the lock.
+    fn cmd_passkeys(&mut self) -> Result<(), Error> {
+        let Some(pin) = self.ask("FIDO PIN: ", Field::Hidden) else {
+            self.line(DIM, "  never mind");
+            return Ok(());
+        };
+        let mut key = fido::Key::open()?;
+        let token = key.token(&pin)?;
+        let all = key.passkeys(&token)?;
+        if all.is_empty() {
+            self.line(DIM, "  no passkeys on the key");
+        }
+        self.passkeys = Some((token, all));
+        self.tab = Tab::Passkey;
+        if self.at_vaults() {
+            self.shelf = Shelf::All;
+        }
+        self.open_list();
+        Ok(())
+    }
+
+    /// `/passkey-rm <n>`: the n-th passkey of the tab erased, after a yes, and the tab
+    /// listed again from the key.
+    fn cmd_passkey_rm(&mut self, arg: &str) -> Result<(), Error> {
+        let at: usize = arg.parse().map_err(|_| Error::BadArg)?;
+        let Some((_, all)) = &self.passkeys else {
+            return Err(Error::Value("open the passkey tab first".into()));
+        };
+        let Some(p) = all.get(at).cloned() else {
+            return Err(Error::NotFound);
+        };
+        let label = passkeys::label(&p);
+        if !self.ask_yes(&format!(
+            "erase the passkey {label} from the key? The site still lists it until you remove it there."
+        )) {
+            self.line(DIM, "  kept");
+            self.open_list();
+            return Ok(());
+        }
+        let Some((token, _)) = self.passkeys.take() else {
+            return Err(Error::NotFound);
+        };
+        let mut key = fido::Key::open()?;
+        key.delete_passkey(&token, &p.id)?;
+        let all = key.passkeys(&token)?;
+        self.passkeys = Some((token, all));
+        self.line(Color::Green, &format!("  erased {label}"));
+        self.open_list();
+        Ok(())
     }
 
     /// `/auth`: `sudo vkey auth enable` or `disable`, as the switch is moved, with
@@ -2379,11 +2447,22 @@ impl Shell {
     /// `/commits`: `vkey commits enable` or `disable`, as the switch is moved.
     fn cmd_commits(&mut self) -> Result<(), Error> {
         let on = commits::enabled();
-        if !self.flipped("sign every git commit with a tap", on) {
-            return Ok(());
-        }
+        let github = (
+            "github",
+            "sign in to GitHub and add the signing key, so commits show as verified",
+        );
+        let verb = match self.switch("sign every git commit with a tap", on, &[github]) {
+            Some(prompt::Flip::Action(_)) => "github",
+            Some(prompt::Flip::To(to)) if to != on => {
+                if to {
+                    "enable"
+                } else {
+                    "disable"
+                }
+            }
+            _ => return Ok(()),
+        };
         let exe = std::env::current_exe()?;
-        let verb = if on { "disable" } else { "enable" };
         self.outside(Command::new(&exe).args(["commits", verb]))?;
         Ok(())
     }
@@ -2438,10 +2517,18 @@ impl Shell {
                 let r = self.cmd_commits();
                 return self.report(r);
             }
-            "github" => {
+            "passkeys" => {
+                let r = self.cmd_passkeys();
+                return self.report(r);
+            }
+            "passkey-rm" => {
+                let r = self.cmd_passkey_rm(arg);
+                return self.report(r);
+            }
+            "passkey-pin" => {
                 let r = std::env::current_exe()
                     .map_err(Error::from)
-                    .and_then(|exe| self.outside(Command::new(exe).args(["commits", "github"])))
+                    .and_then(|exe| self.outside(Command::new(exe).args(["passkey", "pin"])))
                     .map(drop);
                 return self.report(r);
             }
@@ -2472,7 +2559,10 @@ impl Shell {
                     self.unlock().map(|()| self.refresh())
                 }
             }
-            "lock" => self.dev()?.lock().map(|()| self.refresh()),
+            "lock" => {
+                self.passkeys = None;
+                self.dev()?.lock().map(|()| self.refresh())
+            }
             "settings" => self.cmd_settings(),
             "pin" => self.cmd_pin(),
             "wipe" => self.cmd_wipe(),
@@ -2545,6 +2635,18 @@ impl Shell {
 
     /// The items the open tab shows, as table rows.
     fn tab_entries(&self) -> Vec<Row> {
+        if self.tab == Tab::Passkey {
+            return self
+                .passkeys
+                .iter()
+                .flat_map(|(_, all)| all)
+                .map(|p| Row {
+                    text: p.site.clone(),
+                    login: p.user.clone(),
+                    what: "passkey".to_string(),
+                })
+                .collect();
+        }
         self.entries
             .iter()
             .filter(|e| self.in_tab(e))
@@ -2560,7 +2662,17 @@ impl Shell {
             Tab::All => true,
             Tab::Totp => self.known.get(&e.name).is_some_and(|k| k.has_seed),
             Tab::Of(c) => e.category == c,
+            Tab::Passkey => false,
         }
+    }
+
+    /// Whether this board keeps passkeys, as its folder says.
+    fn has_passkeys(&self) -> bool {
+        self.version
+            .as_deref()
+            .and_then(|v| v.rsplit(' ').next())
+            .and_then(boards::by_name)
+            .is_some_and(|b| b.passkeys)
     }
 
     /// The tabs to show: `all`, `totp` when anything has a seed, then every category
@@ -2581,6 +2693,9 @@ impl Shell {
         }
         counts.sort_by_key(|(c, n)| (std::cmp::Reverse(*n), category_name(*c)));
         tabs.extend(counts.into_iter().map(|(c, _)| Tab::Of(c)));
+        if self.has_passkeys() {
+            tabs.push(Tab::Passkey);
+        }
         tabs
     }
 
@@ -2589,15 +2704,23 @@ impl Shell {
     }
 
     /// The neighbouring tab, wrapping at either end.
-    fn shift_tab(&mut self, dir: Dir) {
+    /// The next or previous tab. The passkey tab, the first time, is a command: it asks
+    /// the FIDO PIN before there is anything to show.
+    fn shift_tab(&mut self, dir: Dir) -> Key {
         let tabs = self.tabs();
         let at = tabs.iter().position(|t| *t == self.tab).unwrap_or(0);
         let n = tabs.len();
-        self.tab = match dir {
+        let to = match dir {
             Dir::Next => tabs[(at + 1) % n],
             Dir::Prev => tabs[(at + n - 1) % n],
         };
+        if to == Tab::Passkey && self.passkeys.is_none() {
+            self.menu = None;
+            return Key::Submit("/passkeys".to_string());
+        }
+        self.tab = to;
         self.open_list();
+        Key::Redraw
     }
 
     fn update_menu(&mut self) {
@@ -2759,11 +2882,41 @@ impl Shell {
         }
     }
 
+    /// The keys the passkey tab answers itself: d erases the highlighted one; Enter and
+    /// the other letters only say what a passkey is for, since one is made and used on
+    /// its site, and typing does not search entries that are not there.
+    fn passkey_key(&mut self, code: KeyCode, ctrl: bool) -> Option<Key> {
+        if ctrl || !self.listing() || self.tab != Tab::Passkey {
+            return None;
+        }
+        let selected = self.menu.as_ref().and_then(|m| m.selected);
+        match code {
+            KeyCode::Char('d') => Some(match selected {
+                Some(at) => {
+                    self.menu = None;
+                    Key::Submit(format!("/passkey-rm {at}"))
+                }
+                None => Key::Redraw,
+            }),
+            KeyCode::Enter | KeyCode::Char(_) => {
+                self.line(
+                    DIM,
+                    "  a passkey is made and used on its site, in the browser; d erases it from the key",
+                );
+                Some(Key::Redraw)
+            }
+            _ => None,
+        }
+    }
+
     fn handle_key(&mut self, k: KeyEvent) -> Key {
         if let Some(key) = self.vault_key(k.code) {
             return key;
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        if let Some(key) = self.passkey_key(k.code, ctrl) {
+            return key;
+        }
         match k.code {
             KeyCode::Enter => {
                 // A highlighted menu item is already in the input: one Enter runs it.
@@ -2809,8 +2962,12 @@ impl Shell {
             }
             // In the list the arrows turn the tab; a highlighted name there is not
             // something to edit in place.
-            KeyCode::Left if self.listing() && !self.at_vaults() => self.shift_tab(Dir::Prev),
-            KeyCode::Right if self.listing() && !self.at_vaults() => self.shift_tab(Dir::Next),
+            KeyCode::Left if self.listing() && !self.at_vaults() => {
+                return self.shift_tab(Dir::Prev);
+            }
+            KeyCode::Right if self.listing() && !self.at_vaults() => {
+                return self.shift_tab(Dir::Next);
+            }
             KeyCode::Left | KeyCode::Right if self.listing() => {}
             KeyCode::Left => self.cursor = self.prev_char(),
             KeyCode::Right => self.cursor = self.next_char(),

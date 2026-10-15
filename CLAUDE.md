@@ -235,6 +235,11 @@ The boards:
   The shell's `/settings` turns `auth` and `commits` on and off by running these same
   commands outside raw mode (`sudo` for `auth`). Linux only; macOS and Windows are
   issues #18 and #19.
+- `vkey passkey list|rm|pin` and the shell's `passkey` tab (2026-10-16,
+  `cli/src/passkeys.rs`) list and erase the discoverable passkeys through CTAP2
+  credentialManagement under the key's FIDO PIN, which stays apart from vkey's PIN
+  (maintainer's decision): fido-authenticator keeps it as a bare SHA-256, so one PIN
+  for both would give a flash dump the vault's PIN.
 - A TOTP seed leaves the device two ways. The backup (`ExportBegin`/`ExportNext`, after a
   double tap; 2026-09-09) reseals every item under a key derived from a passphrase
   (Argon2id, `Passphrase` 12–128 bytes, without the chip key, so the file opens on another

@@ -325,6 +325,25 @@ Rejected: presence of the USB device as proof (any ESP32 shows `303a:1001`); PIN
 with a rotating expectation (state to write at every login); a PAM `cdylib`; keeping a
 scheme of our own beside `pam_u2f`.
 
+### The passkey list and the FIDO PIN
+
+Since 2026-10-16 `vkey passkey` and the shell's `passkey` tab list and erase the
+discoverable passkeys through CTAP2 credentialManagement, and `vkey passkey pin` sets or
+changes the FIDO PIN (`cli/src/fido.rs`, PIN protocol 1). Nothing in the firmware
+changed: fido-authenticator enforces it all.
+
+| | |
+|---|---|
+| Given | Listing or erasing needs the FIDO PIN and gets a token for credential management only (permission `cm`), which the shell keeps in memory until the vault locks or it quits |
+| The FIDO PIN apart from vkey's | Maintainer's decision, 2026-10-16. fido-authenticator stores the PIN as the first 16 bytes of its SHA-256 in Trussed's filesystem: a copy of the flash (the revision-2 glitch) finds an 8-digit PIN in under a second. One PIN for both would hand that copy the vault's PIN, which Argon2 otherwise makes cost years |
+| Wrong FIDO PINs | Eight in all, then the FIDO side is blocked until authenticatorReset; three in a row want a replug. Separate from vkey's eight |
+| Malware running as the user | With the FIDO PIN, it can list and erase passkeys - a denial of service, not a sign-in: using one still needs the tap |
+| What the list does not show | Non-resident credentials: the `vkey auth` login and the commit signing key live as handles on the host, not on the key |
+
+Rejected: one PIN for vkey and FIDO (above); the firmware reading fido-authenticator's
+files itself to list passkeys under vkey's PIN (a second path to the passkeys around the
+authenticator, tied to its internal format, more code on the key).
+
 ### Git commits signed with a tap
 
 Since 2026-10-15 `vkey commits enable` (or `/settings` → `commits`) makes an OpenSSH

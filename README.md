@@ -163,6 +163,23 @@ the password.
 In the shell, `/settings` → `auth` does the same in one step, and installs `libpam-u2f`
 with apt first if it is missing.
 
+## Passkeys on the key
+
+```bash
+vkey passkey list    # site and account of every passkey the key keeps
+vkey passkey rm      # one erased from the key, picked from the list
+vkey passkey pin     # the FIDO PIN set, or changed
+```
+
+The nRF52840 keeps the passkeys sites make discoverable (webauthn.io's, a Google
+account's). They sit behind the key's **FIDO PIN**, the one a browser asks for, which is
+apart from vkey's PIN on purpose: the key stores it as a plain SHA-256, so the same PIN
+for both would give a flash dump the vault's PIN too. In the shell the last tab of the
+list is `passkey`: it asks the FIDO PIN once, lists them until the lock, and `d` erases
+the highlighted one. Erasing it on the key does not remove it from the site. `/settings`
+→ `passkey-pin` sets or changes the FIDO PIN. The `vkey auth` login and the commit
+signing key are not kept on the key, so they are not in the list.
+
 ## Git commits signed with a tap
 
 ```bash
@@ -179,7 +196,7 @@ to overwrite a signing setup that is not its own, and offers to add the public h
 GitHub as a signing key (`gh`), so the commits show as verified there. `github` does that
 step alone: it signs `gh` in, or grants it the `admin:ssh_signing_key` permission, in the
 browser when it has to, then adds the key. From then on every commit waits for a tap. In
-the shell it is `/settings` → `commits`, on or off, and `/settings` → `github`. Linux only
+the shell it is `/settings` → `commits`: the switch, and `github` on the line under it. Linux only
 for now; macOS and Windows are issues #18 and #19. What it costs is in
 [the threat model](docs/threat-model.md#git-commits-signed-with-a-tap).
 
