@@ -197,6 +197,111 @@ fn pick<T: Copy>(label: &str, options: &[(T, &str, &str)]) -> Option<T> {
     chosen.map(|i| options[i].0)
 }
 
+/// An off/on switch on one line, starting where the setting is now: ← → (or Tab,
+/// Space, h, l) move it, Enter keeps what it shows, Esc or Ctrl-C leaves it. Only the
+/// answer stays on screen. Works inside the shell's raw mode and on a plain terminal.
+pub fn switch(label: &str, on: bool) -> Option<bool> {
+    // Columns before the label: "  ▸ ", " off ", " ", " on ", " ", " ".
+    const SWITCH: usize = 16;
+    let was_raw = terminal::is_raw_mode_enabled().unwrap_or(false);
+    if !was_raw && terminal::enable_raw_mode().is_err() {
+        return None;
+    }
+    let mut so = io::stdout();
+    // The switch first, then as much of the label as the width leaves: the line never
+    // wraps, so a redraw is always one line.
+    let draw = |so: &mut io::Stdout, sel: bool| -> usize {
+        let width = terminal::size()
+            .map_or(80, |(c, _)| usize::from(c))
+            .saturating_sub(1);
+        let _ = queue!(
+            so,
+            MoveToColumn(0),
+            Clear(ClearType::CurrentLine),
+            SetForegroundColor(ACCENT),
+            Print("  ▸ "),
+            ResetColor
+        );
+        for (value, name) in [(false, " off "), (true, " on ")] {
+            let picked = value == sel;
+            let _ = queue!(
+                so,
+                SetForegroundColor(if picked { ACCENT } else { DIM }),
+                SetAttribute(if picked {
+                    Attribute::Reverse
+                } else {
+                    Attribute::Reset
+                }),
+                Print(name),
+                SetAttribute(Attribute::Reset),
+                ResetColor,
+                Print(" ")
+            );
+        }
+        let room = width.saturating_sub(SWITCH);
+        let shown: String = label.chars().take(room).collect();
+        let len = SWITCH + shown.chars().count();
+        let _ = queue!(so, Print(" "), Print(shown));
+        let _ = so.flush();
+        len
+    };
+    let mut sel = on;
+    let mut drawn = draw(&mut so, sel);
+    let chosen = loop {
+        let Ok(event) = event::read() else {
+            continue;
+        };
+        let key = match event {
+            Event::Key(key) if key.kind == KeyEventKind::Press => key,
+            // A narrower window rewraps the line already drawn into more rows, with the
+            // cursor on the last: up to the first of them, clear, draw to the new width.
+            Event::Resize(cols, _) => {
+                let up = drawn.saturating_sub(1) / usize::from(cols.max(1));
+                if let Ok(up @ 1..) = u16::try_from(up) {
+                    let _ = queue!(so, MoveUp(up));
+                }
+                let _ = queue!(so, MoveToColumn(0), Clear(ClearType::FromCursorDown));
+                drawn = draw(&mut so, sel);
+                continue;
+            }
+            _ => continue,
+        };
+        match (key.code, key.modifiers) {
+            (KeyCode::Enter, _) => break Some(sel),
+            (KeyCode::Esc, _) | (KeyCode::Char('c' | 'd'), KeyModifiers::CONTROL) => break None,
+            (KeyCode::Left | KeyCode::Char('h'), _) => sel = false,
+            (KeyCode::Right | KeyCode::Char('l'), _) => sel = true,
+            (KeyCode::Tab | KeyCode::BackTab | KeyCode::Char(' '), _) => sel = !sel,
+            _ => {}
+        }
+        drawn = draw(&mut so, sel);
+    };
+    let answer = match chosen {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "never mind",
+    };
+    let _ = queue!(
+        so,
+        MoveToColumn(0),
+        Clear(ClearType::CurrentLine),
+        SetForegroundColor(ACCENT),
+        Print("  ▸ "),
+        ResetColor,
+        Print(label),
+        Print(" "),
+        SetForegroundColor(DIM),
+        Print(answer),
+        ResetColor,
+        Print("\r\n")
+    );
+    let _ = so.flush();
+    if !was_raw {
+        let _ = terminal::disable_raw_mode();
+    }
+    chosen
+}
+
 /// A yes/no question that starts on "no": destructive answers take a keystroke.
 /// Without a terminal there is no asking; `--yes` says it up front.
 pub fn confirm(question: &str, assume_yes: bool) -> Result<bool, Error> {

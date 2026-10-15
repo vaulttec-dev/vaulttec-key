@@ -2273,10 +2273,22 @@ impl Shell {
 
     /// `/settings`: one of the commands that act on the key itself.
     fn cmd_settings(&mut self) -> Result<(), Error> {
+        // The two switches say where they stand, so the list is also the status.
+        let state = |on: bool| if on { "on] " } else { "off]" };
+        let user = std::env::var("USER").unwrap_or_default();
+        let descs: Vec<String> = SETTINGS
+            .iter()
+            .map(|(name, desc)| match *name {
+                "auth" => format!("[{} {desc}", state(auth::enabled(&user))),
+                "commits" => format!("[{} {desc}", state(commits::enabled())),
+                _ => (*desc).to_string(),
+            })
+            .collect();
         let options: Vec<(usize, &str, &str)> = SETTINGS
             .iter()
+            .zip(&descs)
             .enumerate()
-            .map(|(i, (name, desc))| (i, *name, *desc))
+            .map(|(i, ((name, _), desc))| (i, *name, desc.as_str()))
             .collect();
         let Some(at) = self.choose("settings:", &options) else {
             return Ok(());
@@ -2284,18 +2296,27 @@ impl Shell {
         self.dispatch(&format!("/{}", SETTINGS[at].0))
     }
 
-    /// `/auth`: `sudo vkey auth enable` or `disable`, whichever flips the current state,
-    /// with `libpam-u2f` installed first if it is missing and apt is there to do it.
+    /// The off/on switch below the transcript, starting where the setting stands; true
+    /// only when it was moved and confirmed.
+    fn flipped(&mut self, label: &str, on: bool) -> bool {
+        if self.frame_rows > 0 {
+            let mut so = io::stdout();
+            self.erase_frame(&mut so);
+            let _ = so.flush();
+        }
+        if prompt::switch(label, on) == Some(!on) {
+            return true;
+        }
+        self.line(DIM, "  nothing changed");
+        false
+    }
+
+    /// `/auth`: `sudo vkey auth enable` or `disable`, as the switch is moved, with
+    /// `libpam-u2f` installed first if it is missing and apt is there to do it.
     fn cmd_auth(&mut self) -> Result<(), Error> {
         let user = std::env::var("USER").unwrap_or_default();
         let on = auth::enabled(&user);
-        let question = if on {
-            "sudo and the lock screen take a tap now - turn that off?"
-        } else {
-            "let sudo and the lock screen take a tap on this key?"
-        };
-        if !self.ask_yes(question) {
-            self.line(DIM, "  nothing changed");
+        if !self.flipped("sudo and the lock screen with a tap", on) {
             return Ok(());
         }
         let exe = std::env::current_exe()?;
@@ -2329,16 +2350,10 @@ impl Shell {
         Ok(())
     }
 
-    /// `/commits`: `vkey commits enable` or `disable`, whichever flips the current state.
+    /// `/commits`: `vkey commits enable` or `disable`, as the switch is moved.
     fn cmd_commits(&mut self) -> Result<(), Error> {
         let on = commits::enabled();
-        let question = if on {
-            "every commit is signed with a tap now - turn that off?"
-        } else {
-            "sign every git commit with a tap on this key?"
-        };
-        if !self.ask_yes(question) {
-            self.line(DIM, "  nothing changed");
+        if !self.flipped("sign every git commit with a tap", on) {
             return Ok(());
         }
         let exe = std::env::current_exe()?;
