@@ -40,12 +40,7 @@ offset = 0x10000
 file = "images/vaultkey.bin"
 secure_boot = false
 
-# The app signed for a Secure Boot chip is not here (2026-10-15): the core changed for
-# the nRF52840's passkeys, and the key that signs this board's images lives on this
-# board, which is left alone. Until tools/sign-vaultkey.sh runs with it plugged in and
-# the entry below comes back, `vkey setup` refuses a Secure Boot chip:
-#
-# [[image]]
-# offset = 0x10000
-# file = "images/vaultkey.signed.bin"
-# secure_boot = true
+[[image]]
+offset = 0x10000
+file = "images/vaultkey.signed.bin"
+secure_boot = true

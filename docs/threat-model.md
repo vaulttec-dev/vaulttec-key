@@ -59,6 +59,10 @@ and every guarantee below that rests on the eFuse key, JTAG being off or Secure 
   Whoever has the key signs firmware the fork runs. By design, the fork moves to a new key
   only through a self-update signed with the old one. A leak is mended only while the
   owner still holds the key.
+- **The C6's Secure Boot key lives here too** (since 2026-10-15): `vkey-signing`, added
+  from the C6's `.vkb` by `vkey restore --only`, so the C6's images are signed without
+  touching the C6. Whoever takes it off this board signs firmware the C6 boots; the C6
+  holds no real secrets, and its own copy stays where it was.
 - **A backup made on this board uses its own cost** (20 passes). It is still guarded by
   the passphrase's entropy, at less than half the C6's work per guess.
 - **Passkeys (FIDO2) live outside the vault** (since 2026-10-15, roadmap phase 6).

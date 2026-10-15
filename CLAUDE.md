@@ -160,9 +160,9 @@ The boards:
   info` prints the chip's build code, UICR `APPROTECT` and last reset cause. Notes,
   measurements and factory state: `docs2/makerdiary.md`; the plan: `docs2/roadmap.md`.
 - **`esp32c6-zero`**, the test board (2026-10-14): nothing is built for it, and it takes
-  `check --wipe-everything` for core changes. Its signed app image left the repository on
-  2026-10-15, when the core changed while the C6 was left alone; `vkey setup` refuses a
-  Secure Boot chip until `tools/sign-vaultkey.sh` runs on it again. Secure Boot v2 is burned, so before its
+  `check --wipe-everything` for core changes. Its images are signed by
+  `tools/sign-vaultkey.sh` with `vkey-signing`, which also lives on the nRF since
+  2026-10-15, so a core change is signed without touching the C6. Secure Boot v2 is burned, so before its
   first wipe a `.vkb` holding `vkey-signing` (its Secure Boot key) must exist: losing that
   key ends its updates for good. USB is a fixed Serial/JTAG (`303a:1001`), HID is impossible, so passkey will never exist
   here; one port carries both the protocol and logs — hence the `VTC2` magic word in

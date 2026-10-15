@@ -212,11 +212,11 @@ Signing costs a PIN and a tap (`tools/sign-vaultkey.sh`), which writes
 board that trusts it; leaking it removes Secure Boot. Public half and digest:
 `firmware/secure-boot/public.pem` and `digest.bin`, in the repository. `images/vaultkey.bin`
 stays unsigned and reproducible (a hook rebuilds and compares), with `vaultkey.signed.bin`
-beside it, verified by the hook with the public key. Since 2026-10-15 it is not: the core
-changed for the nRF52840's passkeys while this board was left alone, so the stale signed
-app left the repository and its `board.toml` entry was commented out. `vkey setup`
-refuses a Secure Boot chip until `tools/sign-vaultkey.sh` runs with this board plugged in
-and the entry is restored.
+beside it, verified by the hook with the public key. Since 2026-10-15 the key also lives
+on the nRF52840 (added from a `.vkb` by `vkey restore --only vkey-signing`), so
+`tools/sign-vaultkey.sh` signs this board's images with the nRF plugged in and this board
+left alone. For one day the signed app was out of the repository, after a core change
+this board was not there to sign.
 
 **A fork enables Secure Boot with its own key, never this one.** The private half exists
 only on the maintainer's device, so the committed `public.pem`, `digest.bin` and

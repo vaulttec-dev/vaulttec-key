@@ -576,6 +576,8 @@ moves but the keys:
    `vkey restore --only vkey-signing <C6 .vkb>` (2026-10-15) adds one item from a backup
    without replacing the vault. With the key on the nRF, `tools/sign-vaultkey.sh` signs the
    C6's images again and its signed app returns to the repository, the C6 left alone.
+   **Done 2026-10-15**: added from the September `.vkb`, the C6's images signed and
+   verified, and the nRF backed up with it.
 2. C6 flashing moves out of the CLI into a script in its folder. `espflash` leaves, and the
    audit exception goes. **Deferred** (2026-10-15): the script chooses between the plain
    and the Secure Boot bootloader, and the wrong choice on a plain chip burns its eFuses.
@@ -666,7 +668,8 @@ Milestones, one commit each, each leaving a key that works:
      of corrupting the statics (`docs2/makerdiary.md`, "Passkeys on the board"). The
      C6's image changed with it. Its signed copy can only be made on the C6, which is
      left alone, so it left the repository, and `vkey setup` refuses a Secure Boot chip
-     until it is signed again (maintainer's decision, 2026-10-15).
+     until it is signed again (maintainer's decision, 2026-10-15). Signed again the same
+     day with `vkey-signing` restored onto the nRF, and back in the repository.
    - **The stack is bounded, not measured.** Its high-water mark cannot be read without a
      second `unsafe` or a probe. The bound comes from the image's call graph, and a lockup
      in `vkey info`'s reset cause would show an overflow.
