@@ -168,6 +168,7 @@ with apt first if it is missing.
 ```bash
 vkey commits enable    # a tap: an SSH key on the key, git signs every commit with it
 vkey commits disable   # git stops signing; the key stays for the next enable
+vkey commits github    # the key on GitHub as a signing key: commits show as verified
 ```
 
 `enable` makes an OpenSSH `ecdsa-sk` key on the nRF52840 (a tap) and keeps its handle in
@@ -175,8 +176,10 @@ vkey commits disable   # git stops signing; the key stays for the next enable
 `~/.ssh`, where GNOME Keyring's agent would take it and refuse to sign). It sets git's `gpg.format`,
 `user.signingkey`, `gpg.ssh.allowedSignersFile` and `commit.gpgsign` globally, refuses
 to overwrite a signing setup that is not its own, and offers to add the public half to
-GitHub as a signing key (`gh`), so the commits show as verified there. From then on every
-commit waits for a tap. In the shell it is `/settings` → `commits`, on or off. Linux only
+GitHub as a signing key (`gh`), so the commits show as verified there. `github` does that
+step alone: it signs `gh` in, or grants it the `admin:ssh_signing_key` permission, in the
+browser when it has to, then adds the key. From then on every commit waits for a tap. In
+the shell it is `/settings` → `commits`, on or off, and `/settings` → `github`. Linux only
 for now; macOS and Windows are issues #18 and #19. What it costs is in
 [the threat model](docs/threat-model.md#git-commits-signed-with-a-tap).
 

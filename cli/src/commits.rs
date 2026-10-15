@@ -3,6 +3,7 @@
 //! ```text
 //! vkey commits enable     an SSH key on the key, git told to sign with it
 //! vkey commits disable    git stops signing; the key stays for the next enable
+//! vkey commits github     the key on GitHub, so the commits show as verified
 //! ```
 //!
 //! The key is a FIDO2 authenticator (the nRF52840's passkeys), and OpenSSH keeps a
@@ -138,42 +139,78 @@ fn make_key(key: &Path) -> Result<(), Error> {
 }
 
 /// GitHub shows a commit as verified only when it knows the key as a signing key.
-/// Uploading publishes it, so it is asked, and needs `gh` with the scope for it.
+/// Uploading publishes it, so `enable` asks first.
 fn offer_to_github(key: &Path) -> Result<(), Error> {
-    let public = pub_path(key);
-    let by_hand = format!(
-        "  gh ssh-key add {} --type signing --title vkey",
-        public.display()
-    );
-    let gh = Command::new("gh").args(["auth", "status"]).output();
-    if !matches!(gh, Ok(ref o) if o.status.success()) {
+    if !prompt::is_tty()
+        || !prompt::yes_no("add the key to GitHub, so the commits show as verified?")
+    {
         println!(
-            "for GitHub to show the commits as verified, add the key as a signing key:\n{by_hand}"
+            "to add it later:  vkey commits github  (or /settings → github)\n  public key: {}",
+            pub_path(key).display()
         );
         return Ok(());
     }
-    if !prompt::is_tty() || !prompt::yes_no("add the key to GitHub as a signing key?") {
-        println!("to add it later:\n{by_hand}");
-        return Ok(());
+    github().map(drop)
+}
+
+/// The scope `gh` needs to add a signing key; a plain `gh auth login` does not ask it.
+const SCOPE: &str = "admin:ssh_signing_key";
+
+/// `vkey commits github`: the signing key's public half on GitHub as a signing key,
+/// signing `gh` in - or giving it the scope - in the browser first when it has to.
+pub fn github() -> Result<u8, Error> {
+    let public = pub_path(&home()?.join(KEY));
+    if !public.exists() {
+        return Err(Error::Value(
+            "no signing key yet:  vkey commits enable".into(),
+        ));
     }
-    let out = Command::new("gh")
-        .args(["ssh-key", "add"])
-        .arg(&public)
-        .args(["--type", "signing", "--title", "vkey"])
-        .output()?;
-    if out.status.success() {
-        println!("added to GitHub: commits signed by this key show as verified");
-        return Ok(());
+    let signed_in = match Command::new("gh").args(["auth", "status"]).output() {
+        Ok(out) => out.status.success(),
+        Err(_) => {
+            return Err(Error::Value(
+                "gh, GitHub's CLI, is missing:  sudo apt install gh".into(),
+            ));
+        }
+    };
+    if !signed_in {
+        println!("gh signs in to GitHub in the browser first");
+        gh_interactive(&["auth", "login", "-h", "github.com", "-s", SCOPE])?;
     }
+    let mut out = add_key(&public)?;
+    if !out.status.success() && String::from_utf8_lossy(&out.stderr).contains(SCOPE) {
+        println!("gh needs one more permission, to add signing keys: grant it in the browser");
+        gh_interactive(&["auth", "refresh", "-h", "github.com", "-s", SCOPE])?;
+        out = add_key(&public)?;
+    }
+    // gh answers success for a key GitHub already has, so both read the same.
     let why = String::from_utf8_lossy(&out.stderr);
-    if why.contains("admin:ssh_signing_key") {
-        println!(
-            "gh needs the scope to add signing keys first:\n  gh auth refresh -h github.com -s admin:ssh_signing_key\nthen:\n{by_hand}"
-        );
-    } else if why.contains("already") {
-        println!("GitHub already has this key");
+    if out.status.success() || why.contains("already") {
+        println!("the key is on GitHub: commits signed with it show as verified");
     } else {
-        println!("GitHub refused the key: {}\n{by_hand}", why.trim());
+        return Err(Error::Value(format!(
+            "GitHub refused the key: {}",
+            why.trim()
+        )));
+    }
+    Ok(0)
+}
+
+fn add_key(public: &Path) -> Result<std::process::Output, Error> {
+    Ok(Command::new("gh")
+        .args(["ssh-key", "add"])
+        .arg(public)
+        .args(["--type", "signing", "--title", "vkey"])
+        .output()?)
+}
+
+/// `gh` with the terminal: it prints a one-time code and opens the browser.
+fn gh_interactive(args: &[&str]) -> Result<(), Error> {
+    if !Command::new("gh").args(args).status()?.success() {
+        return Err(Error::Value(format!(
+            "gh {} did not finish",
+            args.join(" ")
+        )));
     }
     Ok(())
 }

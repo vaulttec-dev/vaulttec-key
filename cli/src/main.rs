@@ -216,6 +216,9 @@ enum CommitsCmd {
     Enable,
     /// git stops signing; the key stays for the next enable
     Disable,
+    /// The signing key on GitHub, so the commits show as verified; signs gh in, or
+    /// gives it the permission, in the browser when it has to
+    Github,
 }
 
 #[derive(Subcommand, Clone, Copy)]
@@ -328,6 +331,9 @@ fn run_off_port(cli: &Cli) -> Option<Result<u8, Error>> {
         Cmd::Commits {
             cmd: CommitsCmd::Disable,
         } => commits::disable(),
+        Cmd::Commits {
+            cmd: CommitsCmd::Github,
+        } => commits::github(),
         Cmd::Setup { erase, board } => cmd_setup(cli.port.as_deref(), board.as_deref(), *erase),
         _ => return None,
     })

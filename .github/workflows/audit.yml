@@ -5,9 +5,9 @@ name: audit
 
 on:
   push:
-    paths: ['**/Cargo.lock', '**/Cargo.toml', '.github/workflows/audit.yml']
+    paths: ['**/Cargo.lock', '**/Cargo.toml', '**/.cargo/audit.toml', '.github/workflows/audit.yml']
   pull_request:
-    paths: ['**/Cargo.lock', '**/Cargo.toml']
+    paths: ['**/Cargo.lock', '**/Cargo.toml', '**/.cargo/audit.toml']
   schedule:
     - cron: '17 6 * * 1'
   workflow_dispatch:
@@ -24,5 +24,9 @@ jobs:
           persist-credentials: false
       # rust-toolchain.toml pins the version; rustup installs it on the first call.
       - run: cargo install cargo-audit --locked
-      - run: cargo audit --file firmware/Cargo.lock
-      - run: cargo audit --file cli/Cargo.lock
+      # From each folder, as tools/checks.sh does: cargo audit reads .cargo/audit.toml
+      # from the working directory, not from beside the lock file.
+      - run: cargo audit
+        working-directory: firmware
+      - run: cargo audit
+        working-directory: cli

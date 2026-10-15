@@ -71,6 +71,10 @@ const SETTINGS: &[(&str, &str)] = &[
         "sign every git commit with a tap - turn on or off",
     ),
     (
+        "github",
+        "sign in to GitHub and add the signing key, so commits show as verified",
+    ),
+    (
         "wipe",
         "factory reset - every secret and the PIN; the button is held, not tapped",
     ),
@@ -2432,6 +2436,13 @@ impl Shell {
             }
             "commits" => {
                 let r = self.cmd_commits();
+                return self.report(r);
+            }
+            "github" => {
+                let r = std::env::current_exe()
+                    .map_err(Error::from)
+                    .and_then(|exe| self.outside(Command::new(exe).args(["commits", "github"])))
+                    .map(drop);
                 return self.report(r);
             }
             _ => {}
