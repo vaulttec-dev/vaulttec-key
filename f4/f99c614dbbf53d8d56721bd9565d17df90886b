@@ -1,0 +1,66 @@
+CLAUDE.md
+  s_211416f9294557::t_b3751ede77fcca 155-156
+  s_211416f9294557::t_7ed7965b3b2e98 261-263
+  s_211416f9294557::t_9441f651a5c5a2 273
+firmware/boards/nrf52840-mdk-dongle/src/main.rs
+  s_211416f9294557::t_92b24bc93347e3 308-310
+  s_211416f9294557::t_36317ec3eb0934 73,76-92,94,99-100
+docs/roadmap.md
+  s_211416f9294557::t_352434f68ae699 738-759
+  s_211416f9294557::t_8264a300dfbf8f 597-598
+cli/src/backup.rs
+  s_211416f9294557::t_7d85cd85bf01a0 448-453
+  s_211416f9294557::t_d96509bfa2a51d 679-697
+  s_211416f9294557::t_c15d3eb0660e12 444,454,637-645,698
+  s_211416f9294557::t_8172d67f310c13 405
+  s_211416f9294557::t_975cae4109f971 385-387,393-400,699
+  s_211416f9294557::t_2c54cef4c9acf4 309,312
+  s_211416f9294557::t_c1de44ec3f67e8 401,406-407,411,431-432,440,455,607,629,646-647,652,664,671,700
+cli/src/shell.rs
+  s_211416f9294557::t_e51f06992a74c3 2366-2370
+  s_211416f9294557::t_19fa01b05538bb 2675
+firmware/boards/nrf52840-mdk-dongle/bootloader/board/board.h
+  s_211416f9294557::t_f8e9448ff92567 68
+firmware/boards/nrf52840-mdk-dongle/src/fido.rs
+  s_211416f9294557::t_3b05a3ad976cfb 7
+  s_211416f9294557::t_9e3b4ee83f27af 62,64
+firmware/boards/nrf52840-mdk-dongle/board.toml
+  s_211416f9294557::t_22905724825665 20-24
+cli/build.rs
+  s_211416f9294557::t_3e051e8ffe8db5 104
+  s_211416f9294557::t_ae63baaca40faa 107
+  s_211416f9294557::t_579d3443789199 9-17,19-22,24-25
+  s_211416f9294557::t_7e6a93e6dc2211 18
+  s_211416f9294557::t_475664a8217776 23
+docs/makerdiary.md
+  s_211416f9294557::t_2d58962c01f8c1 283
+  s_211416f9294557::t_e772d8cd5aba7a 92-95,97-102
+firmware/boards/nrf52840-mdk-dongle/memory.x
+  s_211416f9294557::t_27ed8326f6a451 8-10
+cli/src/fido.rs
+  s_211416f9294557::t_3bf5a0ae3c58ae 247-257
+  s_211416f9294557::t_25ed7b168d7026 46
+docs/threat-model.md
+  s_211416f9294557::t_d1c25f4670afe0 367
+  s_211416f9294557::t_a5ab2a548a0305 70-72
+cli/src/passkeys.rs
+  s_211416f9294557::t_7cd4a495b64404 33-34
+cli/src/boards.rs
+  s_211416f9294557::t_53e8ce6d572c24 12-14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f4f99c614dbbf53d8d56721bd9565d17df90886b",
+  "prompts": {},
+  "sessions": {
+    "s_211416f9294557": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "676596db-a983-4b94-8e19-40dad5711989",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "VaultTec-Dev <vaulttec-dev@proton.me>"
+    }
+  }
+}
