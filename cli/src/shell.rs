@@ -2363,9 +2363,11 @@ impl Shell {
         let mut key = fido::Key::open()?;
         let token = key.token(&pin)?;
         let all = key.passkeys(&token)?;
-        if all.is_empty() {
-            self.line(DIM, "  no passkeys on the key");
-        }
+        let (have, more) = key.room(&token)?;
+        self.line(
+            DIM,
+            &format!("  {have} passkeys on the key, room for about {more} more"),
+        );
         self.passkeys = Some((token, all));
         self.tab = Tab::Passkey;
         if self.at_vaults() {
@@ -2670,7 +2672,7 @@ impl Shell {
             .as_deref()
             .and_then(|v| v.rsplit(' ').next())
             .and_then(boards::by_name)
-            .is_some_and(|b| b.passkeys)
+            .is_some_and(|b| b.passkey_sectors > 0)
     }
 
     /// The tabs to show: `all`, `totp` when anything has a seed, then every category

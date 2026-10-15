@@ -594,8 +594,8 @@ nRF; `check --wipe-everything` green on the C6.
   runtime and no interrupt" below. It is also the fix for "USB unserviced during the tap
   wait".
 - ~~**Runtime: RTIC (Nitrokey's choice) or Embassy.**~~ Neither: see "No runtime" below.
-- **Trussed + `fido-authenticator`**, with littlefs at 0xD8000..0xEC000 and P-256 from
-  `p256-cortex-m4`. Done 2026-10-15 (milestone 3).
+- **Trussed + `fido-authenticator`**, with littlefs at 0xD8000..0xEC000 (0xC8000..0xF4000
+  since milestone 6) and P-256 from `p256-cortex-m4`. Done 2026-10-15 (milestone 3).
 - **Then Linux login moves to `pam_u2f`**, and the old `vkey auth` is removed, recorded in
   `docs/` with the commit it can be restored from.
 - **This is done on the daily key** (no spare). Every update starts with a `.vkb` backup.
@@ -735,6 +735,28 @@ Milestones, one commit each, each leaving a key that works:
    webauthn.io logged in, nothing enrolled anew. Two `Broken pipe`s during the session
    were the dongle's edge connector moving under a press (re-enumeration within a
    second, the vault still unlocked), not the firmware.
+6. **Room for more passkeys** (maintainer's decision, 2026-10-16). GitHub's registration
+   failed with "Passkey registration failed": fido-authenticator 0.3 stores a resident
+   key only if six blocks and the key's size stay free after it (`can_fit`), and of
+   littlefs's 20 blocks the superblock and the directories of a few sites had taken the
+   rest. The vault gives up a quarter: copies of 24 sectors (96 KiB) instead of 32, the
+   region 0x97000..0xC8000. littlefs moves to 0xC8000..0xF4000, 44 blocks, up to the
+   bootloader, whose window ends at 0x97000; a const assert holds the data region to
+   0xF4000. Expect roughly a dozen more sites rather than dozens: each site is a
+   directory, a metadata pair of two blocks. `vkey passkey list` reports
+   fido-authenticator's own estimate (getCredsMetadata).
+   - The old filesystem does not mount at the new place and is formatted: every
+     passkey, the FIDO PIN and the `vkey auth` and commit-signing credentials go.
+   - The vault moves too, so the order on the board is a `.vkb`, the flash, then the
+     restore. A `.vkb` made before carries passkeys laid out for 20 sectors; the CLI
+     now leaves sectors of another count in the file and says so, because the device
+     refuses them and with them the whole restore (`passkey_sectors` in board.toml).
+
+   Acceptance, on the board: the restore of the `.vkb` taken before, `selftest`, the
+   FIDO PIN set again, `vkey passkey list` with the room it reports, the GitHub
+   registration that failed, then `sudo vkey auth enable` and `vkey commits enable`
+   with a new signing key on GitHub; a backup and a restore of it at 44 sectors that
+   changes nothing.
 
 ---
 

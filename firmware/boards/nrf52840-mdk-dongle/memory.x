@@ -5,9 +5,9 @@
  *   0x01000..0x96000   this firmware
  *   0x96000..0x97000   its signature slot, which the bootloader fork checks on every
  *                      boot (bootloader/src/signature.h)
- *   0x97000..0xD8000   the vault (VAULT_BASE in main.rs)
- *   0xD8000..0xEC000   Trussed's filesystem, the passkeys (FS_LEN in main.rs)
- *   0xEC000..0xF4000   free
+ *   0x97000..0xC8000   the vault (VAULT_BASE in main.rs)
+ *   0xC8000..0xF4000   Trussed's filesystem, the passkeys (FS_LEN in main.rs), up to
+ *                      the bootloader: a const assert in main.rs holds it there
  *   0xF4000..0x100000  the UF2 bootloader, its CF2 page, MBR parameters and settings
  *
  * The bootloader writes only 0x01000..0x97000 (BOARD_APP_FLASH_END in bootloader/board),

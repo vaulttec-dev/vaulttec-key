@@ -65,7 +65,7 @@
 
 /*------------------------------------------------------------------*/
 /* Flash: the drive writes 0x1000..BOARD_APP_FLASH_END and nothing else. Above it lie
- * the vault (0x97000..0xD8000) and the filesystem a firmware keeps (0xD8000..0xEC000).
+ * the vault (0x97000..0xC8000) and the filesystem a firmware keeps (0xC8000..0xF4000).
  * The same boundary as FLASH in the firmware's memory.x and VAULT_BASE in its main.rs.
  *
  * The on-board test build (VKEY_AS_APP, bootloader/test/) runs from 0x1000 under the

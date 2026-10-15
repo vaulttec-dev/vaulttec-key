@@ -27,12 +27,11 @@ pub fn unlocked() -> Result<(Key, Token), Error> {
 pub fn list() -> Result<u8, Error> {
     let (mut key, token) = unlocked()?;
     let all = key.passkeys(&token)?;
-    if all.is_empty() {
-        println!("no passkeys on the key");
-    }
     for p in &all {
         println!("{}\t{}", p.site, p.user);
     }
+    let (have, more) = key.room(&token)?;
+    eprintln!("{have} on the key, room for about {more} more");
     Ok(0)
 }
 

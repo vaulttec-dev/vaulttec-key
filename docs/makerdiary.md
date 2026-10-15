@@ -89,12 +89,17 @@ filesystem and claims up to 100 passkeys; the FIDO-only Nitrokey Passkey firmwar
 | 0x00000..0x01000 | 4 KiB | MBR |
 | 0x01000..0x97000 | 600 KiB | firmware: vkey + Trussed + FIDO, ≈420 KiB by the fit check below |
 | 0x97000..0x98000 | 4 KiB | vkey attempt counter |
-| 0x98000..0xB8000 | 128 KiB | vkey image copy A (32 sectors) |
-| 0xB8000..0xD8000 | 128 KiB | vkey image copy B (32 sectors) |
-| 0xD8000..0xEC000 | 80 KiB | Trussed littlefs (passkeys), as on NK3 Mini |
-| 0xEC000..0x100000 | 80 KiB | Nordic secure bootloader, MBR params, bootloader settings |
+| 0x98000..0xB0000 | 96 KiB | vkey image copy A (24 sectors) |
+| 0xB0000..0xC8000 | 96 KiB | vkey image copy B (24 sectors) |
+| 0xC8000..0xF4000 | 176 KiB | Trussed littlefs (passkeys), 44 blocks |
+| 0xF4000..0x100000 | 48 KiB | the UF2 bootloader fork, its CF2 page, MBR params, bootloader settings |
 
-- **Vault: 128 KiB per copy** (32 sectors, C6 has 53). The maintainer's backup of
+The map as it stands since 2026-10-16 (roadmap phase 6, milestone 6). Until then the
+copies were 32 sectors (0x98000..0xD8000) and littlefs had 20 blocks at 0xD8000..0xEC000,
+as on NK3 Mini, with 0xEC000..0xF4000 left free; 20 blocks held two or three sites'
+passkeys before fido-authenticator's margin refused the next.
+
+- **Vault: 96 KiB per copy** (24 sectors since 2026-10-16, 32 before; C6 has 53). The maintainer's backup of
   2026-09-14 was 15 KB; 100–200 entries are expected. `STATE_SECTORS` stops being a core
   constant: the board gives the region size in `Layout`, because a second board with a
   different value now exists.
@@ -275,7 +280,7 @@ vkey alone, no Trussed yet: the same core as the C6, behind the four HAL traits.
 | Port | USB CDC-ACM through `usb-device` + `usbd-serial`, polled from the main loop; VID/PID `1209:0001`, pid.codes' test pair |
 | Clock | SysTick exception, 1 ms. Not a counter read on demand: the auto-lock compares times only when the next request comes, so a counter that wraps between requests would keep an idle key unlocked |
 | Ui | button P0.18, LEDs P0.23/P0.22/P0.24, all active low, from the wiki; amber = red + green |
-| Flash | `Nvmc` over 0x97000..0xEC000 behind a wrapper that fences after every erase and write, split into the vault's region and Trussed's (`Region`), each refusing access past its end |
+| Flash | `Nvmc` over 0x97000..0xF4000 (0xEC000 until 2026-10-16) behind a wrapper that fences after every erase and write, split into the vault's region and Trussed's (`Region`), each refusing access past its end |
 | Entropy | the RNG peripheral, bias correction on |
 | DeviceKey | none: `bound() == false`, PIN only; `vkey auth` is `pam_u2f` since 2026-10-15 and needs none |
 

@@ -67,7 +67,9 @@ and every guarantee below that rests on the eFuse key, JTAG being off or Secure 
   the passphrase's entropy, at less than half the C6's work per guess.
 - **Passkeys (FIDO2) live outside the vault** (since 2026-10-15, roadmap phase 6).
   Trussed and fido-authenticator keep them in a littlefs of their own at
-  0xD8000..0xEC000:
+  0xC8000..0xF4000 (0xD8000..0xEC000 until 2026-10-16; the new region covers the old
+  one, so blocks of the old filesystem, keys among them, stay readable to a flash dump
+  until littlefs reuses them, beside the tail of an old vault copy, which is sealed):
   - **They are not sealed under the PIN.** Trussed writes its keys as they are: the
     passkeys' private keys, and the key that wraps the credential IDs of the
     non-resident ones (`pam_u2f`'s among them). The glitch above reads them straight
@@ -362,7 +364,7 @@ half to GitHub is offered and asked, never done unasked.
 | Key and laptop stolen together | Signs as the user with a tap, until the key is removed from GitHub |
 | The handle file `~/.config/vkey/commit-signing-key` | Useless without the key. Not in the `.vkb`: losing it means a new key and a new upload to GitHub |
 | A copy of the board's flash, or a `.vkb` with its passphrase | The credential is wrapped by fido-authenticator's key, which both carry: with the handle file, another board then signs too |
-| authenticatorReset | Ends the key; a restore from a `.vkb` taken before brings it back |
+| authenticatorReset | Ends the key; a restore from a `.vkb` taken before brings it back, if that `.vkb` was made at the current passkey layout (44 sectors since 2026-10-16) |
 | Every commit waits for a tap | A rebase or an amend signs each commit again, one tap each; a commit with no tap in 30 s fails |
 
 ## What it does not protect against

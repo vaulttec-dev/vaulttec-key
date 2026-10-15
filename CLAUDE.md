@@ -152,7 +152,8 @@ The boards:
 
 - **`nrf52840-mdk-dongle`**, the primary. USB from the firmware (`1209:0001`), polled:
   CDC-ACM for vkey and CTAPHID for passkeys (Trussed + `fido-authenticator` in
-  `src/fido.rs`, their littlefs at 0xD8000..0xEC000). The stack sits at the bottom of RAM,
+  `src/fido.rs`, their littlefs at 0xC8000..0xF4000, 44 blocks up to the bootloader,
+  `passkey_sectors` in its `board.toml`). The stack sits at the bottom of RAM,
   200 KiB, so an overflow resets the chip ("lockup" in `vkey info`). Our UF2 bootloader fork (installed 2026-10-14, below) is how it is flashed: hold
   the button while plugging in, copy `images/vaultkey.signed.uf2` to `UF2BOOT`, replug. It
   runs only images signed with the key in `bootloader/signing-key.pem`; the app ends by
@@ -257,8 +258,9 @@ The boards:
   begins and ends), and the board lets the freeze go by itself after 10 s of a silent vkey
   line. A restore rewrites only sectors that differ, and when it changed any the board
   resets once the answer has left. A file with no sectors leaves the passkeys alone; a
-  board without them refuses sectors, and the CLI leaves them in the file and names them
-  (`passkeys` in `board.toml`).
+  board without them, or with another count of them, refuses sectors, and the CLI leaves
+  them in the file and names them (`passkey_sectors` in `board.toml`), so the items still
+  go back.
   The second way is `vkey export` (2026-09-19): an item written back into 1Password
   through `op item create`, under the same double tap, with the seed in the clear. That
   ends the claim that a seed never leaves — `docs/threat-model.md` says what it costs.
@@ -268,7 +270,7 @@ The boards:
   `main.rs`, checked by `Layout::fits` at compile time and again in `Store::new`; on
   C6-Zero 0x110000..0x17B000, raw flash past the `factory` partition, which the stock
   partition table does not describe). Three regions: one sector of attempt words and two
-  image copies of `state_sectors` each - 53 on C6-Zero, 32 on the nRF52840, whose 1 MiB
+  image copies of `state_sectors` each - 53 on C6-Zero, 24 on the nRF52840, whose 1 MiB
   also holds the firmware, Trussed and the bootloader - filling the region exactly.
 - The image is the PIN header and every item, **packed** - `name_len | category |
   sealed_len | name | pad | sealed | pad` - not fixed slots: a seed is twenty bytes and an

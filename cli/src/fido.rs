@@ -43,6 +43,7 @@ const PIN_TOKEN_WITH_PERMISSIONS: i64 = 0x09;
 const PERMISSION_CREDENTIAL_MANAGEMENT: i64 = 0x04;
 const PIN_PROTOCOL: i64 = 1;
 /// credentialManagement subcommands.
+const CREDS_METADATA: u8 = 0x01;
 const RPS_BEGIN: u8 = 0x02;
 const RPS_NEXT: u8 = 0x03;
 const CREDENTIALS_BEGIN: u8 = 0x04;
@@ -241,6 +242,17 @@ impl Key {
             .and_then(Cbor::as_bytes)
             .ok_or_else(|| Error::Value("the key's answer has no PIN token".into()))?;
         Ok(Token(Zeroizing::new(decrypt(&shared, sealed)?)))
+    }
+
+    /// How many passkeys the key keeps, and how many more fido-authenticator reckons
+    /// fit: its own estimate from the filesystem's free space, two blocks and 400 bytes
+    /// apiece after a margin of five, so it errs low.
+    pub fn room(&mut self, token: &Token) -> Result<(i64, i64), Error> {
+        let answer = self
+            .manage(token, CREDS_METADATA, None)?
+            .ok_or_else(|| Error::Value("the key did not say how full it is".into()))?;
+        let count = |k: i64| field(&answer, k).and_then(Cbor::as_int).unwrap_or(0);
+        Ok((count(1), count(2)))
     }
 
     /// Every passkey the key keeps, site by site.

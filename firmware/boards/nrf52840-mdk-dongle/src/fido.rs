@@ -4,7 +4,7 @@
 //! of those on the spot by running the Trussed service inline: no interrupt, no runtime,
 //! no second context.
 //!
-//! The keys live in Trussed's own littlefs at 0xD8000..0xEC000, apart from the vault and
+//! The keys live in Trussed's own littlefs at 0xC8000..0xF4000, apart from the vault and
 //! not sealed under the PIN; docs/threat-model.md says what that costs.
 
 use core::cell::{Cell, RefCell};
@@ -59,9 +59,9 @@ impl Storage for Internal {
     /// login - the signature counter, the RNG seed - do not wear one sector out.
     const BLOCK_CYCLES: isize = 500;
     /// Files up to this size sit in their directory's metadata instead of a 4 KiB block
-    /// each: what lets a few dozen passkeys share 80 KiB.
+    /// each, so a passkey costs part of its site's directory rather than a block.
     type CACHE_SIZE = U512;
-    /// 8 bytes, a bit per block for 64 blocks: more than there are.
+    /// 8 bytes, a bit per block for 64 blocks: more than the 44 there are.
     type LOOKAHEAD_SIZE = U1;
 
     fn read(&mut self, off: usize, buf: &mut [u8]) -> io::Result<usize> {

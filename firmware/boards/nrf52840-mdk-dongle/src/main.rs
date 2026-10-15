@@ -70,22 +70,34 @@ const RESET_CAUSES: [(u32, &str); 9] = [
 const USB_VID: u16 = 0x1209;
 const USB_PID: u16 = 0x0001;
 
-/// The vault's flash, 0x97000..0xD8000: past the end of FLASH in memory.x and the
+/// The vault's flash, 0x97000..0xC8000: past the end of FLASH in memory.x and the
 /// signature slot after it, before Trussed's filesystem. `LAYOUT` counts from its start.
 const VAULT_BASE: u32 = 0x9_7000;
-const VAULT_LEN: u32 = 0x4_1000;
+const VAULT_LEN: u32 = 0x3_1000;
 
-/// Trussed's filesystem, the passkeys, right after the vault: 0xD8000..0xEC000, twenty
-/// sectors, below the bootloader at 0xF4000 and out of its reach like the vault.
-const FS_LEN: u32 = 0x1_4000;
+/// Trussed's filesystem, the passkeys, right after the vault: 0xC8000..0xF4000, 44
+/// sectors, up to the bootloader at 0xF4000 and out of its reach like the vault. It was
+/// 20 sectors until 2026-10-16, and fido-authenticator refuses a resident key unless
+/// six blocks and the key's size are free after it, which the directories of a few
+/// sites had already used up. `passkey_sectors` in board.toml changes with it: the CLI
+/// reads it to leave out a backup's passkeys laid out for another size.
+const FS_LEN: u32 = 0x2_C000;
 
-/// One attempt sector and two copies of 128 KiB: the sizes decided in
+/// Where the bootloader begins: the data region ends at it, and an access past the end
+/// would erase the one thing on this board no USB tool can put back.
+const BOOTLOADER: u32 = 0xF_4000;
+const _: () = assert!(
+    VAULT_BASE + VAULT_LEN + FS_LEN <= BOOTLOADER,
+    "the vault and Trussed's filesystem end before the bootloader"
+);
+
+/// One attempt sector and two copies of 96 KiB: the sizes decided in
 /// docs/makerdiary.md, smaller than the C6's because this chip has 1 MiB in all.
 const LAYOUT: Layout = Layout {
     attempts: 0x0_0000,
     state_a: 0x0_1000,
-    state_b: 0x2_1000,
-    state_sectors: 32,
+    state_b: 0x1_9000,
+    state_sectors: 24,
 };
 const _: () = assert!(
     LAYOUT.fits() && LAYOUT.state_b + store::SECTOR * LAYOUT.state_sectors == VAULT_LEN,
@@ -293,8 +305,9 @@ fn data_region() -> &'static mut [u8] {
         "the data region is taken once"
     );
     let base = core::ptr::with_exposed_provenance_mut::<u8>(VAULT_BASE as usize);
-    // SAFETY: 0x97000..0xEC000 is flash outside the image - memory.x ends FLASH at
-    // 0x96000, and the bootloader starts at 0xF4000 - so nothing the compiler knows of
+    // SAFETY: 0x97000..0xF4000 is flash outside the image - memory.x ends FLASH at
+    // 0x96000, and the bootloader starts at 0xF4000, which a const assert above holds
+    // the region to - so nothing the compiler knows of
     // lives there; it is page-aligned, as the driver asserts; and the flag above makes
     // this the only reference to it. The flash controller rewrites these bytes on
     // erase, which is why every access goes through `Flash` and its fences.

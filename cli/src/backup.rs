@@ -306,10 +306,10 @@ fn seal_at(key: &[u8; vault::KEY_LEN], aad: &[u8], plain: &[u8]) -> Result<Vec<u
 /// that does not open here goes as it is, for the device to refuse.
 pub fn import(dev: &mut Device, path: &Path, pass: Passphrase<'_>) -> Result<Restored, Error> {
     let (head, items) = read(&source(path)?)?;
-    let passkeys = keeps_passkeys(dev)?;
+    let sectors = passkey_sectors(dev)?;
     let mut mem = vec![Block::new(); KDF_BLOCKS];
     let prepared = match vault::backup_key(pass, &head.salt, head.cost, &mut mem) {
-        Some(key) => prepare(&key, items, passkeys)?,
+        Some(key) => prepare(&key, items, sectors)?,
         None => Restored {
             count: items.len(),
             blobs: items,
@@ -382,22 +382,33 @@ pub fn pick(
     Ok(found.into_iter().map(|(name, _)| name).collect())
 }
 
-/// Whether the board on the other end keeps passkeys, as its folder says.
-fn keeps_passkeys(dev: &mut Device) -> Result<bool, Error> {
+/// How many sectors the board on the other end keeps its passkeys in, as its folder
+/// says; 0 for none.
+fn passkey_sectors(dev: &mut Device) -> Result<u32, Error> {
     let version = dev.info()?;
     Ok(version
         .rsplit(' ')
         .next()
         .and_then(crate::boards::by_name)
-        .is_some_and(|b| b.passkeys))
+        .map_or(0, |b| b.passkey_sectors))
+}
+
+/// The sector count a passkey sector was laid out for: `sector_size | count | index`
+/// lead its plaintext.
+fn region_count(plain: &[u8]) -> Option<u32> {
+    plain
+        .get(4..8)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 /// The items and the passkeys as the device takes them back - the passkeys only on a
-/// board that keeps them - and the names of what is left out.
+/// board that keeps them in as many sectors (`sectors`) as the file was made with, since
+/// the device refuses any other and with it the whole restore - and the names of what is
+/// left out.
 fn prepare(
     key: &[u8; vault::KEY_LEN],
     items: Vec<Vec<u8>>,
-    passkeys: bool,
+    sectors: u32,
 ) -> Result<Restored, Error> {
     let opened = (0u32..)
         .zip(&items)
@@ -417,7 +428,8 @@ fn prepare(
         skipped: Vec::new(),
         passkeys: false,
     };
-    let mut sectors_left = 0;
+    // The count the file's passkeys were laid out for, when they were left out.
+    let mut left_out: Option<u32> = None;
     for item in opened {
         let at = u32::try_from(out.blobs.len()).map_err(|_| Error::BadArg)?;
         match item {
@@ -425,17 +437,22 @@ fn prepare(
                 out.blobs.push(seal_item(key, at, &plain)?);
                 out.count += 1;
             }
-            Incoming::Region(plain) if passkeys => {
+            Incoming::Region(plain) if sectors > 0 && region_count(&plain) == Some(sectors) => {
                 out.blobs.push(seal_at(key, &aad(REGION_AAD, at), &plain)?);
                 out.passkeys = true;
             }
-            Incoming::Region(_) => sectors_left += 1,
+            Incoming::Region(plain) => left_out = Some(region_count(&plain).unwrap_or(0)),
             Incoming::Retired(name) => out.skipped.push(name),
         }
     }
-    if sectors_left > 0 {
-        out.skipped
-            .push("the passkeys: this board does not keep passkeys".to_string());
+    match left_out {
+        None => {}
+        Some(_) if sectors == 0 => out
+            .skipped
+            .push("the passkeys: this board does not keep passkeys".to_string()),
+        Some(theirs) => out.skipped.push(format!(
+            "the passkeys: laid out for {theirs} sectors, this board keeps {sectors}"
+        )),
     }
     Ok(out)
 }
@@ -587,7 +604,7 @@ mod tests {
             blobs: items,
             skipped,
             ..
-        } = prepare(&key, sealed, true).expect("prepares");
+        } = prepare(&key, sealed, 44).expect("prepares");
         assert_eq!(items.len(), 2, "the auth secret stays in the file");
         assert_eq!(skipped.len(), 1, "and is named: {skipped:?}");
         assert!(skipped[0].starts_with("hifes@pop-os:"), "{skipped:?}");
@@ -609,7 +626,7 @@ mod tests {
         let login = Category::Login.wire();
         let sealed =
             vec![seal_item(&key, 0, &backup_plain(login, "github", login)).expect("seals")];
-        let out = prepare(&[8u8; vault::KEY_LEN], sealed.clone(), true).expect("prepares");
+        let out = prepare(&[8u8; vault::KEY_LEN], sealed.clone(), 44).expect("prepares");
         assert_eq!(
             out.blobs, sealed,
             "a wrong passphrase is the device's to refuse"
@@ -617,11 +634,22 @@ mod tests {
         assert!(out.skipped.is_empty());
     }
 
+    /// A passkey sector's plaintext as the device writes it: `sector_size | count | index`
+    /// and then the sector, here cut short.
+    fn region_plain(count: u32) -> Vec<u8> {
+        let mut plain = Vec::new();
+        for word in [4096u32, count, 0] {
+            plain.extend_from_slice(&word.to_le_bytes());
+        }
+        plain.extend_from_slice(&[0x5A; 16]);
+        plain
+    }
+
     #[test]
     fn passkeys_move_up_behind_the_items_or_stay_in_the_file() {
         let key = [7u8; vault::KEY_LEN];
         let login = Category::Login.wire();
-        let sector = vec![0x5A; 16];
+        let sector = region_plain(44);
         let file = [
             seal_item(
                 &key,
@@ -633,19 +661,41 @@ mod tests {
             seal_at(&key, &aad(REGION_AAD, 2), &sector).expect("seals"),
         ];
 
-        let out = prepare(&key, file.to_vec(), true).expect("prepares");
+        let out = prepare(&key, file.to_vec(), 44).expect("prepares");
         assert_eq!((out.count, out.passkeys, out.blobs.len()), (1, true, 2));
         let Some(Incoming::Region(plain)) = open_item(&key, 1, &out.blobs[1]) else {
             panic!("the sector opens one place up, under the sectors' associated data");
         };
         assert_eq!(plain.as_slice(), sector.as_slice());
 
-        let out = prepare(&key, file.to_vec(), false).expect("prepares");
+        let out = prepare(&key, file.to_vec(), 0).expect("prepares");
         assert_eq!((out.count, out.passkeys, out.blobs.len()), (1, false, 1));
         assert!(
             out.skipped.iter().any(|s| s.starts_with("the passkeys")),
             "a board without passkeys takes the items and names what it leaves: {:?}",
             out.skipped
+        );
+    }
+
+    #[test]
+    fn passkeys_laid_out_for_another_size_stay_in_the_file() {
+        let key = [7u8; vault::KEY_LEN];
+        let login = Category::Login.wire();
+        let file = [
+            seal_item(&key, 0, &backup_plain(login, "github", login)).expect("seals"),
+            seal_at(&key, &aad(REGION_AAD, 1), &region_plain(20)).expect("seals"),
+            seal_at(&key, &aad(REGION_AAD, 2), &region_plain(20)).expect("seals"),
+        ];
+        let out = prepare(&key, file.to_vec(), 44).expect("prepares");
+        assert_eq!(
+            (out.count, out.passkeys, out.blobs.len()),
+            (1, false, 1),
+            "the items go back, the sectors the device would refuse do not"
+        );
+        assert_eq!(
+            out.skipped,
+            ["the passkeys: laid out for 20 sectors, this board keeps 44"],
+            "and the restore says why"
         );
     }
 }
