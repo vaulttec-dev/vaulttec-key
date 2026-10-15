@@ -1,0 +1,41 @@
+README.md
+  s_211416f9294557::t_cef62bc063421b 174-175
+cli/src/shell.rs
+  s_211416f9294557::t_6f858af9245d6d 1343
+  s_211416f9294557::t_e5e9b7a45323bb 674-675,681
+  s_211416f9294557::t_e24e221ad53d54 2740-2742
+  s_211416f9294557::t_001d6e01d71012 82-83
+  s_211416f9294557::t_974c20c2e804ba 73-80
+  s_211416f9294557::t_3154b8e0b42c83 731
+  s_211416f9294557::t_fac7a1c8f4c74b 1288-1295,1298-1299
+  s_211416f9294557::t_e3963290937ff7 2310-2315
+  s_211416f9294557::t_2e2ed4a90dadaa 444-445,451-452
+  s_211416f9294557::t_ca1500bfecd3b2 1274
+  s_211416f9294557::t_91b12b88350de8 49-50
+cli/src/prompt.rs
+  s_211416f9294557::t_31232b62e013c3 99-108,116,123
+  s_211416f9294557::t_4783c8be18a4c7 152-157
+docs/threat-model.md
+  s_211416f9294557::t_30035dda91d36d 332
+  s_211416f9294557::t_923a01c8b4a9c3 344
+CLAUDE.md
+  s_211416f9294557::t_04733271183dd4 232-233
+cli/src/commits.rs
+  s_211416f9294557::t_96effccc259ad7 22-25
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "75882d3fa00b867a8151718440eb7cfeed42a923",
+  "prompts": {},
+  "sessions": {
+    "s_211416f9294557": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "676596db-a983-4b94-8e19-40dad5711989",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "VaultTec-Dev <vaulttec-dev@proton.me>"
+    }
+  }
+}
