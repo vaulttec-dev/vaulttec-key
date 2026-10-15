@@ -96,6 +96,16 @@ pub fn generate_password() -> Result<Zeroizing<String>, Error> {
 /// comes back - so a caller never maps an index. None on Esc or Ctrl-C. Only the
 /// answer stays on screen. Works inside the shell's raw mode and on a plain terminal.
 pub fn choose<T: Copy>(label: &str, options: &[(T, &str, &str)]) -> Option<T> {
+    choose_ending_in_danger(label, options, 0)
+}
+
+/// `choose`, with the last `danger` options drawn in red: the ones that destroy what
+/// cannot be brought back without a backup, kept together at the end of the list.
+pub fn choose_ending_in_danger<T: Copy>(
+    label: &str,
+    options: &[(T, &str, &str)],
+    danger: usize,
+) -> Option<T> {
     if options.is_empty() {
         return None;
     }
@@ -103,14 +113,14 @@ pub fn choose<T: Copy>(label: &str, options: &[(T, &str, &str)]) -> Option<T> {
     if !was_raw && terminal::enable_raw_mode().is_err() {
         return None;
     }
-    let chosen = pick(label, options);
+    let chosen = pick(label, options, options.len().saturating_sub(danger));
     if !was_raw {
         let _ = terminal::disable_raw_mode();
     }
     chosen
 }
 
-fn pick<T: Copy>(label: &str, options: &[(T, &str, &str)]) -> Option<T> {
+fn pick<T: Copy>(label: &str, options: &[(T, &str, &str)], danger_from: usize) -> Option<T> {
     let count = options.len();
     let mut so = io::stdout();
     let _ = queue!(
@@ -139,7 +149,12 @@ fn pick<T: Copy>(label: &str, options: &[(T, &str, &str)]) -> Option<T> {
             let _ = queue!(
                 so,
                 Clear(ClearType::CurrentLine),
-                SetForegroundColor(if i == sel { ACCENT } else { DIM }),
+                SetForegroundColor(match (i >= danger_from, i == sel) {
+                    (true, true) => Color::Red,
+                    (true, false) => Color::DarkRed,
+                    (false, true) => ACCENT,
+                    (false, false) => DIM,
+                }),
                 SetAttribute(if i == sel {
                     Attribute::Bold
                 } else {

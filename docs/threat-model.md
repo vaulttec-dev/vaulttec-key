@@ -329,7 +329,7 @@ scheme of our own beside `pam_u2f`.
 
 Since 2026-10-15 `vkey commits enable` (or `/settings` → `commits`) makes an OpenSSH
 `ecdsa-sk` key on the nRF52840 after a tap and points git at it globally: `gpg.format
-ssh`, `user.signingkey ~/.ssh/id_vkey_sk`, `commit.gpgsign true`, and an
+ssh`, `user.signingkey ~/.config/vkey/commit-signing-key`, `commit.gpgsign true`, and an
 `allowed_signers` line for `user.email`. It writes only the user's own files, never a
 system one, and refuses when git already signs with something else. `disable` unsets
 `commit.gpgsign` and keeps the key. `tag.gpgsign` is left alone. Uploading the public
@@ -341,7 +341,7 @@ half to GitHub is offered and asked, never done unasked.
 | What a signature proves | That someone touched this key while a process with the handle asked. Not who, and not what the commit contains: the tap does not show the commit |
 | Malware running as the user | Can run `git commit` (or `ssh-keygen -Y sign` on anything) and wait for a reflex tap. The light is the same amber as a code or a login |
 | Key and laptop stolen together | Signs as the user with a tap, until the key is removed from GitHub |
-| The handle file `~/.ssh/id_vkey_sk` | Useless without the key. Not in the `.vkb`: losing it means a new key and a new upload to GitHub |
+| The handle file `~/.config/vkey/commit-signing-key` | Useless without the key. Not in the `.vkb`: losing it means a new key and a new upload to GitHub |
 | A copy of the board's flash, or a `.vkb` with its passphrase | The credential is wrapped by fido-authenticator's key, which both carry: with the handle file, another board then signs too |
 | authenticatorReset | Ends the key; a restore from a `.vkb` taken before brings it back |
 | Every commit waits for a tap | A rebase or an amend signs each commit again, one tap each; a commit with no tap in 30 s fails |

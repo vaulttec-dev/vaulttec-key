@@ -19,8 +19,10 @@ use std::process::Command;
 use crate::device::Error;
 use crate::{file, prompt};
 
-/// The key handle, beside the user's other SSH keys; `.pub` next to it.
-const KEY: &str = ".ssh/id_vkey_sk";
+/// The key handle, `.pub` next to it. Not in `~/.ssh`: GNOME Keyring loads every key
+/// there into its agent, which cannot sign with a FIDO2 key, and `ssh-keygen -Y sign`
+/// asks the agent first - every commit then fails with "agent refused operation".
+const KEY: &str = ".config/vkey/commit-signing-key";
 /// Who signed what, for `git log --show-signature` and `git verify-commit`.
 const SIGNERS: &str = ".config/git/allowed_signers";
 

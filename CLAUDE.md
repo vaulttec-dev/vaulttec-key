@@ -229,7 +229,8 @@ The boards:
   (category 201 sealed under the chip key, command `Respond` 0x19) is gone, restorable
   from 4bd49f3; both numbers stay unused, and a restore leaves such an item in the file.
 - `vkey commits enable` (2026-10-15, `cli/src/commits.rs`) signs every git commit with
-  a tap: an OpenSSH `ecdsa-sk` key on the nRF52840, its handle in `~/.ssh/id_vkey_sk`,
+  a tap: an OpenSSH `ecdsa-sk` key on the nRF52840, its handle in `~/.config/vkey/commit-signing-key` (not `~/.ssh`, whose keys GNOME
+  Keyring's agent takes and then refuses to sign with),
   git's global signing settings pointed at it; `disable` unsets `commit.gpgsign` only.
   The shell's `/settings` turns `auth` and `commits` on and off by running these same
   commands outside raw mode (`sudo` for `auth`). Linux only; macOS and Windows are

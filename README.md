@@ -171,7 +171,8 @@ vkey commits disable   # git stops signing; the key stays for the next enable
 ```
 
 `enable` makes an OpenSSH `ecdsa-sk` key on the nRF52840 (a tap) and keeps its handle in
-`~/.ssh/id_vkey_sk`, which signs nothing without the key. It sets git's `gpg.format`,
+`~/.config/vkey/commit-signing-key`, which signs nothing without the key (not in
+`~/.ssh`, where GNOME Keyring's agent would take it and refuse to sign). It sets git's `gpg.format`,
 `user.signingkey`, `gpg.ssh.allowedSignersFile` and `commit.gpgsign` globally, refuses
 to overwrite a signing setup that is not its own, and offers to add the public half to
 GitHub as a signing key (`gh`), so the commits show as verified there. From then on every

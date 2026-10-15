@@ -46,17 +46,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
 ];
 /// Behind `/settings`: what is done to the key rather than with an entry. They still
-/// resolve when typed, so `/pin` and `/backup` work as before.
+/// resolve when typed, so `/pin` and `/backup` work as before. The last `DANGER` are
+/// drawn red, together at the end: each can leave the key empty.
 const SETTINGS: &[(&str, &str)] = &[
     ("pin", "set or change the PIN"),
-    (
-        "wipe",
-        "factory reset - every secret and the PIN; the button is held, not tapped",
-    ),
-    (
-        "setup",
-        "flash a new board with the built-in firmware, set its PIN, self-test",
-    ),
     (
         "selftest",
         "one live code against an independent HMAC; one tap",
@@ -77,7 +70,17 @@ const SETTINGS: &[(&str, &str)] = &[
         "commits",
         "sign every git commit with a tap - turn on or off",
     ),
+    (
+        "wipe",
+        "factory reset - every secret and the PIN; the button is held, not tapped",
+    ),
+    (
+        "setup",
+        "flash a new board with the built-in firmware, set its PIN, self-test",
+    ),
 ];
+/// `wipe` and `setup`, the end of `SETTINGS`.
+const DANGER: usize = 2;
 /// Reached from the list with a, e, d and i, never offered as commands: an entry has
 /// one place, and the list is it. They still resolve when typed, so the transcript's
 /// `❯ /rm name` is a line that would work.
@@ -438,11 +441,15 @@ enum Tab {
 #[derive(Clone, PartialEq, Eq)]
 enum Shelf {
     Vaults,
+    /// Every entry, whichever vault it came from.
+    All,
     In(Option<String>),
 }
 
 /// The row that stands for entries no vault owns.
 const NO_VAULT: &str = "(no vault)";
+/// The first row: every entry of every vault.
+const ALL_VAULTS: &str = "all";
 
 impl Tab {
     fn label(self) -> &'static str {
@@ -664,11 +671,14 @@ impl Shell {
     /// selected item is always in it.
     fn menu_lines(&mut self, w: usize) -> Vec<(bool, String)> {
         let cap = Self::rows().saturating_sub(5 + usize::from(self.listing()));
+        // The vaults are places, not entries: a plain list of names and counts.
+        let at_vaults = self.at_vaults();
         let Some(m) = self.menu.as_mut() else {
             return Vec::new();
         };
         match m.kind {
             MenuKind::Commands => command_lines(m, w, cap),
+            MenuKind::List if at_vaults => command_lines(m, w, cap),
             MenuKind::Names | MenuKind::List => table_lines(m, w, cap),
         }
     }
@@ -718,6 +728,7 @@ impl Shell {
             let place = match &self.shelf {
                 _ if self.vaults.is_empty() => None,
                 Shelf::Vaults => Some((ACCENT, "vaults".to_string())),
+                Shelf::All => Some((DIM, format!("{ALL_VAULTS} ▸ "))),
                 Shelf::In(v) => Some((DIM, format!("{} ▸ ", v.as_deref().unwrap_or(NO_VAULT)))),
             };
             let at_vaults = self.at_vaults();
@@ -1260,6 +1271,7 @@ impl Shell {
         }
         self.shelf = match vault.trim() {
             "" => Shelf::Vaults,
+            ALL_VAULTS => Shelf::All,
             NO_VAULT => Shelf::In(None),
             v => Shelf::In(Some(v.to_string())),
         };
@@ -1273,13 +1285,18 @@ impl Shell {
         self.input.clear();
         self.cursor = 0;
         let items = if self.at_vaults() {
-            self.vault_groups()
-                .into_iter()
-                .map(|(vault, n)| Row {
+            let count = |n: usize| format!("{n} item{}", if n == 1 { "" } else { "s" });
+            let all = Row {
+                text: ALL_VAULTS.to_string(),
+                login: String::new(),
+                what: count(self.entries.len()),
+            };
+            std::iter::once(all)
+                .chain(self.vault_groups().into_iter().map(|(vault, n)| Row {
                     text: vault.unwrap_or_else(|| NO_VAULT.to_string()),
                     login: String::new(),
-                    what: format!("{n} item{}", if n == 1 { "" } else { "s" }),
-                })
+                    what: count(n),
+                }))
                 .collect()
         } else {
             self.tab_entries()
@@ -1323,7 +1340,7 @@ impl Shell {
 
     fn in_shelf(&self, e: &Stored) -> bool {
         match &self.shelf {
-            Shelf::Vaults => true,
+            Shelf::Vaults | Shelf::All => true,
             Shelf::In(v) => self.vault_of(e) == *v,
         }
     }
@@ -2290,7 +2307,12 @@ impl Shell {
             .enumerate()
             .map(|(i, ((name, _), desc))| (i, *name, desc.as_str()))
             .collect();
-        let Some(at) = self.choose("settings:", &options) else {
+        if self.frame_rows > 0 {
+            let mut so = io::stdout();
+            self.erase_frame(&mut so);
+            let _ = so.flush();
+        }
+        let Some(at) = prompt::choose_ending_in_danger("settings:", &options, DANGER) else {
             return Ok(());
         };
         self.dispatch(&format!("/{}", SETTINGS[at].0))
@@ -2715,7 +2737,9 @@ impl Shell {
                 self.menu = None;
                 Some(Key::Submit(format!("/list {vault}")))
             }
-            KeyCode::Esc if matches!(self.shelf, Shelf::In(_)) && !self.vaults.is_empty() => {
+            KeyCode::Esc
+                if matches!(self.shelf, Shelf::In(_) | Shelf::All) && !self.vaults.is_empty() =>
+            {
                 self.shelf = Shelf::Vaults;
                 self.open_list();
                 Some(Key::Redraw)
