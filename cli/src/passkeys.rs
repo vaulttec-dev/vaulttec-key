@@ -49,10 +49,7 @@ pub fn rm() -> Result<u8, Error> {
         println!("nothing erased");
         return Ok(0);
     };
-    if !prompt::yes_no(&format!(
-        "erase {} from the key? the site still lists it until you remove it there",
-        labels[at]
-    )) {
+    if !prompt::yes_no(&erase_question(&labels[at])) {
         println!("nothing erased");
         return Ok(0);
     }
@@ -94,6 +91,15 @@ pub fn new_pin() -> Result<Zeroizing<String>, Error> {
         ));
     }
     Ok(new)
+}
+
+/// The question before a passkey is erased: the order that leaves nothing dead behind -
+/// the site first, where the public half lives, then the key.
+pub fn erase_question(label: &str) -> String {
+    format!(
+        "erase the passkey {label} from the key? Remove it on the site first: once erased \
+         here it signs in nowhere, and the site keeps listing it until it is removed there too"
+    )
 }
 
 /// How a passkey is named to a person: the site and, when the site gave one, the account.

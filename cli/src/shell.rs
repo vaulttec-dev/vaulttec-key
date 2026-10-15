@@ -2386,9 +2386,7 @@ impl Shell {
             return Err(Error::NotFound);
         };
         let label = passkeys::label(&p);
-        if !self.ask_yes(&format!(
-            "erase the passkey {label} from the key? The site still lists it until you remove it there."
-        )) {
+        if !self.ask_yes(&passkeys::erase_question(&label)) {
             self.line(DIM, "  kept");
             self.open_list();
             return Ok(());
