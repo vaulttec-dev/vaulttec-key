@@ -665,7 +665,7 @@ fn run_restore(
         eprintln!("  left in the file: {line}");
     }
     if done.passkeys {
-        println!("the key restarts to load its passkeys...");
+        println!("if a passkey changed, the key restarts to load them...");
         // Past the reset, so a command run right after does not land in it.
         std::thread::sleep(std::time::Duration::from_secs(3));
     }

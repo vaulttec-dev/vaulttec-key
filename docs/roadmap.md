@@ -742,9 +742,10 @@ Milestones, one commit each, each leaving a key that works:
    rest. The vault gives up a quarter: copies of 24 sectors (96 KiB) instead of 32, the
    region 0x97000..0xC8000. littlefs moves to 0xC8000..0xF4000, 44 blocks, up to the
    bootloader, whose window ends at 0x97000; a const assert holds the data region to
-   0xF4000. Expect roughly a dozen more sites rather than dozens: each site is a
-   directory, a metadata pair of two blocks. `vkey passkey list` reports
-   fido-authenticator's own estimate (getCredsMetadata).
+   0xF4000. fido-authenticator 0.3 keeps each resident key as a small file in one
+   directory, inline in its metadata, so the real room is wider than its own estimate,
+   which `vkey passkey list` reports (getCredsMetadata: two blocks and 400 bytes per
+   key after a margin of five): 13 on the empty filesystem.
    - The old filesystem does not mount at the new place and is formatted: every
      passkey, the FIDO PIN and the `vkey auth` and commit-signing credentials go.
    - The vault moves too, so the order on the board is a `.vkb`, the flash, then the
@@ -757,6 +758,19 @@ Milestones, one commit each, each leaving a key that works:
    registration that failed, then `sudo vkey auth enable` and `vkey commits enable`
    with a new signing key on GitHub; a backup and a restore of it at 44 sectors that
    changes nothing.
+
+   **Accepted 2026-10-16**: the restore brought back 48 items and left the passkeys in
+   the file ("laid out for 20 sectors, this board keeps 44"); `selftest` green; the
+   FIDO PIN set through `vkey passkey pin`; the list reported 0 and room for 13. The
+   first GitHub registration after the flash made a passkey on the key that GitHub's
+   server then refused - most likely a challenge left from a page opened before the
+   flash, not proven - and a fresh page registered it. The key holds one `github.com`
+   passkey after both: the second, for the same site and user handle, replaced the
+   first, as CTAP2 has it. `sudo vkey auth enable` and
+   `vkey commits enable` with a new key on GitHub; a backup of 48 items and the
+   passkeys and its restore, after which the key did not restart (reset cause still
+   power-on, vault still unlocked). The restore's "the key restarts" now reads "if a
+   passkey changed": the CLI cannot tell whether one did.
 
 ---
 

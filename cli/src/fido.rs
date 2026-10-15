@@ -261,7 +261,12 @@ impl Key {
         let Some(first) = self.manage(token, RPS_BEGIN, None)? else {
             return Ok(out);
         };
+        // An empty key may say so with NO_CREDENTIALS or, as fido-authenticator 0.3
+        // does, with a total of none and no site.
         let total = field(&first, 5).and_then(Cbor::as_int).unwrap_or(1);
+        if total == 0 {
+            return Ok(out);
+        }
         let mut sites = vec![first];
         for _ in 1..total {
             if let Some(next) = self.manage(token, RPS_NEXT, None)? {

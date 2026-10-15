@@ -2281,7 +2281,10 @@ impl Shell {
         }
         if restored.passkeys {
             // The key resets to load them; the port goes and comes back.
-            self.line(Color::Blue, "  the key restarts to load its passkeys...");
+            self.line(
+                Color::Blue,
+                "  if a passkey changed, the key restarts to load them...",
+            );
             std::thread::sleep(Duration::from_secs(3));
             if !self.reconnect() {
                 self.line(
