@@ -303,7 +303,7 @@ mapping. The line is `sufficient`: what it adds is a way in, and the password st
 | Malware enrolling a key of its own | `/etc/u2f_mappings` is root's: adding a line needs root already |
 | Someone at the unlocked laptop while you are away, key in the port | Gets root with one tap where `sudo` used to want the password |
 | A copy of the board's flash (the revision-2 glitch) | The credential's key is wrapped by fido-authenticator's key, which sits unsealed in Trussed's filesystem: whoever reads the flash can answer this host's logins, given the host |
-| A `.vkb` backup | Holds the login once milestone 5 puts the passkeys into it: with the passphrase, another board then answers this host's `sudo` too |
+| A `.vkb` backup | Holds the login with the passkeys (since 2026-10-15): with the passphrase, another board then answers this host's `sudo` too |
 | The key in, nobody tapping | The password prompt comes when the key gives up, after 30 s; the old scheme gave up after 10 |
 | A FIDO PIN on the key | Its own, not vkey's; the credential is made without one, so a login does not ask for it |
 | The login screen after boot | COSMIC's greeter shares the `cosmic-greeter` service, so a tap may log in there too; the keyring, unlocked only by the password, then stays locked |
@@ -324,6 +324,27 @@ Rejected: presence of the USB device as proof (any ESP32 shows `303a:1001`); PIN
 (a second password to type buys nothing over the one it replaces); HMAC challenge-response
 with a rotating expectation (state to write at every login); a PAM `cdylib`; keeping a
 scheme of our own beside `pam_u2f`.
+
+### Git commits signed with a tap
+
+Since 2026-10-15 `vkey commits enable` (or `/settings` → `commits`) makes an OpenSSH
+`ecdsa-sk` key on the nRF52840 after a tap and points git at it globally: `gpg.format
+ssh`, `user.signingkey ~/.ssh/id_vkey_sk`, `commit.gpgsign true`, and an
+`allowed_signers` line for `user.email`. It writes only the user's own files, never a
+system one, and refuses when git already signs with something else. `disable` unsets
+`commit.gpgsign` and keeps the key. `tag.gpgsign` is left alone. Uploading the public
+half to GitHub is offered and asked, never done unasked.
+
+| | |
+|---|---|
+| Given | A signature needs this physical key, its handle file, and a tap after the request; no PIN and no user verification |
+| What a signature proves | That someone touched this key while a process with the handle asked. Not who, and not what the commit contains: the tap does not show the commit |
+| Malware running as the user | Can run `git commit` (or `ssh-keygen -Y sign` on anything) and wait for a reflex tap. The light is the same amber as a code or a login |
+| Key and laptop stolen together | Signs as the user with a tap, until the key is removed from GitHub |
+| The handle file `~/.ssh/id_vkey_sk` | Useless without the key. Not in the `.vkb`: losing it means a new key and a new upload to GitHub |
+| A copy of the board's flash, or a `.vkb` with its passphrase | The credential is wrapped by fido-authenticator's key, which both carry: with the handle file, another board then signs too |
+| authenticatorReset | Ends the key; a restore from a `.vkb` taken before brings it back |
+| Every commit waits for a tap | A rebase or an amend signs each commit again, one tap each; a commit with no tap in 30 s fails |
 
 ## What it does not protect against
 

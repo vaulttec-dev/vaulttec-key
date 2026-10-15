@@ -160,11 +160,30 @@ recognise it leaves alone and prints the line to add by hand. Keep a root shell 
 another terminal until `sudo` and the lock screen have both worked, with the tap and with
 the password.
 
+In the shell, `/settings` → `auth` does the same in one step, and installs `libpam-u2f`
+with apt first if it is missing.
+
+## Git commits signed with a tap
+
+```bash
+vkey commits enable    # a tap: an SSH key on the key, git signs every commit with it
+vkey commits disable   # git stops signing; the key stays for the next enable
+```
+
+`enable` makes an OpenSSH `ecdsa-sk` key on the nRF52840 (a tap) and keeps its handle in
+`~/.ssh/id_vkey_sk`, which signs nothing without the key. It sets git's `gpg.format`,
+`user.signingkey`, `gpg.ssh.allowedSignersFile` and `commit.gpgsign` globally, refuses
+to overwrite a signing setup that is not its own, and offers to add the public half to
+GitHub as a signing key (`gh`), so the commits show as verified there. From then on every
+commit waits for a tap. In the shell it is `/settings` → `commits`, on or off. Linux only
+for now; macOS and Windows are issues #18 and #19. What it costs is in
+[the threat model](docs/threat-model.md#git-commits-signed-with-a-tap).
+
 ## Gestures and capacity
 
 | Gesture | LED | What it releases |
 |---|---|---|
-| Tap | amber | one TOTP code, the secret fields of one item, one `.env`, one passkey, or one `vkey auth` login |
+| Tap | amber | one TOTP code, the secret fields of one item, one `.env`, one passkey, one `vkey auth` login, or one signed git commit |
 | Hold 5 s | red | factory wipe: every secret and the PIN; on the nRF52840, erasing every passkey (within 10 s of plugging in) |
 | Double tap | blue | the encrypted backup file, or an export / seed readout |
 

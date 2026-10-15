@@ -24,6 +24,7 @@ mod auth;
 mod backup;
 mod boards;
 mod check;
+mod commits;
 mod device;
 mod fido;
 mod file;
@@ -199,8 +200,22 @@ enum Cmd {
         #[command(subcommand)]
         cmd: AuthCmd,
     },
+    /// Every git commit signed with a tap: an SSH key on the key, git told to use it
+    Commits {
+        #[command(subcommand)]
+        cmd: CommitsCmd,
+    },
     /// Copy this binary to ~/.local/bin/vkey
     Install,
+}
+
+#[derive(Subcommand, Clone, Copy)]
+enum CommitsCmd {
+    /// An SSH key on the key (a tap, once), git set to sign every commit with it, and
+    /// its public half offered to GitHub as a signing key
+    Enable,
+    /// git stops signing; the key stays for the next enable
+    Disable,
 }
 
 #[derive(Subcommand, Clone, Copy)]
@@ -295,22 +310,33 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<u8, Error> {
-    match cli.cmd {
-        Some(Cmd::Install) => return install::install().map(|()| 0),
-        // pamu2fcfg talks to the key over FIDO itself; vkey's port is not needed.
-        Some(Cmd::Auth {
+/// The commands that do not talk to vkey's port: installing, flashing, and what reaches
+/// the key over FIDO. None for every other command.
+fn run_off_port(cli: &Cli) -> Option<Result<u8, Error>> {
+    Some(match cli.cmd.as_ref()? {
+        Cmd::Install => install::install().map(|()| 0),
+        // The enrolment and ssh-keygen talk to the key over FIDO themselves.
+        Cmd::Auth {
             cmd: AuthCmd::Enable,
-        }) => return auth::enable(),
-        Some(Cmd::Auth {
+        } => auth::enable(),
+        Cmd::Auth {
             cmd: AuthCmd::Disable,
-        }) => return auth::disable(),
-        Some(Cmd::Setup { erase, board }) => {
-            return cmd_setup(cli.port.as_deref(), board.as_deref(), erase);
-        }
-        _ => {}
-    }
+        } => auth::disable(),
+        Cmd::Commits {
+            cmd: CommitsCmd::Enable,
+        } => commits::enable(),
+        Cmd::Commits {
+            cmd: CommitsCmd::Disable,
+        } => commits::disable(),
+        Cmd::Setup { erase, board } => cmd_setup(cli.port.as_deref(), board.as_deref(), *erase),
+        _ => return None,
+    })
+}
 
+fn run(cli: Cli) -> Result<u8, Error> {
+    if let Some(done) = run_off_port(&cli) {
+        return done;
+    }
     let mut dev = Device::open(cli.port.as_deref())?;
     let version = dev.probe();
     let Some(cmd) = cli.cmd else {
@@ -324,7 +350,9 @@ fn run(cli: Cli) -> Result<u8, Error> {
     };
 
     match cmd {
-        Cmd::Install | Cmd::Setup { .. } | Cmd::Auth { .. } => unreachable!("handled above"),
+        Cmd::Install | Cmd::Setup { .. } | Cmd::Auth { .. } | Cmd::Commits { .. } => {
+            unreachable!("handled above")
+        }
 
         Cmd::Info => run_info(&mut dev, &version),
 

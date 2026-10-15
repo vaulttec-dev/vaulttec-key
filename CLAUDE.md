@@ -120,8 +120,8 @@ This is a security device. The rules below are not recommendations.
   yields free attempts. In flash this is one word write without an erase.
 - **A claim in the protocol must hold in the code.** Advertising a guarantee only half the
   paths enforce is worse than not advertising it.
-- **Irreversible actions get their own gesture.** Code, password, a `vkey auth` login and
-  a passkey on the nRF52840 — a tap (amber); wipe, and erasing every passkey
+- **Irreversible actions get their own gesture.** Code, password, a `vkey auth` login, a
+  signed git commit and a passkey on the nRF52840 — a tap (amber); wipe, and erasing every passkey
   (authenticatorReset) — hold 5 s (red); backup — double tap (blue). A tap never wipes and never exports; a hold
   never exports; a double tap never wipes. Password on a tap is the maintainer's decision of
   2026-09-08 — do not reintroduce a separate hold. A new command with consequences gets a
@@ -228,6 +228,12 @@ The boards:
   it. That is the one place the CLI writes system files. The Ed25519 scheme before it
   (category 201 sealed under the chip key, command `Respond` 0x19) is gone, restorable
   from 4bd49f3; both numbers stay unused, and a restore leaves such an item in the file.
+- `vkey commits enable` (2026-10-15, `cli/src/commits.rs`) signs every git commit with
+  a tap: an OpenSSH `ecdsa-sk` key on the nRF52840, its handle in `~/.ssh/id_vkey_sk`,
+  git's global signing settings pointed at it; `disable` unsets `commit.gpgsign` only.
+  The shell's `/settings` turns `auth` and `commits` on and off by running these same
+  commands outside raw mode (`sudo` for `auth`). Linux only; macOS and Windows are
+  issues #18 and #19.
 - A TOTP seed leaves the device two ways. The backup (`ExportBegin`/`ExportNext`, after a
   double tap; 2026-09-09) reseals every item under a key derived from a passphrase
   (Argon2id, `Passphrase` 12–128 bytes, without the chip key, so the file opens on another

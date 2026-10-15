@@ -128,7 +128,7 @@ pub fn disable() -> Result<u8, Error> {
 /// `pamu2fcfg` writes: `user:<id, base64>,<x and y, base64>,es256,+presence`. Nothing on
 /// this host changes until both taps have answered.
 fn enrol(user: &str) -> Result<String, Error> {
-    if !PAM_U2F.iter().any(|p| Path::new(p).exists()) {
+    if !module_present() {
         return Err(Error::Value(
             "pam_u2f is missing:  sudo apt install libpam-u2f".into(),
         ));
@@ -145,6 +145,19 @@ fn enrol(user: &str) -> Result<String, Error> {
         BASE64.encode(&credential.id),
         BASE64.encode(&credential.public)
     ))
+}
+
+/// Whether `pam_u2f` is installed where this host's PAM looks for it.
+pub fn module_present() -> bool {
+    PAM_U2F.iter().any(|p| Path::new(p).exists())
+}
+
+/// Whether a tap lets `user` in through `sudo`: the line in its PAM file and the user's
+/// credential in the mapping. Both are world-readable, so no root is needed to ask.
+pub fn enabled(user: &str) -> bool {
+    let mine = format!("{user}:");
+    fs::read_to_string("/etc/pam.d/sudo").is_ok_and(|t| t.lines().any(|l| l.trim() == PAM_LINE))
+        && fs::read_to_string(MAPPINGS).is_ok_and(|t| t.lines().any(|l| l.starts_with(&mine)))
 }
 
 fn hostname() -> Result<String, Error> {

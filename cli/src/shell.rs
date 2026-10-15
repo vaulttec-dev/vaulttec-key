@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crossterm::cursor::{MoveDown, MoveToColumn, MoveUp};
@@ -29,7 +30,7 @@ use crate::device::{
 };
 use crate::item::{Item, category_name};
 use crate::prompt::{ACCENT, DIM, PinPrompt, WARN_AT, copy_secret, copy_to_clipboard};
-use crate::{backup, import, op, prompt, setup, sources, totp};
+use crate::{auth, backup, commits, import, op, prompt, setup, sources, totp};
 
 /// Commands live behind `/`; a bare word is the name of an entry to use.
 const COMMANDS: &[(&str, &str)] = &[
@@ -41,7 +42,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("lock", "forget the key until the next PIN"),
     (
         "settings",
-        "PIN, backup and restore, self-test, setup, factory reset",
+        "PIN, backup and restore, self-test, setup, factory reset, tap for sudo and commits",
     ),
 ];
 /// Behind `/settings`: what is done to the key rather than with an entry. They still
@@ -67,6 +68,14 @@ const SETTINGS: &[(&str, &str)] = &[
     (
         "restore",
         "restore entries from 1Password API, a CSV export, or a backup file",
+    ),
+    (
+        "auth",
+        "sudo and the lock screen with a tap - turn on or off",
+    ),
+    (
+        "commits",
+        "sign every git commit with a tap - turn on or off",
     ),
 ];
 /// Reached from the list with a, e, d and i, never offered as commands: an entry has
@@ -2275,6 +2284,86 @@ impl Shell {
         self.dispatch(&format!("/{}", SETTINGS[at].0))
     }
 
+    /// `/auth`: `sudo vkey auth enable` or `disable`, whichever flips the current state,
+    /// with `libpam-u2f` installed first if it is missing and apt is there to do it.
+    fn cmd_auth(&mut self) -> Result<(), Error> {
+        let user = std::env::var("USER").unwrap_or_default();
+        let on = auth::enabled(&user);
+        let question = if on {
+            "sudo and the lock screen take a tap now - turn that off?"
+        } else {
+            "let sudo and the lock screen take a tap on this key?"
+        };
+        if !self.ask_yes(question) {
+            self.line(DIM, "  nothing changed");
+            return Ok(());
+        }
+        let exe = std::env::current_exe()?;
+        if !on && !auth::module_present() {
+            if !Path::new("/usr/bin/apt-get").exists() {
+                return Err(Error::Value(
+                    "pam_u2f is missing: install your distribution's pam-u2f package".into(),
+                ));
+            }
+            if !self.ask_yes("pam_u2f is missing - install libpam-u2f with apt first?") {
+                self.line(DIM, "  nothing changed");
+                return Ok(());
+            }
+            self.line(DIM, "  sudo asks for your password, or a tap");
+            if !self.outside(Command::new("sudo").args([
+                "apt-get",
+                "install",
+                "-y",
+                "libpam-u2f",
+            ]))? {
+                return Err(Error::Value("apt-get could not install libpam-u2f".into()));
+            }
+        }
+        // sudo's secure_path leaves out ~/.local/bin: the binary goes by its full path.
+        let verb = if on { "disable" } else { "enable" };
+        self.line(
+            DIM,
+            "  sudo asks for your password, or a tap if it already takes one",
+        );
+        self.outside(Command::new("sudo").arg(&exe).args(["auth", verb]))?;
+        Ok(())
+    }
+
+    /// `/commits`: `vkey commits enable` or `disable`, whichever flips the current state.
+    fn cmd_commits(&mut self) -> Result<(), Error> {
+        let on = commits::enabled();
+        let question = if on {
+            "every commit is signed with a tap now - turn that off?"
+        } else {
+            "sign every git commit with a tap on this key?"
+        };
+        if !self.ask_yes(question) {
+            self.line(DIM, "  nothing changed");
+            return Ok(());
+        }
+        let exe = std::env::current_exe()?;
+        let verb = if on { "disable" } else { "enable" };
+        self.outside(Command::new(&exe).args(["commits", verb]))?;
+        Ok(())
+    }
+
+    /// `cmd` run in the plain terminal: the frame goes, raw mode is left for as long as
+    /// it runs - sudo reads a password and ssh-keygen prints its own lines - and both
+    /// come back after. Its output stays in the transcript.
+    fn outside(&mut self, cmd: &mut Command) -> Result<bool, Error> {
+        let mut so = io::stdout();
+        if self.frame_rows > 0 {
+            self.erase_frame(&mut so);
+        }
+        let _ = so.flush();
+        let _ = terminal::disable_raw_mode();
+        let status = cmd.status();
+        let _ = terminal::enable_raw_mode();
+        self.draw_frame(&mut so);
+        let _ = so.flush();
+        Ok(status?.success())
+    }
+
     /// A `/command [arg]` runs the command; anything else is the name of an entry to
     /// use, and an empty line offers the list of them. Leaving is Ctrl-D, not a command.
     fn dispatch(&mut self, line: &str) -> Result<(), Error> {
@@ -2299,6 +2388,18 @@ impl Shell {
                 name => ("use", name),
             },
         };
+        // These reach the key over FIDO, not over this port, and touch no vault.
+        match cmd {
+            "auth" => {
+                let r = self.cmd_auth();
+                return self.report(r);
+            }
+            "commits" => {
+                let r = self.cmd_commits();
+                return self.report(r);
+            }
+            _ => {}
+        }
         if !self.connected() && !self.reconnect() {
             self.line(Color::Red, "  board disconnected - plug it back in");
             return Ok(());
