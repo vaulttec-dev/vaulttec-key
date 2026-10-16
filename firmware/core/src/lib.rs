@@ -25,6 +25,6 @@ pub mod wire;
 #[macro_export]
 macro_rules! version {
     ($board:literal) => {
-        concat!("vaultkey 0.9 ", $board)
+        concat!("vaultkey 1.0 ", $board)
     };
 }
