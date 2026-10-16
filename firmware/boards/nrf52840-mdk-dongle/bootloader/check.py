@@ -5,8 +5,7 @@ SWD probe. Takes bootloader.bin, the region from 0xF4000 (code, then the CF2 pag
 - No UICR address the code could write through: the bootloader must never write UICR.
   A write there (PSELRESET, NFCPINS, APPROTECT) is permanent without a probe. Searched
   three ways: as a word anywhere in the code, as an immediate in any instruction but a
-  comparison, and as a movw/movt pair or a movt of 0x1000 whose low half it cannot
-  see. Like the radio search in build-vaultkey.sh, it catches direct addressing, not an
+  comparison, and as any movt of 0x1000, whatever low half it meets. Like the radio search in build-vaultkey.sh, it catches direct addressing, not an
   address computed from another base plus an offset.
 - The CF2 block is the factory one, word for word. Its board ID is what the factory
   bootloader checks before it accepts this one as a self-update, and what a later
@@ -43,23 +42,21 @@ CF2 = [
 # objdump --no-show-raw-insn: "   f5f2a:\tcmp.w\tr3, #268439552\t@ 0x10001000"
 INSN = re.compile(r"^\s*([0-9a-f]+):\s+(\S+)\s*(.*)$")
 NUMBER = re.compile(r"(?<![\w])(?:#|@ )?(0x[0-9a-f]+|\d+)\b")
-MOVW = re.compile(r"^movw\S*\s+(r\d+|ip|lr|sl|fp), #(\d+)")
 MOVT = re.compile(r"^movt\S*\s+(r\d+|ip|lr|sl|fp), #(\d+)")
 
 
 def words_in_code(code: bytes, base: int) -> list[str]:
-    # Halfword steps: Thumb literal pools are word-aligned, but a constant packed in
-    # data need not be.
+    # Every byte offset: Thumb literal pools are word-aligned, but a constant packed in
+    # data need not be aligned at all.
     return [
         hex(base + i)
-        for i in range(0, len(code) - 3, 2)
+        for i in range(len(code) - 3)
         if struct.unpack_from("<I", code, i)[0] in UICR
     ]
 
 
 def immediates_and_pairs(dis: str) -> list[str]:
     hits = []
-    last_movw: dict[str, int] = {}
     for line in dis.splitlines():
         m = INSN.match(line)
         if not m:
@@ -71,19 +68,10 @@ def immediates_and_pairs(dis: str) -> list[str]:
                 if int(n, 0) in UICR:
                     hits.append(f"{addr}: {text}")
                     break
-        if w := MOVW.match(text):
-            last_movw[w.group(1)] = int(w.group(2))
-        elif t := MOVT.match(text):
-            # A high half of 0x1000 with a low half that did not come from a movw into
-            # the same register (a mov.w, a mov from another register) could still be
-            # UICR, so it counts as one.
-            low = last_movw.get(t.group(1))
-            high = int(t.group(2)) << 16
-            if (low is None and high == UICR.start & 0xFFFF0000) or (
-                low is not None and (high | low) in UICR
-            ):
-                hits.append(f"{addr}: {text} (with movw #{low:#x})" if low is not None
-                            else f"{addr}: {text} (low half unknown)")
+        if (t := MOVT.match(text)) and int(t.group(2)) << 16 == UICR.start & 0xFFFF0000:
+            # Any high half of 0x1000 counts: which low half meets it at run time is
+            # more than a line-by-line reading can tell.
+            hits.append(f"{addr}: {text}")
     return hits
 
 

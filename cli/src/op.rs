@@ -455,17 +455,31 @@ pub fn load_vault_map() -> BTreeMap<String, String> {
     map.into_iter().filter(|(_, v)| !v.is_empty()).collect()
 }
 
-/// Folds what a run learned into the vault map on disk, readable only by its owner.
+/// Folds what a run learned into the vault map on disk.
 fn save_vault_map(learned: BTreeMap<String, String>) {
+    let mut map = load_vault_map();
+    map.extend(learned);
+    write_vault_map(&map);
+}
+
+/// An entry renamed by hand stays in its vault under the new name.
+pub fn vault_renamed(from: &str, to: &str) {
+    let mut map = load_vault_map();
+    if let Some(vault) = map.remove(from) {
+        map.insert(to.to_string(), vault);
+        write_vault_map(&map);
+    }
+}
+
+/// The vault map written whole, readable only by its owner.
+fn write_vault_map(map: &BTreeMap<String, String>) {
     let Some(path) = config_path("op_vaults.json") else {
         return;
     };
-    let mut map = load_vault_map();
-    map.extend(learned);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(json) = serde_json::to_vec_pretty(&map) {
+    if let Ok(json) = serde_json::to_vec_pretty(map) {
         let _ = file::replace(&path, &json, 0o600);
     }
 }
@@ -1038,9 +1052,9 @@ pub fn sync(
         mirror.items(
             &items,
             item_blocked.or_else(|| {
-                items
-                    .is_empty()
-                    .then(|| "1Password listed no items at all".to_string())
+                // The listing as it came, documents included: a vault of documents
+                // only is a listing, and what an earlier run took from it goes now.
+                (all == 0).then(|| "1Password listed no items at all".to_string())
             }),
         )?,
         mirror.environments(

@@ -33,7 +33,7 @@ pub const OVERHEAD: usize = NONCE_LEN + TAG_LEN;
 /// six digits fall in a fortnight, seven in five months, eight in four years. No key
 /// derivation rescues a shorter PIN - a second per unlock is already as slow as the
 /// device may be, so length is the only lever left. Without a chip key a copy of the
-/// flash is guessed offline instead, and no length rescues that (docs/threat-model.md).
+/// flash is guessed offline instead, and eight digits do not hold there (docs/threat-model.md).
 pub const PIN_LEN: usize = 8;
 /// A backup file has no attempt counter: whoever holds it guesses forever, at the speed
 /// of their own hardware, and 128 KiB of Argon2id is not much of a brake. Twelve is a

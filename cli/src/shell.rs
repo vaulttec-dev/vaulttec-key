@@ -904,6 +904,10 @@ impl Shell {
             return;
         };
         let flipped = st.unlocked != self.unlocked;
+        // The passkeys' token goes with the lock, the idle one too.
+        if flipped && !st.unlocked {
+            self.passkeys = None;
+        }
         self.unlocked = st.unlocked;
         self.has_pin = st.has_pin;
         self.retries = st.retries_left;
@@ -1716,6 +1720,7 @@ impl Shell {
             Some(new) if new != name => {
                 self.dev()?.rename(&name, &new)?;
                 sources::renamed(&name, &new);
+                op::vault_renamed(&name, &new);
                 new
             }
             _ => name,
@@ -2289,6 +2294,8 @@ impl Shell {
                 "  if a passkey changed, the key restarts to load them...",
             );
             std::thread::sleep(Duration::from_secs(3));
+            // A reset FIDO side has forgotten the token the passkey tab held.
+            self.passkeys = None;
             if !self.reconnect() {
                 self.line(
                     Color::Yellow,

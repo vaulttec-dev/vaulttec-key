@@ -12,7 +12,8 @@ use crate::device::Error;
 /// the source map or an `op` cache, never a file that no longer parses.
 pub fn replace(path: &Path, contents: &[u8], mode: u32) -> Result<(), Error> {
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".vkey-new");
+    // Per process: two vkeys replacing the same file must not write into one another's.
+    tmp.push(format!(".vkey-new.{}", std::process::id()));
     let mut f = OpenOptions::new()
         .write(true)
         .create(true)

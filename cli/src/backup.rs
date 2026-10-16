@@ -376,6 +376,19 @@ pub fn pick(
                 .join(", ")
         )));
     }
+    // Every name checked before the first is written, so a refusal adds nothing.
+    let on_key = dev.list()?;
+    let taken: Vec<&str> = found
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .filter(|n| on_key.iter().any(|e| e.name == *n))
+        .collect();
+    if !taken.is_empty() {
+        return Err(Error::Value(format!(
+            "already on the key: {}; nothing was added",
+            taken.join(", ")
+        )));
+    }
     for (name, item) in &found {
         dev.put(name, item, false)?;
     }
@@ -384,7 +397,7 @@ pub fn pick(
 
 /// How many sectors the board on the other end keeps its passkeys in, as its folder
 /// says; 0 for none.
-fn passkey_sectors(dev: &mut Device) -> Result<u32, Error> {
+pub fn passkey_sectors(dev: &mut Device) -> Result<u32, Error> {
     let version = dev.info()?;
     Ok(version
         .rsplit(' ')

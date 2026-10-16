@@ -39,10 +39,14 @@ OBJCOPY="$LLVM/llvm-objcopy"
 # every slot this firmware does use (USB, flash controller, RNG). It does not rule out
 # an address computed from a neighbouring peripheral's base plus an offset.
 radio_refs() { # elf image base
-    local slot words pairs
+    local slot words pairs dis
     slot=$(printf '%x' $(($3 >> 12)))
     words=$(od -An -v -tx4 -w4 "$2" | grep -c "^ *0*${slot}[0-9a-f]\{3\}$" || true)
-    pairs=$("$LLVM/llvm-objdump" -d --no-show-raw-insn "$1" | grep -E $'\tmov[wt]\t' | {
+    # On its own: the `|| true` below is for grep finding no mov, not for a failed
+    # disassembly, which would read as no reference at all.
+    dis="$("$LLVM/llvm-objdump" -d --no-show-raw-insn "$1")" \
+        || { echo "llvm-objdump could not disassemble $1" >&2; exit 1; }
+    pairs=$(grep -E $'\tmov[wt]\t' <<<"$dis" | {
         declare -A low
         n=0
         while read -r _ op reg val; do

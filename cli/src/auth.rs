@@ -295,7 +295,8 @@ fn root_only(verb: &str) -> Result<(), Error> {
     let exe = std::env::current_exe()?;
     for path in exe.ancestors() {
         let meta = fs::metadata(path)?;
-        let writable = meta.mode() & 0o002 != 0 || (meta.mode() & 0o020 != 0 && meta.gid() != 0);
+        // Group root is not root: a member of it who can write here is "others".
+        let writable = meta.mode() & 0o022 != 0;
         if meta.uid() != 0 || writable {
             return Err(Error::Value(format!(
                 "this runs as root from {}, and {} can be changed by others than root, so \

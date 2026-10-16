@@ -7,7 +7,7 @@ real secrets yet.
 
 | Part | What it is |
 |---|---|
-| `firmware/core` | Firmware as a chip-free library: `proto` (frames), `device` (PIN, entries), `vault` (KDF/AEAD), `store` (flash, A/B image), `oath` (entry kinds, HOTP/TOTP), `ui` (button rules), `hal` (four traits — port, clock, button+LED, chip key; flash and RNG arrive via `embedded-storage` and `rand_core`). Bare-metal Rust, `no_std`, no RTOS; crypto from RustCrypto. |
+| `firmware/core` | Firmware as a chip-free library: `proto` (frames), `device` (PIN, entries), `vault` (KDF/AEAD), `store` (flash, A/B image), `oath` (entry kinds, HOTP/TOTP), `ui` (button rules), `hal` (five traits — port, clock, button+LED, chip key, attachment: flash a backup carries besides the vault; flash and RNG arrive via `embedded-storage` and `rand_core`). Bare-metal Rust, `no_std`, no RTOS; crypto from RustCrypto. |
 | `firmware/boards/<board>/` | One board = one folder: `Cargo.toml` with the chip crates, `.cargo/config.toml` with the target, `src/main.rs` with pins and trait impls, `board.toml`, `bootloader/`, `images/`. The chip name appears **nowhere** outside such a folder. |
 | `cli/` | The `vkey` command: one static binary. Subcommands for scripts (`clap`), an interactive shell (`crossterm`, draws itself), flashing through `espflash` as a library with images embedded via `include_bytes!`. All user work goes through this CLI. |
 
@@ -122,7 +122,7 @@ This is a security device. The rules below are not recommendations.
   paths enforce is worse than not advertising it.
 - **Irreversible actions get their own gesture.** Code, password, a `vkey auth` login, a
   signed git commit and a passkey on the nRF52840 — a tap (amber); wipe, a restore from a
-  `.vkb` (it replaces everything, passkeys included; 2026-10-16) and erasing every passkey
+  `.vkb` (it replaces every item, and the passkeys when the file carries them; 2026-10-16) and erasing every passkey
   (authenticatorReset) — hold 5 s (red); backup — double tap (blue). A tap never wipes and never exports; a hold
   never exports; a double tap never wipes. Password on a tap is the maintainer's decision of
   2026-09-08 — do not reintroduce a separate hold. A new command with consequences gets a
@@ -161,7 +161,7 @@ The boards:
   its signature slot at 0x96000. No chip key, so it holds no real secrets yet. `vkey
   info` prints the chip's build code, UICR `APPROTECT` and last reset cause. Notes,
   measurements and factory state: `docs/makerdiary.md`; the plan: `docs/roadmap.md`.
-- **`esp32c6-zero`**, the test board (2026-10-14): nothing is built for it, and it takes
+- **`esp32c6-zero`**, the test board (2026-10-14): no feature is built for it, and it takes
   `check --wipe-everything` for core changes. Its images are signed by
   `tools/sign-vaultkey.sh` with `vkey-signing`, which also lives on the nRF since
   2026-10-15, so a core change is signed without touching the C6. Secure Boot v2 is burned, so before its

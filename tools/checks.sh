@@ -146,6 +146,13 @@ check_signed_images() {
 check_signed_uf2() {
     step "signed UF2s match their unsigned twins and bootloader/signing-key.pem"
     local pem dir name signed plain kind tmp fp ok
+    # Driven by the UF2s too: a key taken away must not silently end their check.
+    for signed in "$ROOT"/firmware/boards/*/images/*.signed.uf2; do
+        [[ -f "$signed" ]] || continue
+        dir="$(dirname "$(dirname "$signed")")"
+        [[ -f "$dir/bootloader/signing-key.pem" ]] \
+            || fail "$(basename "$dir"): $(basename "$signed") has no bootloader/signing-key.pem to verify it under"
+    done
     for pem in "$ROOT"/firmware/boards/*/bootloader/signing-key.pem; do
         [[ -f "$pem" ]] || continue
         dir="$(dirname "$(dirname "$pem")")"

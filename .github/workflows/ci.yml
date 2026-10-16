@@ -134,6 +134,8 @@ jobs:
             cmp -n "$(stat -c %s "$plain")" "$plain" "$s"
             espsecure verify-signature --version 2 --keyfile "$pub" "$s"
           done
+      - name: signed UF2s verify under each board's bootloader key
+        run: bash -c '. tools/checks.sh && check_signed_uf2'
 
   wording:
     name: no forbidden marketing claim

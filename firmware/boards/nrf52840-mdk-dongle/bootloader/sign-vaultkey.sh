@@ -28,7 +28,8 @@ for tool in openssl vkey base64 python3; do
     command -v "$tool" >/dev/null || { echo "$tool is missing" >&2; exit 1; }
 done
 [[ -f "$PUBLIC" ]] || { echo "no $PUBLIC: run signing-key.sh first" >&2; exit 1; }
-[[ -d /dev/shm ]] || { echo "no /dev/shm: the key would have to touch the disk" >&2; exit 1; }
+[[ -d /dev/shm && "$(stat -f -c %T /dev/shm 2>/dev/null)" == tmpfs ]] \
+    || { echo "/dev/shm is not tmpfs: the key would have to touch the disk" >&2; exit 1; }
 [[ -f "$images/vaultkey.bin" ]] || { echo "no images/vaultkey.bin - build first" >&2; exit 1; }
 grep -qE "^device:.* $board\$" <<<"$(vk info)" || { echo "$PORT is not $board" >&2; exit 1; }
 

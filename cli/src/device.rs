@@ -278,8 +278,7 @@ pub struct Stored {
 /// the key. Two matches are an error, not a pick: the other one may be a key holding
 /// secrets, and `check` wipes whatever it reaches.
 pub fn find_port() -> Result<String, Error> {
-    let mut found: Vec<String> = serialport::available_ports()
-        .unwrap_or_default()
+    let mut found: Vec<String> = serialport::available_ports()?
         .into_iter()
         .filter(|p| {
             matches!(&p.port_type, SerialPortType::UsbPort(u)

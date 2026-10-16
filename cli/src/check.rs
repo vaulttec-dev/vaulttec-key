@@ -386,11 +386,13 @@ fn backup(
         "  >>> hold {} down for five seconds again when the light turns red",
         rep.button
     );
+    // A board that keeps passkeys must get them back, or the round trip lost them.
+    let keeps_passkeys = backup::passkey_sectors(d)? > 0;
     let done = backup::import(d, &dir, passphrase(PASS)?)?;
     rep.check(
         "restore",
-        done.count == 3 && done.skipped.is_empty(),
-        &format!("{} items", done.count),
+        done.count == 3 && done.skipped.is_empty() && done.passkeys == keeps_passkeys,
+        &format!("{} items, passkeys back: {}", done.count, done.passkeys),
     );
     let _ = std::fs::remove_file(&dir);
     rep.tap();

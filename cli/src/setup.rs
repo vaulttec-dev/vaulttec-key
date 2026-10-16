@@ -201,10 +201,14 @@ pub fn wait_for_firmware(port_hint: &str, timeout: Duration) -> Result<Device, E
     let mut last = Error::Value("board did not come back after flashing".into());
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_secs(1));
-        // Still rebooting is no board yet; a second key is a reason to stop.
+        // Still rebooting is no board yet. A second key is a reason to stop, unless the
+        // port just flashed is among them: that one was named, or found alone.
         let port = match find_port() {
             Ok(p) => p,
             Err(Error::NoBoard) => port_hint.to_string(),
+            Err(Error::ManyBoards(ports)) if ports.iter().any(|p| p == port_hint) => {
+                port_hint.to_string()
+            }
             Err(e) => return Err(e),
         };
         let mut dev = match Device::open(Some(&port)) {

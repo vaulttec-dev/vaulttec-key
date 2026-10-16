@@ -35,6 +35,8 @@ pub fn enable() -> Result<u8, Error> {
     let key_text = key.to_string_lossy().into_owned();
     refuse_foreign("gpg.format", "ssh")?;
     refuse_foreign("user.signingkey", &key_text)?;
+    let signers = home.join(SIGNERS);
+    refuse_foreign("gpg.ssh.allowedSignersFile", &signers.to_string_lossy())?;
     let Some(email) = git_get("user.email")? else {
         return Err(Error::Value(
             "git has no user.email to sign as:  git config --global user.email you@example.com"
@@ -46,7 +48,6 @@ pub fn enable() -> Result<u8, Error> {
         make_key(&key)?;
     }
     let public = fs::read_to_string(pub_path(&key))?;
-    let signers = home.join(SIGNERS);
     if let Some(dir) = signers.parent() {
         fs::create_dir_all(dir)?;
     }
@@ -75,12 +76,13 @@ pub fn enable() -> Result<u8, Error> {
 /// signers stay, so the next enable takes no tap and GitHub needs no new key.
 pub fn disable() -> Result<u8, Error> {
     let status = Command::new("git")
-        .args(["config", "--global", "--unset", "commit.gpgsign"])
+        .args(["config", "--global", "--unset-all", "commit.gpgsign"])
         .status()?;
-    // 5: the setting was not there, which is what was asked for.
+    // 5: the setting was not there, which is what was asked for. With plain --unset it
+    // also means several lines, left in place.
     if !status.success() && status.code() != Some(5) {
         return Err(Error::Value(
-            "git config --unset commit.gpgsign failed".into(),
+            "git config --unset-all commit.gpgsign failed".into(),
         ));
     }
     println!("git commits are no longer signed; enable again to sign with the same key");
@@ -94,6 +96,7 @@ pub fn enabled() -> bool {
     };
     let key = home.join(KEY).to_string_lossy().into_owned();
     matches!(git_get("commit.gpgsign"), Ok(Some(v)) if v == "true")
+        && matches!(git_get("gpg.format"), Ok(Some(v)) if v == "ssh")
         && matches!(git_get("user.signingkey"), Ok(Some(v)) if v == key)
 }
 
@@ -183,9 +186,10 @@ pub fn github() -> Result<u8, Error> {
         gh_interactive(&["auth", "refresh", "-h", "github.com", "-s", SCOPE])?;
         out = add_key(&public)?;
     }
-    // gh answers success for a key GitHub already has, so both read the same.
+    // gh answers success for a key this account already has. A failure that says
+    // "already" is the key in use on another account, which is no verified commit here.
     let why = String::from_utf8_lossy(&out.stderr);
-    if out.status.success() || why.contains("already") {
+    if out.status.success() {
         println!("the key is on GitHub: commits signed with it show as verified");
     } else {
         return Err(Error::Value(format!(

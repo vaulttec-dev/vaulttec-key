@@ -17,7 +17,8 @@ single-binary host CLI, and a press of the board's button for every secret that 
 > revision-2 chip can still be glitched open, though, and it has no chip key
 > ([docs/threat-model.md](docs/threat-model.md)). So it is **not for real secrets** until the steps
 > in [docs/roadmap.md](docs/roadmap.md) are done, and `vkey setup` does not flash it yet.
-> Everything below still describes the ESP32-C6-Zero, which is now only a test board.
+> Everything below still describes the ESP32-C6-Zero, which is now only a test board, except
+> `sudo`, passkeys and signed commits, which need the nRF52840.
 
 ## In ten seconds
 
@@ -57,7 +58,7 @@ the device under routine use — only an explicit export under a double tap read
   Routine use returns only codes. `vkey backup` reseals every item under a
   backup passphrase without revealing secrets.
 - Everything, `list` included, needs the PIN — except a passkey or a `vkey auth` login on the
-  nRF52840, a tap alone; the key re-locks after two idle minutes. Secrets and
+  nRF52840: a tap, plus the FIDO PIN when a site asks for it; the key re-locks after two idle minutes. Secrets and
   PINs are never arguments or environment variables — hidden prompt or stdin.
 
 ## What it does not do
@@ -178,7 +179,8 @@ vkey passkey pin     # the FIDO PIN set, or changed
 ```
 
 The nRF52840 keeps the passkeys sites make discoverable (webauthn.io's, a Google
-account's). They sit behind the key's **FIDO PIN**, the one a browser asks for, which is
+account's). Making, listing and erasing them takes the key's **FIDO PIN** once it is set,
+and a sign-in takes it when the site asks for it; that PIN is
 apart from vkey's PIN on purpose: the key stores it as a plain SHA-256, so the same PIN
 for both would give a flash dump the vault's PIN too. In the shell the last tab of the
 list is `passkey`: it asks the FIDO PIN once, lists them until the lock, and `d` erases

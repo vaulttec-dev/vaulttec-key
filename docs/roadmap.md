@@ -19,9 +19,10 @@ notes, measurements and the factory state: `docs/makerdiary.md`.
   `makerdiary.md`. Installing it moves the bootloader address in UICR, which without a
   probe is a one-shot operation with no way back. A fork of the bootloader already on the
   board installs through its own update path at the same address.
-- **UF2 stays the transport for good.** `vkey setup` for the nRF copies a signed UF2 to
-  the bootloader's drive. That is no longer throwaway work.
-- **Test without a spare.** Neither board holds real secrets (2026-10-14). The C6 takes
+- **UF2 stays the transport for good.** `vkey setup` for the nRF is to copy a signed UF2 to
+  the bootloader's drive; until it does, the copy is by hand. That is no longer throwaway work.
+- **Test without a spare.** Neither board holds real secrets (2026-10-14); the nRF holds
+  only the two signing keys, `vkey-signing` and `vkey-signing-nrf`, each also in a `.vkb`. The C6 takes
   the full `check --wipe-everything` for core changes, once a `.vkb` holds its Secure Boot
   key `vkey-signing`; the nRF takes it while it holds nothing a `.vkb` cannot restore.
   nRF-only changes get `selftest` and a `.vkb`
@@ -33,14 +34,15 @@ notes, measurements and the factory state: `docs/makerdiary.md`.
 **Real secrets go onto the nRF when phases 3-5 are done, not when features are done.**
 No board holds real secrets today, and the C6 is a test board, not a fallback
 (2026-10-14), so every feature is built for the nRF alone. The nRF has no chip key, and
-its debug port is open. Until 2026-10-14 its bootloader also flashed anything and served
+APPROTECT closes its debug port (phase 4), though a boot-time glitch opens it on this
+revision-2 chip. Until 2026-10-14 its bootloader also flashed anything and served
 the flash back (`CURRENT.UF2`); our fork has replaced it since (phase 3). A copy of its
 flash gives up the PIN offline in hours (`docs/threat-model.md`). `espflash` stays in the
 CLI while the C6 is flashed through it, and the audit exception with it.
 
 The order is fixed by what each step depends on. First the **bootloader** with no read-back
 and signed images only: APPROTECT means nothing while UF2 hands out the flash. Then
-**APPROTECT**. Then the **chip key**.
+**APPROTECT**. Then the **chip key**, skipped on this revision-2 chip (phase 5).
 
 ---
 
@@ -60,8 +62,8 @@ and signed images only: APPROTECT means nothing while UF2 hands out the flash. T
 3. **Re-sign and flash the C6.** Unplug the nRF. Then `./tools/sign-vaultkey.sh`,
    `cargo build --release` in `cli/`, `vkey install`, `vkey setup` **without**
    `--erase`, and `vkey totp selftest`.
-4. **`auth enable` on the nRF.** `sudo vkey --port <nRF> auth enable` must refuse at once
-   and write nothing to `/usr/local/bin/vkey`.
+4. ~~**`auth enable` on the nRF.**~~ Obsolete since phase 6: `vkey auth` is `pam_u2f`
+   now, and `enable` works on the nRF.
 5. **Commit.** `git add` the whole `firmware/boards/nrf52840-mdk-dongle/` folder with
    `images/`, then commit (the maintainer).
 

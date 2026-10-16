@@ -274,10 +274,11 @@ impl Key {
             }
         }
         for site in &sites {
-            let name = field(site, 3)
-                .and_then(|rp| text_field(rp, "id"))
-                .unwrap_or("?")
-                .to_string();
+            let name = printable(
+                field(site, 3)
+                    .and_then(|rp| text_field(rp, "id"))
+                    .unwrap_or("?"),
+            );
             let hash = field(site, 4)
                 .and_then(Cbor::as_bytes)
                 .ok_or_else(|| Error::Value("the key named a site without its hash".into()))?;
@@ -294,11 +295,11 @@ impl Key {
             }
             for c in &creds {
                 let user = field(c, 6);
-                let shown = user
-                    .and_then(|u| text_field(u, "name"))
-                    .or_else(|| user.and_then(|u| text_field(u, "displayName")))
-                    .unwrap_or("")
-                    .to_string();
+                let shown = printable(
+                    user.and_then(|u| text_field(u, "name"))
+                        .or_else(|| user.and_then(|u| text_field(u, "displayName")))
+                        .unwrap_or(""),
+                );
                 let id = field(c, 7)
                     .and_then(|d| bytes_field(d, "id"))
                     .ok_or_else(|| {
@@ -477,8 +478,20 @@ impl Key {
             let total = usize::from(u16::from_be_bytes([packet[5], packet[6]]));
             let mut out = Vec::with_capacity(total);
             out.extend_from_slice(&packet[7..7 + total.min(PACKET - 7)]);
+            let mut next = 0u8;
             while out.len() < total {
                 let more = self.packet()?;
+                // Another program's channel shares the hidraw node: not ours to read.
+                if more[..4] != packet[..4] {
+                    continue;
+                }
+                if more[4] != next {
+                    return Err(Error::Value(format!(
+                        "the key sent packet {} of its answer where {next} was due",
+                        more[4]
+                    )));
+                }
+                next = next.wrapping_add(1);
                 let take = (total - out.len()).min(PACKET - 5);
                 out.extend_from_slice(&more[5..5 + take]);
             }
@@ -624,6 +637,14 @@ fn padded_pin(pin: &str) -> Result<Zeroizing<Vec<u8>>, Error> {
     let mut out = Zeroizing::new(vec![0u8; PIN_PADDED]);
     out[..pin.len()].copy_from_slice(pin.as_bytes());
     Ok(out)
+}
+
+/// A name a site chose, with what a terminal would act on rather than show - escape
+/// sequences, line breaks - turned into `?`: these names are printed.
+fn printable(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 /// The text under key `k` of a CBOR map keyed by text.

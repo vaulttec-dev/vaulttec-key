@@ -305,7 +305,7 @@ mapping. The line is `sufficient`: what it adds is a way in, and the password st
 
 | | |
 |---|---|
-| Given | A login needs this physical key and a fresh tap after the request; the host holds a public key only; no vkey PIN, locked or not, and no attempt spent |
+| Given | A login needs this physical key and a fresh tap after the request; the host holds the public key and the credential ID, the private key wrapped by a key on the board; no vkey PIN, locked or not, and no attempt spent |
 | Laptop and key stolen together | The lock screen opens with a tap. A powered-off laptop is protected by disk encryption, not by this. Carry the key separately, do not leave it in the port |
 | Malware running as the user | Can start `sudo` and wait for a reflex tap. The light is the same amber as a code or a passkey; a tap you did not ask for is the thing to refuse |
 | Malware rewriting `vkey` | `~/.local/bin/vkey` is the user's to rewrite, so `enable` and `disable` refuse to run as root from a binary, or under a directory, that anyone but root can change, and name the copy to run instead: `/usr/local/sbin/vkey`, root's, in sudo's `secure_path`. `/settings` brings that copy up to date through `/usr/bin/sudo` before it calls it (since 2026-10-16). Not closed: malware running as the user can still put a `sudo` of its own first in PATH or alias it in the shell, and catch the password the next time `sudo` asks; no program of the user's can stop that |

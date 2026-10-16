@@ -94,7 +94,8 @@ build_esp() {
 build_uf2() {
     local dir="$1" name="$2" out log key kind
     if [[ -n "${BOOTLOADER_TEST_KEY:-}" ]]; then
-        key="$BOOTLOADER_TEST_KEY" kind=test
+        # Absolute: docker -v reads a bare relative name as a named volume.
+        key="$(realpath -m -- "$BOOTLOADER_TEST_KEY")" kind=test
     else
         key="$dir/bootloader/signing-key.pem" kind=real
     fi

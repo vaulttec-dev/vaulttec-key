@@ -32,7 +32,8 @@ vk() { vkey --port "$PORT" "$@"; }
 for tool in openssl vkey base64; do
     command -v "$tool" >/dev/null || { echo "$tool is missing" >&2; exit 1; }
 done
-[[ -d /dev/shm ]] || { echo "no /dev/shm: the key would have to touch the disk" >&2; exit 1; }
+[[ -d /dev/shm && "$(stat -f -c %T /dev/shm 2>/dev/null)" == tmpfs ]] \
+    || { echo "/dev/shm is not tmpfs: the key would have to touch the disk" >&2; exit 1; }
 if [[ -e "$PUBLIC" ]]; then
     echo "$PUBLIC exists: the signing key was made already." >&2
     echo "A second one would not be the key a built bootloader trusts." >&2

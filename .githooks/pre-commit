@@ -19,7 +19,7 @@ unstaged=$(git -C "$ROOT" diff --name-only -- "${paths[@]}")
 [[ -z "$unstaged" ]] || fail "unstaged changes in files the checks read - stage or stash them:
 $unstaged"
 
-untracked=$(git -C "$ROOT" ls-files --others --exclude-standard -- '*.rs' '*.py' '*.sh')
+untracked=$(git -C "$ROOT" ls-files --others --exclude-standard -- '*.rs' '*.py' '*.sh' '*.pem')
 [[ -z "$untracked" ]] || fail "source files that are not in git would not be in the commit - add or delete them:
 $untracked"
 

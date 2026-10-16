@@ -213,7 +213,7 @@ board that trusts it; leaking it removes Secure Boot. Public half and digest:
 `firmware/secure-boot/public.pem` and `digest.bin`, in the repository. `images/vaultkey.bin`
 stays unsigned and reproducible (a hook rebuilds and compares), with `vaultkey.signed.bin`
 beside it, verified by the hook with the public key. Since 2026-10-15 the key also lives
-on the nRF52840 (added from a `.vkb` by `vkey restore --only vkey-signing`), so
+on the nRF52840 (added by `vkey restore --only vkey-signing <C6 .vkb>`), so
 `tools/sign-vaultkey.sh` signs this board's images with the nRF plugged in and this board
 left alone. For one day the signed app was out of the repository, after a core change
 this board was not there to sign.

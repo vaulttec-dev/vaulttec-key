@@ -1,8 +1,8 @@
 # Next board: Makerdiary nRF52840 MDK USB Dongle
 
 Research notes of 2026-10-03. The board was ordered on 2026-10-03. Decided: passkey is back,
-on Trussed. Since 2026-10-04 the board folder builds vkey for the chip (no Trussed yet); it
-has not run on a board.
+on Trussed. Since 2026-10-04 the board folder builds vkey for the chip; it has run on the
+board since 2026-10-13, with Trussed since 2026-10-15.
 
 ## Goal
 
@@ -39,7 +39,7 @@ Why not our own, so it is not re-argued:
 
 Correctness and security rank above simplicity: a vetted stack beats fresh code of our own,
 even a bigger one. The price is accepted: a large dependency tree, littlefs in C, two
-storages, two PINs, no passkey backup.
+storages, two PINs, no passkey backup (since solved: the `.vkb` carries them, 2026-10-15).
 
 Plan:
 
@@ -75,6 +75,8 @@ Open questions before code:
   in Trussed's store, the vault PIN in `store.rs`. Merging them means changing Trussed.
 - **Backup.** Passkeys in Trussed's store are not in the `.vkb` backup. Losing the key means
   re-enrolling passkeys on every site; keep a second factor registered everywhere.
+  Answered 2026-10-15: the `.vkb` carries Trussed's sectors, and a restore puts them back
+  on a board with the same `passkey_sectors`.
 
 ## Memory map (decided 2026-10-03)
 

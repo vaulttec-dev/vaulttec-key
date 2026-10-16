@@ -750,8 +750,9 @@ fn run_op(
     }
 
     // `op` cannot list Developer Environments, so the saved ones are the whole known set:
-    // a run that names none takes all of them, and a new one is only ever added.
-    if item.is_none() && env_pairs.is_empty() {
+    // a run that names none takes all of them, and a new one is only ever added. One
+    // that names only unknown ones takes none, not all.
+    if item.is_none() && environments.is_empty() {
         env_pairs.extend(saved);
         env_pairs.sort_by(|a, b| a.0.cmp(&b.0));
         if prompt::is_tty() {
