@@ -23,11 +23,11 @@ is no bounty; public credit in the release notes is offered gladly if you want i
 |---|---|
 | Firmware in `firmware/` | Physical attacks with equipment: power glitching, side channels, flash extraction |
 | The CLI in `cli/` and the tools in `tools/` | Attacks requiring full control of the host at the moment of a legitimate button press |
-| A code or a signature produced without a button press | Vulnerabilities in the ESP32 itself or in `esp-hal` — report those to Espressif, and tell us so we can update |
+| A code or a signature produced without a button press | Vulnerabilities in the chips or their HALs, Trussed or `fido-authenticator` — report those upstream, and tell us so we can update |
 | Bypassing or brute-forcing the PIN over the protocol | |
 | Extracting secrets by software means | |
 
 Out of scope does not mean uninteresting: it means already known, and documented with its
 consequences in [docs/threat-model.md](docs/threat-model.md). Read the limitations there
-before reporting — the ESP32 is not a secure element, and no resistance to physical
+before reporting — neither board is a secure element, and no resistance to physical
 attack is claimed.
