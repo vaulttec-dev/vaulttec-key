@@ -209,7 +209,12 @@ pub fn wait_for_firmware(port_hint: &str, timeout: Duration) -> Result<Device, E
             Err(Error::ManyBoards(ports)) if ports.iter().any(|p| p == port_hint) => {
                 port_hint.to_string()
             }
-            Err(e) => return Err(e),
+            Err(e @ Error::ManyBoards(_)) => return Err(e),
+            // The ports could not be listed this second, mid-reset: try again.
+            Err(e) => {
+                last = e;
+                continue;
+            }
         };
         let mut dev = match Device::open(Some(&port)) {
             Ok(d) => d,

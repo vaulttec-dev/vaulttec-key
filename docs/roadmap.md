@@ -21,8 +21,9 @@ notes, measurements and the factory state: `docs/makerdiary.md`.
   board installs through its own update path at the same address.
 - **UF2 stays the transport for good.** `vkey setup` for the nRF is to copy a signed UF2 to
   the bootloader's drive; until it does, the copy is by hand. That is no longer throwaway work.
-- **Test without a spare.** Neither board holds real secrets (2026-10-14); the nRF holds
-  only the two signing keys, `vkey-signing` and `vkey-signing-nrf`, each also in a `.vkb`. The C6 takes
+- **Test without a spare.** Neither board holds real secrets (2026-10-14); the nRF's vault
+  holds only the two signing keys, `vkey-signing` and `vkey-signing-nrf`, each also in a `.vkb`,
+  and Trussed's storage beside it the passkeys of phase 6 (`github.com`'s among them). The C6 takes
   the full `check --wipe-everything` for core changes, once a `.vkb` holds its Secure Boot
   key `vkey-signing`; the nRF takes it while it holds nothing a `.vkb` cannot restore.
   nRF-only changes get `selftest` and a `.vkb`
