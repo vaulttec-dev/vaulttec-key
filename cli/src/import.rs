@@ -259,9 +259,10 @@ pub(crate) fn entry_name(title: &str, url: &str) -> Option<String> {
     Some(truncate(&name))
 }
 
-/// At most `NAME_MAX` bytes, never mid-character.
+/// At most `NAME_MAX` bytes, never mid-character, and never ending in a space the cut
+/// laid bare: a name may not, so the item would be refused.
 pub(crate) fn truncate(s: &str) -> String {
-    cut(s, NAME_MAX)
+    cut(s, NAME_MAX).trim_end().to_string()
 }
 
 /// The first `max` bytes of `s`, never mid-character.
@@ -490,6 +491,13 @@ mod tests {
         let parsed = parse(csv).expect("parses");
         assert!(parsed.rows.is_empty());
         assert_eq!(parsed.dropped, vec!["Bank".to_string()]);
+    }
+
+    #[test]
+    fn a_cut_title_never_ends_in_a_space() {
+        let name = truncate("Indie Hackers: Work Together to Build Profitable Online Businesses");
+        assert_eq!(name, "Indie Hackers: Work Together to");
+        assert!(crate::device::name(&name).is_ok());
     }
 
     #[test]

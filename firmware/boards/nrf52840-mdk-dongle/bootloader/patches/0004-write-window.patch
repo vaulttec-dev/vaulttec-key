@@ -1,0 +1,21 @@
+diff --git a/src/usb/uf2/uf2cfg.h b/src/usb/uf2/uf2cfg.h
+index e5a6398..41a7309 100644
+--- a/src/usb/uf2/uf2cfg.h
++++ b/src/usb/uf2/uf2cfg.h
+@@ -21,9 +21,14 @@
+   #define CFG_UF2_FLASH_SIZE          (512*1024)  // 512 kB
+ #endif
+ 
+-// Application Address Space
++// Application Address Space: the board's window, not everything below the bootloader.
++// A UF2 block outside it is never written. A bootloader self-update is staged at the
++// top of this window (BOOTLOADER_ADDR_NEW_RECIEVED below), so the application is
++// flashed again after one.
+ #define USER_FLASH_START              MBR_SIZE // skip MBR included in SD hex
+-#define USER_FLASH_END                (BOOTLOADER_REGION_START - DFU_APP_DATA_RESERVED)
++#define USER_FLASH_END                BOARD_APP_FLASH_END
++STATIC_ASSERT(USER_FLASH_END <= BOOTLOADER_REGION_START);
++STATIC_ASSERT(USER_FLASH_END - DFU_BL_IMAGE_MAX_SIZE >= USER_FLASH_START);
+ 
+ // Bootloader start address
+ #define BOOTLOADER_ADDR_START         BOOTLOADER_REGION_START

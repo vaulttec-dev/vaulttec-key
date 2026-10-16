@@ -9,10 +9,10 @@
 #
 # Flashing is `vkey setup` (on a Secure Boot chip after tools/sign-vaultkey.sh).
 #
-# A board is a folder under firmware/boards with a board.toml (chip, target, images).
-# Nothing here names a chip. Needs rustup with the board's target, and espflash
-# (`cargo install espflash`). The port is found by espflash itself; override with
-# PORT=/dev/ttyACM1.
+# A board is a folder under firmware/boards with a board.toml (chip, target,
+# image_tool, images). Nothing here names a chip. Needs rustup with the board's target,
+# and espflash (`cargo install espflash`) for boards whose image_tool is espflash. The
+# port is found by espflash itself; override with PORT=/dev/ttyACM1.
 
 set -euo pipefail
 
@@ -27,7 +27,41 @@ if [[ -d "$ROOT/.git" ]] && [[ "$(git -C "$ROOT" config --get core.hooksPath || 
     echo "git hooks enabled: .githooks (pre-commit, commit-msg, pre-push)"
 fi
 
-command -v espflash >/dev/null || { echo "espflash is missing:  cargo install espflash" >&2; exit 1; }
+# The objcopy and objdump that ship with the pinned toolchain (rust-toolchain.toml lists
+# llvm-tools), so a raw image is the same bytes on every machine.
+LLVM="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin"
+OBJCOPY="$LLVM/llvm-objcopy"
+
+# Where a radio driver ships inside the chip's HAL crate, the lock file proves nothing,
+# so board.toml names the radio's 4 KiB peripheral slot and the image is searched for
+# it: no data word in the slot, and no movw/movt pair that builds an address in it. That
+# catches a driver addressing the radio's registers directly - the same search finds
+# every slot this firmware does use (USB, flash controller, RNG). It does not rule out
+# an address computed from a neighbouring peripheral's base plus an offset.
+radio_refs() { # elf image base
+    local slot words pairs dis
+    slot=$(printf '%x' $(($3 >> 12)))
+    words=$(od -An -v -tx4 -w4 "$2" | grep -c "^ *0*${slot}[0-9a-f]\{3\}$" || true)
+    # On its own: the `|| true` below is for grep finding no mov, not for a failed
+    # disassembly, which would read as no reference at all.
+    dis="$("$LLVM/llvm-objdump" -d --no-show-raw-insn "$1")" \
+        || { echo "llvm-objdump could not disassemble $1" >&2; exit 1; }
+    pairs=$(grep -E $'\tmov[wt]\t' <<<"$dis" | {
+        declare -A low
+        n=0
+        while read -r _ op reg val; do
+            reg=${reg%,}
+            val=${val#\#}
+            if [[ $op == movw ]]; then
+                low[$reg]=$((val))
+            elif [[ -n ${low[$reg]:-} ]] && ((((val << 16 | low[$reg]) >> 12) == ($3 >> 12))); then
+                n=$((n + 1))
+            fi
+        done
+        echo "$n"
+    } || true)
+    echo $((words + pairs))
+}
 
 # A panic location carries the path of the file it came from, and for a dependency that is
 # an absolute path into the builder's ~/.cargo. Left alone it would put the builder's home
@@ -69,6 +103,7 @@ for dir in "${dirs[@]}"; do
     [[ -f "$dir/board.toml" ]] || { echo "$name: no board.toml" >&2; exit 1; }
     chip="$(toml_value "$dir/board.toml" chip)"
     target="$(toml_value "$dir/board.toml" target)"
+    image_tool="$(toml_value "$dir/board.toml" image_tool)"
     elf="$ROOT/firmware/target/$target/release/vaultkey-$name"
 
     echo "== $name ($chip, $target)"
@@ -77,10 +112,28 @@ for dir in "${dirs[@]}"; do
     # from the old file while a different tree gets compiled.
     (cd "$dir" && cargo build --release --locked)
     mkdir -p "$dir/images"
-    espflash save-image --chip "$chip" "$elf" "$dir/images/vaultkey.bin" >/dev/null
+    # espflash wraps the ELF in the ESP-IDF image format its bootloader checks; objcopy
+    # gives the raw flash contents, for chips that boot straight from them.
+    case "$image_tool" in
+        espflash)
+            command -v espflash >/dev/null || { echo "espflash is missing:  cargo install espflash" >&2; exit 1; }
+            espflash save-image --chip "$chip" "$elf" "$dir/images/vaultkey.bin" >/dev/null
+            ;;
+        objcopy) "$OBJCOPY" -O binary "$elf" "$dir/images/vaultkey.bin" ;;
+        *) echo "$name: board.toml image_tool must be espflash or objcopy, not '$image_tool'" >&2; exit 1 ;;
+    esac
     echo "   image: $(stat -c %s "$dir/images/vaultkey.bin") bytes -> firmware/boards/$name/images/vaultkey.bin"
+    radio_base="$(grep -E '^radio_base\s*=' "$dir/board.toml" | sed 's/^[^=]*=\s*//; s/\s*#.*//' || true)"
+    if [[ -n "$radio_base" ]]; then
+        refs="$(radio_refs "$elf" "$dir/images/vaultkey.bin" "$radio_base")"
+        if ((refs > 0)); then
+            echo "*** $name: $refs reference(s) to the radio at $radio_base in the image - this build could transmit ***" >&2
+            exit 1
+        fi
+        echo "   no-radio: nothing in the image reaches $radio_base"
+    fi
 done
-echo "no-radio check: passed"
+echo "no-radio check: passed (no radio crate in the lock file; radio_base boards searched)"
 
 # The images are compiled into the CLI, so it is rebuilt right after - once every
 # image board.toml names exists; the signed ones come from tools/sign-vaultkey.sh,

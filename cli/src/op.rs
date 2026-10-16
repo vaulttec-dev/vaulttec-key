@@ -3,7 +3,7 @@
 //! Pulls passwords, TOTP credentials and `.env` documents directly from
 //! 1Password in memory (`Zeroizing`), without writing cleartext files to disk.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -12,14 +12,14 @@ use std::time::Instant;
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
-use crate::auth::replace_file;
 use crate::device::{Category, Class, Device, EnvBlob, Error, FieldKind, Reach};
+use crate::file;
 use crate::import::{Summary, entry_name, truncate, unique_name};
 use crate::item::{Item, OwnedField, class_of, field_kind_name, field_kind_of, op_category};
 use crate::prompt::SyncUi;
 use crate::sources::{
-    Manifest, OP_DOC, OP_ENV, OP_ITEM, Outcome, Phase, SyncRun, absorb, claim_written, config_path,
-    finish, keep_unlocked, survivor,
+    Manifest, OP_ENV, OP_ITEM, Outcome, Phase, SyncRun, absorb, claim_written, config_path, finish,
+    keep_unlocked, survivor,
 };
 use crate::totp;
 
@@ -131,6 +131,19 @@ fn op_list(
 pub(crate) struct OpListEntry {
     pub(crate) id: String,
     pub(crate) title: String,
+    #[serde(default)]
+    pub(crate) category: String,
+    #[serde(default)]
+    pub(crate) vault: Option<OpVaultRef>,
+}
+
+#[derive(Deserialize, Debug)]
+pub(crate) struct OpVaultRef {
+    #[serde(default)]
+    pub(crate) id: String,
+    /// Empty in a document listing, which names the vault by id alone.
+    #[serde(default)]
+    pub(crate) name: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -241,7 +254,11 @@ pub(crate) fn item_of(detail: &OpItemDetail) -> Result<(Item, Vec<String>), Erro
             }
             // `purpose` is 1Password's own word for what a field is for, and both
             // PASSWORD and NOTES fields hold secrets that must not leak without a tap.
-            let class = if matches!(f.purpose.as_deref(), Some("PASSWORD" | "NOTES")) {
+            // An SSH key item's private key is type SSHKEY with no purpose; its public
+            // key and fingerprint are plain strings and stay open.
+            let class = if matches!(f.purpose.as_deref(), Some("PASSWORD" | "NOTES"))
+                || f.field_type.eq_ignore_ascii_case("SSHKEY")
+            {
                 Class::Secret
             } else {
                 class_of(kind)
@@ -421,7 +438,49 @@ pub fn save_saved_env(name: &str, id: &str) {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(json) = serde_json::to_vec_pretty(&map) {
-        let _ = replace_file(&path, &json, 0o600);
+        let _ = file::replace(&path, &json, 0o600);
+    }
+}
+
+/// Which 1Password vault each entry came from, by entry name, for `/list` to group by.
+/// The key does not know vaults; this host remembers them the way it remembers sources.
+#[must_use]
+pub fn load_vault_map() -> BTreeMap<String, String> {
+    let map: BTreeMap<String, String> = config_path("op_vaults.json")
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|d| serde_json::from_slice(&d).ok())
+        .unwrap_or_default();
+    // A nameless vault is what a run before document listings were resolved by id
+    // left behind: no vault at all rather than a row with no name.
+    map.into_iter().filter(|(_, v)| !v.is_empty()).collect()
+}
+
+/// Folds what a run learned into the vault map on disk.
+fn save_vault_map(learned: BTreeMap<String, String>) {
+    let mut map = load_vault_map();
+    map.extend(learned);
+    write_vault_map(&map);
+}
+
+/// An entry renamed by hand stays in its vault under the new name.
+pub fn vault_renamed(from: &str, to: &str) {
+    let mut map = load_vault_map();
+    if let Some(vault) = map.remove(from) {
+        map.insert(to.to_string(), vault);
+        write_vault_map(&map);
+    }
+}
+
+/// The vault map written whole, readable only by its owner.
+fn write_vault_map(map: &BTreeMap<String, String>) {
+    let Some(path) = config_path("op_vaults.json") else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_vec_pretty(map) {
+        let _ = file::replace(&path, &json, 0o600);
     }
 }
 
@@ -533,39 +592,6 @@ pub(crate) fn process_item(
     };
     let name = unique_name(&base_name, &qualifier, taken);
     put_item(dev, &name, &stored, replace, ui, run)
-}
-
-/// Imports an `.env` document from 1Password.
-pub(crate) fn process_document(
-    dev: &mut Device,
-    doc_id: &str,
-    title: &str,
-    replace: bool,
-    ui: &mut dyn SyncUi,
-    run: &mut SyncRun,
-) -> Result<(), Error> {
-    let name = env_entry_name(title);
-    let content = match op_exec(&["document", "get", doc_id]) {
-        Ok(b) => b,
-        Err(e) => {
-            ui.info(&format!("  failed to get document '{title}': {e}"));
-            run.summary.skipped += 1;
-            run.saw(&name, Outcome::Offered);
-            return Ok(());
-        }
-    };
-
-    let blob = match EnvBlob::new(content) {
-        Ok(b) => b,
-        Err(e) => {
-            ui.info(&format!("  document '{title}' is not a valid .env: {e}"));
-            run.summary.skipped += 1;
-            run.saw(&name, Outcome::Offered);
-            return Ok(());
-        }
-    };
-
-    put_item(dev, &name, &blob.item(), replace, ui, run)
 }
 
 /// Imports a 1Password Developer Environment by its ID.
@@ -732,27 +758,6 @@ pub fn pull_item(
         }
     }
 
-    // If item get was not found, try as a document
-    match op_exec(&["document", "get", item_query]) {
-        Ok(raw_doc) => {
-            let blob = EnvBlob::new(raw_doc).map_err(|e| {
-                Error::Value(format!(
-                    "content of '{item_query}' is not a valid .env: {e}"
-                ))
-            })?;
-            let name = env_entry_name(item_query);
-            put_item(dev, &name, &blob.item(), replace, ui, &mut run)?;
-            claim_written(&mut run, OP_DOC)?;
-            return Ok(run.summary);
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            if is_critical_op_error(&msg) {
-                return Err(e);
-            }
-        }
-    }
-
     // If item and document not found, try as an environment read
     let Ok(raw_env) = op_exec(&["environment", "read", item_query]) else {
         return Err(Error::Value(format!(
@@ -799,9 +804,34 @@ struct Mirror<'a> {
     /// Set once the key has no room left. The phases go on naming what the source
     /// offers - otherwise the rest would read as withdrawn - but write nothing more.
     full: bool,
+    /// The vault each name this run gave out came from, for `/list`.
+    vaults: BTreeMap<String, String>,
+    /// Vault names by id, from the item listing, for the documents that lack them.
+    vault_names: HashMap<String, String>,
 }
 
 impl Mirror<'_> {
+    /// Files under `vault` every name taken since `before` was.
+    fn note_vault(&mut self, pending: Option<(&OpVaultRef, BTreeSet<String>)>) {
+        let Some((vault, before)) = pending else {
+            return;
+        };
+        let Some(vault) = self.vault_name(vault) else {
+            return;
+        };
+        for name in self.taken.difference(&before) {
+            self.vaults.insert(name.clone(), vault.clone());
+        }
+    }
+
+    fn vault_name(&self, vault: &OpVaultRef) -> Option<String> {
+        if vault.name.is_empty() {
+            self.vault_names.get(&vault.id).cloned()
+        } else {
+            Some(vault.name.clone())
+        }
+    }
+
     /// Passwords, TOTP secrets and the `.env` an item may carry in a note.
     fn items(&mut self, items: &[OpListEntry], blocked: Option<String>) -> Result<Phase, Error> {
         // Two items of the same title are told apart by their login, so their names
@@ -813,10 +843,15 @@ impl Mirror<'_> {
 
         let mut offered = BTreeSet::new();
         let mut unread: Option<String> = None;
+        // The names an entry gets are only known once it is through, and the body
+        // leaves early in many places: each entry's are settled when the next begins.
+        let mut pending: Option<(&OpVaultRef, BTreeSet<String>)> = None;
         for entry in items {
-            // Every category is mirrored now: a passport and a credit card go on the
-            // key like a login does. What an item is decides nothing about whether it
-            // is stored - only its fields' classes decide what comes back out.
+            self.note_vault(pending.take());
+            pending = entry.vault.as_ref().map(|v| (v, self.taken.clone()));
+            // Every category but a Document is mirrored: a passport and a credit card
+            // go on the key like a login does, and only their fields' classes decide
+            // what comes back out.
             let is_dup = counts.get(entry.title.as_str()).copied().unwrap_or(0) > 1;
             let base_name = truncate(entry.title.trim());
 
@@ -883,62 +918,11 @@ impl Mirror<'_> {
             }
             absorb(self.run, OP_ITEM, self.map, &mut offered)?;
         }
+        self.note_vault(pending.take());
 
         Ok(Phase {
             bucket: OP_ITEM,
             blocked: blocked.or(unread),
-            offered,
-        })
-    }
-
-    /// `.env` files kept as 1Password documents.
-    fn documents(
-        &mut self,
-        documents: Option<&[OpListEntry]>,
-        blocked: Option<String>,
-    ) -> Result<Phase, Error> {
-        let mut offered = BTreeSet::new();
-        for doc in documents.unwrap_or_default() {
-            let name = env_entry_name(&doc.title);
-            if self.full {
-                offered.insert(name);
-                self.run.summary.left += 1;
-                continue;
-            }
-            if !self.replace && self.existing.contains(&name) {
-                self.ui
-                    .info(&format!("syncing document '{}'...", doc.title));
-                self.ui
-                    .info(&format!("  skipped env '{name}' (already exists)"));
-                self.run.summary.skipped += 1;
-                offered.insert(name);
-                continue;
-            }
-
-            keep_unlocked(self.dev, self.ping.as_ref(), &mut self.last_ping);
-            self.ui
-                .info(&format!("syncing document '{}'...", doc.title));
-            match process_document(
-                self.dev,
-                &doc.id,
-                &doc.title,
-                self.replace,
-                self.ui,
-                self.run,
-            ) {
-                Ok(()) => {}
-                Err(Error::Full) => {
-                    self.full = true;
-                    offered.insert(name);
-                }
-                Err(e) => return Err(e),
-            }
-            absorb(self.run, OP_DOC, self.map, &mut offered)?;
-        }
-
-        Ok(Phase {
-            bucket: OP_DOC,
-            blocked,
             offered,
         })
     }
@@ -1016,25 +1000,22 @@ pub fn sync(
     let account = (!selection).then(op_account).flatten();
     let account_id = account.as_deref();
     let item_blocked = why_not_prune(&map, OP_ITEM, account_id, selection);
-    let doc_blocked = why_not_prune(&map, OP_DOC, account_id, selection);
     let env_blocked = why_not_prune(&map, OP_ENV, account_id, selection);
 
     ui.info("fetching items from 1Password...");
     let items_out = op_list("item", tag, vault)?;
-    let items: Vec<OpListEntry> = serde_json::from_slice(&items_out)
+    let mut items: Vec<OpListEntry> = serde_json::from_slice(&items_out)
         .map_err(|e| Error::Value(format!("failed to parse 1Password item list: {e}")))?;
-
-    // A listing that failed is not an empty listing: told apart, because treating a
-    // failure as "1Password has no documents" would delete every blob that came from
-    // one.
-    let documents: Option<Vec<OpListEntry>> = op_list("document", tag, vault)
-        .ok()
-        .and_then(|out| serde_json::from_slice(&out).ok());
+    // A Document is a file - a signing key, a backup - and the key is no file store
+    // (maintainer's decision, 2026-10-15). Left out of the listing, one stored by an
+    // earlier run is no longer offered, so this run removes it.
+    let all = items.len();
+    items.retain(|e| !e.category.eq_ignore_ascii_case("DOCUMENT"));
 
     ui.info(&format!(
-        "found {} items and {} documents in 1Password",
+        "found {} items in 1Password ({} documents left there)",
         items.len(),
-        documents.as_ref().map_or(0, Vec::len)
+        all - items.len()
     ));
 
     // There is no listing to ask 1Password for environments, so the whole of this
@@ -1058,23 +1039,22 @@ pub fn sync(
         ui,
         replace,
         full: false,
+        vaults: BTreeMap::new(),
+        vault_names: items
+            .iter()
+            .filter_map(|e| e.vault.as_ref())
+            .filter(|v| !v.name.is_empty())
+            .map(|v| (v.id.clone(), v.name.clone()))
+            .collect(),
     };
 
     let phases = [
         mirror.items(
             &items,
             item_blocked.or_else(|| {
-                items
-                    .is_empty()
-                    .then(|| "1Password listed no items at all".to_string())
-            }),
-        )?,
-        mirror.documents(
-            documents.as_deref(),
-            doc_blocked.or_else(|| match &documents {
-                None => Some("the document listing failed".to_string()),
-                Some(d) if d.is_empty() => Some("1Password listed no documents at all".to_string()),
-                Some(_) => None,
+                // The listing as it came, documents included: a vault of documents
+                // only is a listing, and what an earlier run took from it goes now.
+                (all == 0).then(|| "1Password listed no items at all".to_string())
             }),
         )?,
         mirror.environments(
@@ -1089,6 +1069,7 @@ pub fn sync(
     // Everything the phases still hold, taken before the key and the screen are needed
     // again: `mirror` borrows both.
     let (full, ping) = (mirror.full, mirror.ping.take());
+    save_vault_map(std::mem::take(&mut mirror.vaults));
 
     if full {
         ui.info("the device is full: nothing more was written");
@@ -1129,13 +1110,7 @@ pub fn export_item(
         .into_iter()
         .find(|e| e.name == name)
         .ok_or(Error::NotFound)?;
-    let Some(category) = op_category(stored.category) else {
-        return Err(Error::Value(
-            "an auth secret is not written back: it is this machine's login, and 1Password \
-             has no use for it"
-                .into(),
-        ));
-    };
+    let category = op_category(stored.category);
 
     // What reach the item needs is what it holds: a seed costs the double tap, and
     // nothing else does. Asking for the seed reach on an item without one would cost a
@@ -1337,6 +1312,35 @@ mod tests {
     }
 
     #[test]
+    fn an_ssh_private_key_is_behind_a_tap_and_its_public_half_is_not() {
+        let json = r#"{
+            "id": "s",
+            "title": "server",
+            "category": "SSH_KEY",
+            "fields": [
+                { "id": "private_key", "label": "private key", "type": "SSHKEY", "value": "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEI\n-----END PRIVATE KEY-----\n" },
+                { "id": "public_key", "label": "public key", "type": "STRING", "value": "ssh-ed25519 AAAAC3Nza" },
+                { "id": "fingerprint", "label": "fingerprint", "type": "STRING", "value": "SHA256:abc" }
+            ],
+            "urls": []
+        }"#;
+        let detail: OpItemDetail = serde_json::from_str(json).expect("valid JSON");
+        let (item, _) = item_of(&detail).expect("an item");
+        assert_eq!(
+            item.by_label("private key").expect("kept").class,
+            Class::Secret
+        );
+        assert_eq!(
+            item.by_label("public key").expect("kept").class,
+            Class::Open
+        );
+        assert_eq!(
+            item.by_label("fingerprint").expect("kept").class,
+            Class::Open
+        );
+    }
+
+    #[test]
     fn an_item_with_nothing_in_it_says_so() {
         let json =
             r#"{ "id": "e", "title": "Empty", "category": "LOGIN", "fields": [], "urls": [] }"#;
@@ -1412,7 +1416,7 @@ mod tests {
         // A duplicate title qualified by login: unguessable, only the map knows it.
         map.claim("AWS:alice", OP_ITEM);
         map.claim("AWS:bob", OP_ITEM);
-        map.claim("elsewhere", OP_DOC);
+        map.claim("elsewhere", OP_ENV);
 
         let github = item_names(&map, "GitHub");
         assert!(github.contains(&"GitHub".to_string()));

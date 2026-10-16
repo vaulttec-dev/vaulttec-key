@@ -19,15 +19,14 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::auth::replace_file;
-use crate::device::{Category, Device, Error, Reach, Stored};
+use crate::device::{Device, Error, Reach, Stored};
+use crate::file;
 use crate::import::Summary;
 use crate::prompt::SyncUi;
 
 /// The buckets a name can belong to. A name has exactly one owner: the sync that
 /// wrote it last.
 pub const OP_ITEM: &str = "op:item";
-pub const OP_DOC: &str = "op:doc";
 pub const OP_ENV: &str = "op:env";
 pub const FILE: &str = "file";
 
@@ -78,7 +77,7 @@ impl Manifest {
         }
         let json = serde_json::to_vec_pretty(self)
             .map_err(|e| Error::Value(format!("cannot write the source map: {e}")))?;
-        replace_file(&path, &json, 0o600)
+        file::replace(&path, &json, 0o600)
     }
 
     /// This name now belongs to this bucket. The last sync to write a name owns it.
@@ -298,13 +297,10 @@ pub(crate) fn prune(
     Ok(())
 }
 
-/// An item worth pinging the device with to hold off its auto-lock: any but an auth
-/// secret, which refuses to be read at all, out of a listing already in hand.
+/// An item worth pinging the device with to hold off its auto-lock, out of a listing
+/// already in hand.
 pub(crate) fn survivor(entries: &[Stored]) -> Option<String> {
-    entries
-        .iter()
-        .find(|e| e.category != Category::Auth)
-        .map(|e| e.name.clone())
+    entries.first().map(|e| e.name.clone())
 }
 
 /// Every name the key holds. A listing that does not come back reads as empty, which
@@ -423,7 +419,7 @@ mod tests {
 
     #[test]
     fn prunes_only_what_the_bucket_owns_and_the_source_dropped() {
-        let m = manifest(&[("gone", OP_ITEM), ("kept", OP_ITEM), ("doc", OP_DOC)]);
+        let m = manifest(&[("gone", OP_ITEM), ("kept", OP_ITEM), ("doc", OP_ENV)]);
         let prune = m.to_prune(OP_ITEM, &set(&["kept"]), &set(&["gone", "kept", "doc"]));
         assert_eq!(prune, vec!["gone".to_string()]);
     }
@@ -498,7 +494,7 @@ mod tests {
             ("AWS:alice", OP_ITEM),
             ("AWS:bob", OP_ITEM),
             ("AWSomeApp", OP_ITEM),
-            ("AWS:doc", OP_DOC),
+            ("AWS:doc", OP_ENV),
         ]);
         let family = m.family(OP_ITEM, "AWS");
         assert!(family.contains(&"AWS".to_string()));

@@ -9,6 +9,17 @@ single-binary host CLI, and a press of the board's button for every secret that 
 > batch, no certification. Read [docs/threat-model.md](docs/threat-model.md) before relying on it,
 > and keep the recovery codes your services give you.
 
+> **Two boards** (2026-10-13). Development now targets the Makerdiary nRF52840 MDK USB Dongle
+> (`firmware/boards/nrf52840-mdk-dongle`), which also holds passkeys (FIDO2, since
+> 2026-10-15) and answers `sudo` through them. It runs the same
+> core and passes the full lifecycle test. Its bootloader is now our own fork, which runs
+> only signed firmware and serves no flash back, and APPROTECT closes its debug port. This
+> revision-2 chip can still be glitched open, though, and it has no chip key
+> ([docs/threat-model.md](docs/threat-model.md)). So it is **not for real secrets** until the steps
+> in [docs/roadmap.md](docs/roadmap.md) are done, and `vkey setup` does not flash it yet.
+> Everything below still describes the ESP32-C6-Zero, which is now only a test board, except
+> `sudo`, passkeys and signed commits, which need the nRF52840.
+
 ## In ten seconds
 
 ```console
@@ -46,17 +57,17 @@ the device under routine use — only an explicit export under a double tap read
 - A TOTP secret leaves the key in the clear only under an explicit double tap (`vkey export <name>`).
   Routine use returns only codes. `vkey backup` reseals every item under a
   backup passphrase without revealing secrets.
-- Everything, `list` included, needs the PIN — except a `vkey auth` login, a tap alone; the key
-  re-locks after two idle minutes. Secrets and
+- Everything, `list` included, needs the PIN — except a passkey or a `vkey auth` login on the
+  nRF52840: a tap, plus the FIDO PIN when a site asks for it; the key re-locks after two idle minutes. Secrets and
   PINs are never arguments or environment variables — hidden prompt or stdin.
 
 ## What it does not do
 
 Read [docs/threat-model.md](docs/threat-model.md) **before** you depend on this.
 
-- **Nothing against phishing.** A TOTP code works on a fake site just as on the real one; that is a
-  property of TOTP. WebAuthn resists it, and this hardware cannot: the C6's USB is a fixed
-  Serial/JTAG port with no HID.
+- **Phishing, for TOTP and passwords.** A TOTP code works on a fake site just as on the real one;
+  that is a property of TOTP. The browser binds a passkey to its site, and only the nRF52840
+  board has passkeys: the C6's USB is a fixed Serial/JTAG port with no HID.
 - **Nothing for the code or password you just received** — it crosses the host: terminal, optionally
   the clipboard. The clipboard is cleared after 30 s, but a clipboard manager has already kept its own
   copy, and the reveal stays in the terminal's scrollback until the window closes. Details in the
@@ -108,8 +119,9 @@ vkey get myapp > .env                 # better without a file:  env $(vkey get m
 vkey list · rm · info · lock · pin set/change · totp selftest · wipe
 vkey op [query]                       # mirror 1Password (passwords, TOTP, notes, developer .env)
 vkey import passwords.csv             # Google Password Manager or 1Password CSV export (skips unchanged)
-vkey backup vault.vkb                 # everything in one file, sealed on the key; two taps
+vkey backup vault.vkb                 # everything, the nRF's passkeys too, sealed on the key; two taps
 vkey restore [file]                   # restore from 1Password, CSV, or .vkb backup file
+vkey restore --only NAME file.vkb     # just that item out of a backup, nothing replaced
 vkey check --wipe-everything          # lifecycle test on a board; ERASES EVERYTHING
 sudo vkey auth enable                 # sudo and the lock screen with a tap (below)
 ```
@@ -127,29 +139,81 @@ touches what a CSV brought, and an entry under a name no source offers is left a
 
 ## sudo and the lock screen with a tap
 
-With the key plugged in, `sudo` and the lock screen take a tap instead of your password;
-without it, or with no tap for ten seconds, they ask for the password as always. The key
-signs a fresh challenge with a secret that never leaves it; the host keeps only its public
-key. It needs no PIN, so a stolen laptop with the key still in it opens with a tap — read
-[the trade-off](docs/threat-model.md#vkey-auth--sudo-and-the-lock-screen-with-a-tap-no-pin)
+With the nRF52840 key plugged in, `sudo` and the lock screen take a tap instead of your
+password; without it they ask for the password as always, and with it but no tap, once the
+key gives up after 30 s. This is `pam_u2f`, the scheme every FIDO2 key uses: the key makes
+a credential for this host, the host keeps only its public half. It needs no PIN, so a
+stolen laptop with the key still in it opens with a tap — read
+[the trade-off](docs/threat-model.md#vkey-auth--sudo-and-the-lock-screen-with-a-tap-through-pam_u2f)
 first.
 
 ```bash
-sudo vkey auth enable     # PIN, then a tap: sudo and the lock screen are set up
+sudo apt install libpam-u2f
+sudo install -m 0755 "$(command -v vkey)" /usr/local/sbin/vkey   # a copy only root can change
+sudo vkey auth enable     # two taps: sudo and the lock screen are set up
 sudo vkey auth disable    # back to the password alone
 ```
 
-`enable` copies `vkey` to `/usr/local/bin`, and adds one line to the PAM files of `sudo` and
-of the lock screens this host has — COSMIC, GNOME, KDE, sway, Hyprland — keeping each
-original as `*.before-vkey`. A file it does not recognise it leaves alone and prints the
-line to add by hand.
+`enable` and `disable` refuse to run as root from `~/.local/bin`: anything running as you
+could rewrite that file and would then run as root. The copy in `/usr/local/sbin` is
+root's, and `sudo` finds it by name.
+
+`enable` makes a credential on the key (a tap), tries it the way a login will (another
+tap), writes it to `/etc/u2f_mappings` (root's), and adds
+one line to the PAM files of `sudo` and of the lock screens this host has — COSMIC, GNOME,
+KDE, sway, Hyprland — keeping each original as `*.before-vkey`. A file it does not
+recognise it leaves alone and prints the line to add by hand. Keep a root shell open in
+another terminal until `sudo` and the lock screen have both worked, with the tap and with
+the password.
+
+In the shell, `/settings` → `auth` does the same in one step: it installs `libpam-u2f`
+with apt first if it is missing, and brings `/usr/local/sbin/vkey` up to date when it
+differs from the `vkey` you run.
+
+## Passkeys on the key
+
+```bash
+vkey passkey list    # site and account of every passkey the key keeps
+vkey passkey rm      # one erased from the key, picked from the list
+vkey passkey pin     # the FIDO PIN set, or changed
+```
+
+The nRF52840 keeps the passkeys sites make discoverable (webauthn.io's, a Google
+account's). Making, listing and erasing them takes the key's **FIDO PIN** once it is set,
+and a sign-in takes it when the site asks for it; that PIN is
+apart from vkey's PIN on purpose: the key stores it as a plain SHA-256, so the same PIN
+for both would give a flash dump the vault's PIN too. In the shell the last tab of the
+list is `passkey`: it asks the FIDO PIN once, lists them until the lock, and `d` erases
+the highlighted one. Erasing it on the key does not remove it from the site. `/settings`
+→ `passkey-pin` sets or changes the FIDO PIN. The `vkey auth` login and the commit
+signing key are not kept on the key, so they are not in the list.
+
+## Git commits signed with a tap
+
+```bash
+vkey commits enable    # a tap: an SSH key on the key, git signs every commit with it
+vkey commits disable   # git stops signing; the key stays for the next enable
+vkey commits github    # the key on GitHub as a signing key: commits show as verified
+```
+
+`enable` makes an OpenSSH `ecdsa-sk` key on the nRF52840 (a tap) and keeps its handle in
+`~/.config/vkey/commit-signing-key`, which signs nothing without the key (not in
+`~/.ssh`, where GNOME Keyring's agent would take it and refuse to sign). It sets git's `gpg.format`,
+`user.signingkey`, `gpg.ssh.allowedSignersFile` and `commit.gpgsign` globally, refuses
+to overwrite a signing setup that is not its own, and offers to add the public half to
+GitHub as a signing key (`gh`), so the commits show as verified there. `github` does that
+step alone: it signs `gh` in, or grants it the `admin:ssh_signing_key` permission, in the
+browser when it has to, then adds the key. From then on every commit waits for a tap. In
+the shell it is `/settings` → `commits`: the switch, and `github` on the line under it. Linux only
+for now; macOS and Windows are issues #18 and #19. What it costs is in
+[the threat model](docs/threat-model.md#git-commits-signed-with-a-tap).
 
 ## Gestures and capacity
 
 | Gesture | LED | What it releases |
 |---|---|---|
-| Tap | amber | one TOTP code, the secret fields of one item, one `.env`, or one `vkey auth` login |
-| Hold 5 s | red | factory wipe: every secret and the PIN |
+| Tap | amber | one TOTP code, the secret fields of one item, one `.env`, one passkey, one `vkey auth` login, or one signed git commit |
+| Hold 5 s | red | factory wipe: every secret and the PIN; a restore from a `.vkb`, which replaces everything; on the nRF52840, erasing every passkey (within 10 s of plugging in) |
 | Double tap | blue | the encrypted backup file, or an export / seed readout |
 
 A tap never wipes and never exports, so a hostile host cannot swap a code request for a
@@ -231,6 +295,8 @@ that is not in it exists on neither side. The device has no clock — the host s
 |---|---|
 | [docs/threat-model.md](docs/threat-model.md) | what it protects against and what it does not. **Read first** |
 | [docs/hardware.md](docs/hardware.md) | the C6-Zero board: measured pins, traps, bringing up a new one |
+| [docs/roadmap.md](docs/roadmap.md) | the nRF52840 board, from bring-up to daily use |
+| [docs/makerdiary.md](docs/makerdiary.md) | the nRF52840 board: why this one, its factory state, what was measured |
 
 ## Security and licence
 

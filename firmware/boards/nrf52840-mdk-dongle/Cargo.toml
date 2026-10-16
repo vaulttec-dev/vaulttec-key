@@ -1,0 +1,96 @@
+[package]
+name = "vaultkey-nrf52840-mdk-dongle"
+version = "0.9.0"
+edition = "2024"
+rust-version = "1.95"
+description = "vaulttecdev hardware key on the Makerdiary nRF52840 MDK USB Dongle"
+publish = false
+
+[[bin]]
+name = "vaultkey-nrf52840-mdk-dongle"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+vaultkey-core = { path = "../../core" }
+
+# Everything below is what this chip needs; the key itself knows none of it.
+nrf52840-hal = "0.19.0"
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+# The MBR at 0x0 hands over to 0x1000; `set-vtor` points the core at this image's
+# vector table instead of relying on the MBR to forward exceptions.
+# `paint-stack` fills the stack before main: a reset in the middle of a key derivation
+# would otherwise leave Argon2's blocks for the next run to find in RAM.
+cortex-m-rt = { version = "0.7", features = ["set-vtor", "paint-stack"] }
+critical-section = "1"
+embedded-hal = "1.0"
+embedded-storage = "0.3"
+usb-device = "0.3"
+usbd-serial = "0.2"
+# CTAPHID, the HID interface FIDO2 speaks (docs/roadmap.md, phase 6), beside the CDC one.
+usbd-ctaphid = { version = "0.5", default-features = false }
+ctaphid-dispatch = { version = "0.4", default-features = false }
+ctaphid-app = "0.2"
+# The slot through which the CTAPHID pipe raises the flag of a request the host cancels.
+ref-swap = "0.1.2"
+heapless-bytes = "0.5"
+# Passkeys: Trussed holds the keys in a littlefs of its own, fido-authenticator speaks
+# CTAP2 over it. Only the mechanisms fido-authenticator's bounds name, no logging.
+trussed = { version = "0.2", default-features = false, features = [
+    "certificate-client", "crypto-client", "filesystem-client", "management-client",
+    "ui-client", "serde-extensions",
+    "aes256-cbc", "chacha8-poly1305", "ed255", "hmac-sha256", "p256", "sha256",
+    "log-none",
+] }
+trussed-core = "0.2"
+# The two Trussed extensions fido-authenticator asks for, and the backend that has them.
+trussed-staging = { version = "0.5", default-features = false, features = ["fs-info", "hkdf", "log-none"] }
+trussed-fs-info = "0.3"
+trussed-hkdf = "0.4"
+# `dispatch`, not `ctaphid-dispatch`: 0.3 compiles its CTAPHID `App` only under the
+# feature that also brings the APDU one, which nothing calls and LTO drops.
+fido-authenticator = { version = "0.3", features = ["dispatch", "log-none"] }
+littlefs2 = "0.8"
+# littlefs calls a few C string functions; tinyrlibc has them in Rust (c-headers/).
+littlefs2-sys = { version = "0.4", features = ["tinyrlibc"] }
+# The chip's RNG speaks rand_core 0.9, like the core; Trussed asks for 0.6.
+rand_core = "0.9"
+rand_core_06 = { package = "rand_core", version = "0.6" }
+static_cell = "2"
+# The INFO text, built at boot; already in the tree through usb-device.
+heapless = "0.8"
+
+# The workspace's table with one difference: `unsafe_code` is `deny`, not `forbid`, so
+# the one place that must name memory-mapped flash (`data_region` in src/main.rs) can
+# say why with #[expect]. tools/checks.sh keeps it identical otherwise; it stays last
+# in this file because the check reads from here to the end.
+[lints.rust]
+unsafe_code = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+unused_import_braces = "deny"
+unused_lifetimes = "deny"
+unused_macro_rules = "deny"
+unused_qualifications = "deny"
+non_ascii_idents = "deny"
+explicit_outlives_requirements = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+# Restriction lints that pay for themselves here.
+unwrap_used = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+mem_forget = "deny"
+exit = "deny"
+missing_assert_message = "deny"
+undocumented_unsafe_blocks = "deny"
+# Pedantic lints that only ask for boilerplate.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

@@ -1,10 +1,11 @@
 # One board = one folder. This file is the board's identity for everything outside the
 # firmware: the CLI reads it at build time and embeds the images listed here, and
-# tools/build-vaultkey.sh reads `chip` and `target` to build and flash.
+# tools/build-vaultkey.sh reads `chip`, `target` and `image_tool` to build.
 
 name = "esp32c6-zero"
 chip = "esp32c6"                          # as espflash names it
 target = "riscv32imac-unknown-none-elf"   # rustup target the firmware is built for
+image_tool = "espflash"                   # the ESP-IDF app image the bootloader checks
 
 # How the CLI recognises the board on the USB bus.
 usb_vid = 0x303A

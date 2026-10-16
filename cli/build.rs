@@ -6,6 +6,23 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::{env, fs};
 
+/// `passkey_sectors` of a board.toml: how many 4 KiB sectors its passkeys take, 0 when
+/// the board has none.
+fn passkey_sectors(t: &toml::Table, path: &Path) -> u32 {
+    let Some(v) = t.get("passkey_sectors") else {
+        return 0;
+    };
+    v.as_integer()
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: `passkey_sectors` is not a positive count",
+                path.display()
+            )
+        })
+}
+
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let boards_dir = manifest.join("../firmware/boards");
@@ -84,9 +101,10 @@ fn main() {
             )
             .expect("writing to a String cannot fail");
         }
+        let passkey_sectors = passkey_sectors(&t, &toml_path);
         writeln!(
             out,
-            "    Board {{ name: {:?}, chip: {:?}, button: {:?}, usb_vid: {:#x}, usb_pid: {:#x}, images: &[{images}] }},",
+            "    Board {{ name: {:?}, chip: {:?}, button: {:?}, usb_vid: {:#x}, usb_pid: {:#x}, passkey_sectors: {passkey_sectors}, images: &[{images}] }},",
             string("name"),
             string("chip"),
             string("button"),

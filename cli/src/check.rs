@@ -13,16 +13,15 @@
 
 use std::num::NonZeroU8;
 
-use ed25519_dalek::SigningKey;
 use zeroize::Zeroizing;
 
 use crate::device::{
-    AUTH_CHALLENGE_LEN, AUTH_SECRET_LEN, Category, Class, Device, EnvBlob, Error, FieldKind,
-    MAX_ATTEMPTS, Params, Reach, login_item, passphrase, pin,
+    Category, Class, Device, EnvBlob, Error, MAX_ATTEMPTS, Params, Reach, login_item, passphrase,
+    pin,
 };
-use crate::item::{Item, OwnedField};
+use crate::item::Item;
 use crate::totp::{TEST_SECRET, decode_base32, seed_field, selftest};
-use crate::{auth, backup, boards};
+use crate::{backup, boards};
 
 const PIN: &str = "12345678";
 const NEW_PIN: &str = "87654321";
@@ -82,7 +81,11 @@ pub fn run(d: &mut Device) -> Result<u8, Error> {
         failures: 0,
         button: boards::button(Some(&version)),
     };
-    println!("device: {version}\n");
+    println!("device: {version}");
+    for line in d.chip_report()? {
+        println!("chip:   {line}");
+    }
+    println!();
 
     clean_start(d, &mut rep)?;
     println!("\n=== no PIN yet ===");
@@ -101,8 +104,6 @@ pub fn run(d: &mut Device) -> Result<u8, Error> {
     lock_unlock(d, &mut rep)?;
     println!("\n=== rekey ===");
     rekey(d, &mut rep, &first_code, &env_blob)?;
-    println!("\n=== auth: a login answered while locked ===");
-    auth(d, &mut rep)?;
     println!("\n=== live code against an independent HMAC ===");
     let ok = selftest(d, &rep.button, |line| println!("{line}"))?;
     rep.check("selftest", ok, "");
@@ -199,7 +200,7 @@ fn provisioning(d: &mut Device, rep: &mut Report) -> Result<(), Error> {
     d.pin_unlock(pin(PIN)?)?;
     let took = started.elapsed();
     rep.check(
-        "key derivation under 2 s (1.2 s of Argon2 plus the round trip)",
+        "key derivation under 2 s (the board's ~1 s of Argon2 plus the round trip)",
         took.as_millis() < 2000,
         &format!("{} ms", took.as_millis()),
     );
@@ -356,7 +357,10 @@ fn backup(
 ) -> Result<(), Error> {
     const PASS: &str = "correct horse battery staple";
     let dir = std::env::temp_dir().join(format!("vkey-check-{}.vkb", std::process::id()));
-    println!("  >>> tap {} ONCE when the light turns blue", rep.button);
+    println!(
+        "  >>> blue asks for two taps, but this step proves one is refused: tap {} only ONCE",
+        rep.button
+    );
     rep.expect(
         "backup refused for one tap",
         &backup::export(d, &dir, passphrase(PASS)?),
@@ -364,19 +368,31 @@ fn backup(
     );
     println!("  >>> tap {} twice when the light turns blue", rep.button);
     let n = backup::export(d, &dir, passphrase(PASS)?)?;
-    rep.check("backup written", n == 3, &format!("{n} items"));
+    rep.check("backup written", n.items == 3, &n.describe());
     d.delete("t")?;
     d.delete("e")?;
+    println!(
+        "  >>> a restore replaces everything, so it takes the wipe's hold, and this one \
+         must then refuse the wrong passphrase: hold {} down for five seconds when the \
+         light turns red",
+        rep.button
+    );
     rep.expect(
         "restore refused with the wrong passphrase",
         &backup::import(d, &dir, passphrase("correct horse battery")?),
         &Error::BadBackup,
     );
+    println!(
+        "  >>> hold {} down for five seconds again when the light turns red",
+        rep.button
+    );
+    // A board that keeps passkeys must get them back, or the round trip lost them.
+    let keeps_passkeys = backup::passkey_sectors(d)? > 0;
     let done = backup::import(d, &dir, passphrase(PASS)?)?;
     rep.check(
         "restore",
-        done.count == 3 && done.skipped.is_empty(),
-        &format!("{} items", done.count),
+        done.count == 3 && done.skipped.is_empty() && done.passkeys == keeps_passkeys,
+        &format!("{} items, passkeys back: {}", done.count, done.passkeys),
     );
     let _ = std::fs::remove_file(&dir);
     rep.tap();
@@ -450,57 +466,6 @@ fn rekey(d: &mut Device, rep: &mut Report, first_code: &str, env_blob: &[u8]) ->
     });
     d.pin_unlock(pin(NEW_PIN)?)?;
     rep.check("new PIN works", d.pin_status()?.unlocked, "");
-    Ok(())
-}
-
-/// An auth secret signs a challenge after a tap with the device locked, and the
-/// signature verifies under the seed's public key on this side; a chip without its
-/// eFuse key refuses to hold one at all.
-fn auth(d: &mut Device, rep: &mut Report) -> Result<(), Error> {
-    const SECRET: [u8; AUTH_SECRET_LEN] = [0x5A; AUTH_SECRET_LEN];
-    let bound = d.pin_status()?.chip_bound;
-    let auth_item = Item::new(Category::Auth).with(OwnedField::new(
-        Class::Secret,
-        FieldKind::Concealed,
-        "seed",
-        &SECRET,
-    ));
-    let added = d.put("a", &auth_item, false);
-    if !bound {
-        rep.expect(
-            "no auth secret without a chip key",
-            &added,
-            &Error::Incompatible,
-        );
-        return Ok(());
-    }
-    added?;
-    rep.expect(
-        "no code from an auth secret",
-        &d.code("a", Some(59)),
-        &Error::BadArg,
-    );
-    let challenge = [0x33; AUTH_CHALLENGE_LEN];
-    d.lock()?;
-    rep.tap();
-    let signature = d.respond("a", &challenge)?;
-    rep.check(
-        "the signature verifies under the public key",
-        auth::verifies(
-            &SigningKey::from_bytes(&SECRET).verifying_key(),
-            &challenge,
-            &signature,
-        ),
-        "",
-    );
-    let st = d.pin_status()?;
-    rep.check(
-        "still locked, no attempt spent",
-        !st.unlocked && st.retries_left == MAX_ATTEMPTS,
-        &format!("{st:?}"),
-    );
-    d.pin_unlock(pin(NEW_PIN)?)?;
-    d.delete("a")?;
     Ok(())
 }
 

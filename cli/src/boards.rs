@@ -9,6 +9,9 @@ pub struct Board {
     pub button: &'static str,
     pub usb_vid: u16,
     pub usb_pid: u16,
+    /// The 4 KiB sectors its passkeys live in; 0 for a board without them. A backup's
+    /// passkeys go back only to a board with the same count.
+    pub passkey_sectors: u32,
     /// Everything `setup` may write, in flash order.
     pub images: &'static [Image],
 }

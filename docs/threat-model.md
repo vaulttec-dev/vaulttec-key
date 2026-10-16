@@ -5,8 +5,126 @@
 > There is no sale today, and the document holds all the same: the owner must not rely
 > on guarantees the device does not give.
 
-Last reviewed 2026-09-12. Revisited on every hardware or firmware change. Reporting
-policy: [`SECURITY.md`](../SECURITY.md). Board details: [`docs/hardware.md`](hardware.md).
+Last reviewed 2026-09-12; the nRF52840 board section added 2026-10-13, its signing key
+and bootloader fork 2026-10-14, its passkeys 2026-10-15. Revisited on every
+hardware or firmware change. Reporting policy: [`SECURITY.md`](../SECURITY.md). Board
+details: [`docs/hardware.md`](hardware.md).
+
+## The nRF52840 board: not for real secrets yet
+
+The rest of this document describes the ESP32-C6 key. The second board,
+`firmware/boards/nrf52840-mdk-dongle` (Makerdiary MDK USB Dongle), runs the same core and
+passed `vkey check --wipe-everything` on 2026-10-13. Its protection is much weaker today,
+and every guarantee below that rests on the eFuse key, JTAG being off or Secure Boot does
+**not** hold on it:
+
+- **No chip key.** `DeviceKey` is unbound, so the data key comes from the PIN and Argon2
+  alone (128 KiB, 20 passes - about a second on this 64 MHz core). The eight-attempt wipe
+  only guards the device's own PIN check. Whoever copies the flash can try every PIN on
+  their own hardware. Measured 2026-10-13 with the same `argon2` crate on one laptop core:
+  0.97 ms per guess at 20 passes (2.4 ms at the C6's 48). All 10^8 PINs then take about
+  28 core-hours, a few hours on an ordinary laptop, and less on a GPU. The "years for
+  eight digits" figure is for the C6 with the counter erased; it does not apply here.
+- **The flash can be copied only with a glitch.** The chip is revision 2 (build code
+  `AAD0`). Since 2026-10-15 its firmware has written UICR `APPROTECT` to Enabled
+  (`0xffffff00`, phase 4), which closes the debug port from the next reset on, for good.
+  Revision 2 predates Nordic's fix for the published APPROTECT voltage glitch (IN-133),
+  so someone with glitching gear can still open the port at boot and read the flash. A
+  chip key would fall the same way, which is why there is none (roadmap, phase 5).
+
+  The USB drive no longer hands it out. The factory UF2 bootloader served `CURRENT.UF2`,
+  the whole application area, to anyone who held the button while plugging the key in.
+  On 2026-10-13 the vault's region came back with its contents. Our bootloader fork
+  replaced it on 2026-10-14, and its drive holds only `INFO_UF2.TXT` and `INDEX.HTM`. Raw
+  sectors past them read as zeros: checked on the board where the factory's drive had
+  served its own code.
+- **Only firmware signed with the fork's key runs** (since 2026-10-14). The fork checks
+  the signature on every boot. On the board it refused an image with one bit flipped and
+  an image signed with another key, and it ran the signed vkey. Whoever holds the button
+  can still write the application region, so a bad copy leaves the board in the
+  bootloader until a signed image is copied.
+- **`vkey auth` is a passkey here** (since 2026-10-15): `pam_u2f` over the board's FIDO2,
+  in place of the old scheme, which needed a chip key. Its section below says what that
+  costs.
+- **The bootloader fork's signing key lives on this board.** It is the `.env`
+  `vkey-signing-nrf`, made by `bootloader/signing-key.sh` on 2026-10-14 (fingerprint
+  `a1700ebd539b0bfc`), with a `.vkb` as its second copy. That copy was proven twice, each
+  time by a restore that signed byte for byte the same, the second after the wipe test.
+  Everything above applies to it:
+  - for 1 h 17 min, until the fork was installed, `CURRENT.UF2` and the offline PIN search
+    handed it to anyone who held the board for a minute and then computed for a few hours;
+  - then SWD did the same, until APPROTECT closed it on 2026-10-15 (phase 4); since then
+    it takes the glitch.
+
+  Whoever has the key signs firmware the fork runs. By design, the fork moves to a new key
+  only through a self-update signed with the old one. A leak is mended only while the
+  owner still holds the key.
+- **The C6's Secure Boot key lives here too** (since 2026-10-15): `vkey-signing`, added
+  from the C6's `.vkb` by `vkey restore --only`, so the C6's images are signed without
+  touching the C6. Whoever takes it off this board signs firmware the C6 boots; the C6
+  holds no real secrets, and its own copy stays where it was.
+- **A backup made on this board uses its own cost** (20 passes). It is still guarded by
+  the passphrase's entropy, at less than half the C6's work per guess.
+- **Passkeys (FIDO2) live outside the vault** (since 2026-10-15, roadmap phase 6).
+  Trussed and fido-authenticator keep them in a littlefs of their own at
+  0xC8000..0xF4000 (0xD8000..0xEC000 until 2026-10-16; the new region covers the old
+  one, so blocks of the old filesystem, keys among them, stay readable to a flash dump
+  until littlefs reuses them, beside the tail of an old vault copy, which is sealed):
+  - **They are not sealed under the PIN.** Trussed writes its keys as they are: the
+    passkeys' private keys, and the key that wraps the credential IDs of the
+    non-resident ones (`pam_u2f`'s among them). The glitch above reads them straight
+    off the flash. No PIN search is needed, so a passkey falls in the minutes the glitch
+    takes, where the vault takes hours more.
+  - **A tap is enough, locked or not.** Registration and login take the vault's tap
+    (amber, a fresh press after the request), never the vkey PIN. A FIDO PIN, if one is
+    set through a browser or `fido2-token`, belongs to fido-authenticator. It gates what a
+    site asks it to gate and encrypts nothing.
+  - **Nothing leaves over USB.** No CTAP command returns a private key. U2F (CTAP1) is
+    not served at all: its presence check polls every 250 ms, and a tap that must start
+    after the request cannot answer that.
+  - **Erasing them takes the wipe's gesture.** authenticatorReset erases every passkey,
+    so it needs the 5 s hold (red), not a tap, and fido-authenticator accepts it only in
+    the first 10 s after the key is plugged in. The vault's own wipe,
+    `check --wipe-everything` included, does not touch them: they sit in another region.
+  - **Origin binding.** The browser binds a passkey to its site's origin, so a look-alike
+    site gets nothing it can use: the property WebAuthn has and TOTP lacks. TOTP codes and
+    passwords from the vault stay as phishable as anywhere.
+  - **They are in the backup, under its passphrase** (milestone 5): a deliberate break
+    from FIDO's rule that they never leave (maintainer's decision, 2026-10-15). `vkey
+    backup` carries Trussed's whole filesystem after the items, as sealed 4 KiB sectors:
+    every passkey, the key that wraps the non-resident credentials (`pam_u2f`'s among
+    them), the signature counters. They leave only after the double tap, like the items.
+    Passkeys are not served while the backup runs, so the copy is never torn.
+    - Whoever has the `.vkb` and its passphrase has the passkeys. Restored onto another
+      nRF52840, they make a clone that answers every site and this host's `sudo`.
+    - A restore replaces the passkeys, as it replaces the vault, after the PIN and the
+      wipe's 5 s hold (since 2026-10-16; before, the PIN alone was enough, which let a
+      host that knew the PIN skip the hold authenticatorReset takes). A file with no
+      passkeys leaves them as they are.
+    - Restoring an older backup winds the signature counters back. A site that checks
+      them may take the key for a clone.
+    - A restore cut short leaves the region torn. The key formats it on its next start,
+      which also loses the `sudo` credential, until the restore runs again from the file.
+    - The C6 takes an nRF backup's items and leaves the passkeys in the file, named.
+
+    Losing the key with no backup still loses them, so every site keeps a second way in.
+
+**Accepted, not fixed** (maintainer's decision, 2026-10-13): this revision-2 chip will hold
+everything once the steps below are done. The glitch above stays open after them. Someone
+who takes the key and has the gear reads the flash and finds the PIN offline in hours. For
+a personal key, that risk is accepted rather than paid for with a revision-3 dongle.
+
+Before this board holds a real secret, two things are required:
+- our own fork of the UF2 bootloader, which runs signed images only, serves no read-back
+  and writes only to the application region (accepted 2026-10-14);
+- APPROTECT (written 2026-10-15).
+
+A chip-bound key, a secret in a flash page locked by the ACL until reset, was the third.
+It was dropped on this revision (2026-10-15): it loads from flash at boot, so the glitch
+above reads it as well, and it would protect nothing the PIN does not already. On a
+revision-3 chip it would be worth having. The plan is in `docs/roadmap.md`. Nordic's secure bootloader was dropped from it: there is
+no SWD probe, and installing it moves the bootloader address in UICR, a one-shot change
+with no way back.
 
 ## What the device is
 
@@ -51,7 +169,7 @@ An unlock is checked against the verifier; nothing derived from the PIN is store
 
 | Choice | Reason |
 |---|---|
-| Argon2id, 128 KiB, no allocator | Memory hardness costs an attacker more than PBKDF2 does — but 128 KiB is what the board can spare beside an 80 KiB vault and a 300 KiB stack, and it fits in the cache of any desktop core, so it buys time, not the memory bandwidth Argon2 is meant to charge for. Against the PIN that changes nothing (the counter and the eFuse key do the work); against a stolen `.vkb` it is the whole defence, hence the passphrase rule below |
+| Argon2id, 128 KiB, no allocator | Memory hardness costs an attacker more than PBKDF2 does — but 128 KiB is what the board can spare beside an 80 KiB vault and a 300 KiB stack (since 2026-10-15 it is taken on the stack for each derivation and scrubbed after it; the nRF52840 paints its stack at boot, so a reset mid-derivation leaves nothing behind), and it fits in the cache of any desktop core, so it buys time, not the memory bandwidth Argon2 is meant to charge for. Against the PIN that changes nothing (the counter and the eFuse key do the work); against a stolen `.vkb` it is the whole defence, hence the passphrase rule below |
 | Cost `t` in the vault header, bounded above | A forged header cannot park the key for hours |
 | Not `scrypt`, not `balloon-hash` | `scrypt` needs `alloc`; `balloon-hash` doubles the crypto crates |
 | PIN exactly 8 digits (0.9; was 6–8) | The counter can be erased through download mode, so the real cost of a guess is one firmware unlock, ~1.3 s. That is a fortnight for six digits, five months for seven and four years for eight — the only lever is length, because a slower KDF makes every honest unlock slower too. A PIN of the wrong length is refused before the wire and costs no attempt |
@@ -67,8 +185,8 @@ before the burn became `Incompatible` and was wiped.
 
 | Gesture | Action | LED |
 |---|---|---|
-| Tap | code, the secret fields of an item, a `.env`, a `vkey auth` login | amber |
-| Hold 5 s | wipe | red |
+| Tap | code, the secret fields of an item, a `.env`, a passkey, a `vkey auth` login | amber |
+| Hold 5 s | wipe; a restore from a `.vkb`, which replaces everything; on the nRF52840 also erasing every passkey | red |
 | Double tap, 800 ms window | encrypted backup, **and an export or seed readout** | blue |
 
 A tap never wipes and never exports; a hold never exports; a double tap never wipes. One
@@ -161,67 +279,106 @@ its strength is the passphrase's — keep it where you keep other backups, and t
 passphrase elsewhere. Host malware during `backup` gets the same ciphertext the owner
 gets; it cannot swap a code request for an export, and it can substitute its own
 passphrase only if the owner happens to double tap, which is never needed otherwise.
-`vkey restore` writes the file back under PIN with no gesture, like `add`: nothing comes
-out, a duplicate name replaces, and entry versus blob the newer one from the file wins.
+`vkey restore` writes the file back under the PIN and the wipe's 5 s hold (since
+2026-10-16; before, the PIN alone): nothing comes out, but everything is replaced, the
+passkeys too, so a host that learned the PIN cannot swap in a vault or passkeys of its
+own. `vkey restore --only` adds items beside the vault under the PIN alone, like `add`;
+`add` and `rm` of one item stay gesture-free, so such a host can still delete items one
+by one, never the passkeys.
 Rejected: a flash-image copy as backup — PIN-encrypted, 8 digits fall offline in days, and
 it does not transfer while bound to the chip key.
 
-### `vkey auth` — sudo and the lock screen with a tap, no PIN
+### `vkey auth` — sudo and the lock screen with a tap, through `pam_u2f`
 
-`vkey auth` (2026-09-14) lets `sudo` and the lock screen accept a tap on the key instead
-of the Linux password, through `pam_exec`; with no key, or no tap within ten seconds (the
-firmware's own timeout for a login, shorter than a code's 30 s), PAM asks for the password
-as before. The scheme is `pam_u2f`'s. `sudo vkey auth enable` draws a 32-byte Ed25519 seed
-on the host, stores it on the key as an `Auth` entry, keeps the public key in
-`/etc/vkey/auth/<user>` (root, 0644) and zeroizes the seed. A login sends a fresh random
-challenge; the key signs `"vaultkey/auth/v1" | challenge` after a tap; the signature is
-verified here. The host holds no secret and writes nothing at login, so `sudo` (checked as
-root) and a lock screen running as the user (COSMIC's `cosmic-greeter`, `swaylock`) read the
-same file. A recorded signature is worthless: the next challenge is a different one.
-
-`enable` also copies the binary to `/usr/local/bin/vkey` and adds one line to each PAM
-service this host has among `sudo`, `cosmic-greeter`, `gdm-password`, `kde`, `swaylock`,
-`hyprlock` — above the line that brings in the password check, a copy of the file kept once
-as `*.before-vkey`, the new file renamed over the old. A file with no recognisable anchor is
-left alone and the line printed for the owner to place. `disable` takes the lines out,
-deletes the public key and the entry. This replaces the first version (same day), which
-kept a rotating expectation on the host instead of a public key: two state files, one of
-them in the user's home, and a user who had to edit PAM by hand. Writing `/etc/pam.d` from
-the CLI is the price of a setup a person can do; the line is `sufficient`, so what it adds
-is a way in, and the password stays one.
-
-**The deliberate exception to "everything needs the PIN".** An `Auth` record is sealed
-under `DeviceKey::mac("vaultkey/auth-key/v1")` — the eFuse key alone — not under the DEK, so
-`Respond` works while the device is locked and spends no attempt: `sudo` can never be what
-wipes the vault. On a chip without a burned key it is refused (`Incompatible`), because
-there it would be sealed under nothing. Adding, listing, renaming and deleting still need
-the PIN; a PIN change does not touch the record; a wipe removes it; a backup reseals it
-under the passphrase and a restore under the new chip, so the host's public key stays valid.
+Since 2026-10-15 `vkey auth` is the scheme every other key uses: `pam_u2f` over FIDO2, on
+the nRF52840's passkeys (maintainer's decision, 2026-10-03). `sudo vkey auth enable` makes
+a non-resident credential for `pam://<host>` after a tap, tries it with an assertion after
+a second tap, and only then writes its public half to `/etc/u2f_mappings` (root's, 0644),
+replacing only that user's line. It speaks CTAP2 itself (`cli/src/fido.rs`) rather than
+run `pamu2fcfg`: the 1.1.0 that distributions ship demands an attestation certificate, and
+this key attests with the credential's own key. Each PAM service this host has among `sudo`, `cosmic-greeter`, `gdm-password`, `kde`,
+`swaylock`, `hyprlock` gets one line, `auth sufficient pam_u2f.so
+authfile=/etc/u2f_mappings cue`, above the one that brings in the password check. A copy
+of each file is kept once as `*.before-vkey`, and a file with no recognisable anchor is
+left alone with the line printed. `disable` takes the lines out and the user out of the
+mapping. The line is `sufficient`: what it adds is a way in, and the password stays one.
 
 | | |
 |---|---|
-| Given | A login needs this physical board and a finger on it; no secret on the host; a fresh challenge every time; no PIN attempt spent |
+| Given | A login needs this physical key and a fresh tap after the request; the host holds the public key and the credential ID, the private key wrapped by a key on the board; no vkey PIN, locked or not, and no attempt spent |
 | Laptop and key stolen together | The lock screen opens with a tap. A powered-off laptop is protected by disk encryption, not by this. Carry the key separately, do not leave it in the port |
-| Malware running as the user | Can start `sudo` and wait for a reflex tap. The LED is the same amber as a code; a tap you did not ask for is the thing to refuse |
-| A locked key | Answers `NotFound` to every name that is not an auth entry, so it names no service without the PIN; whether `<user>@<host>` is enrolled is not secret |
+| Malware running as the user | Can start `sudo` and wait for a reflex tap. The light is the same amber as a code or a passkey; a tap you did not ask for is the thing to refuse |
+| Malware rewriting `vkey` | `~/.local/bin/vkey` is the user's to rewrite, so `enable` and `disable` refuse to run as root from a binary, or under a directory, that anyone but root can change, and name the copy to run instead: `/usr/local/sbin/vkey`, root's, in sudo's `secure_path`. `/settings` brings that copy up to date through `/usr/bin/sudo` before it calls it (since 2026-10-16). Not closed: malware running as the user can still put a `sudo` of its own first in PATH or alias it in the shell, and catch the password the next time `sudo` asks; no program of the user's can stop that |
+| Malware enrolling a key of its own | `/etc/u2f_mappings` is root's: adding a line needs root already |
 | Someone at the unlocked laptop while you are away, key in the port | Gets root with one tap where `sudo` used to want the password |
-| A `.vkb` backup | Now also carries the login seed: with the passphrase and any chip-bound board it signs for your `sudo` too |
-| A user-writable binary | PAM runs `vkey` as root; `vkey auth` refuses unless its executable and every directory above it are root's alone, hence `/usr/local/bin/vkey` |
-| The public key file | Not secret. Replacing it needs root, and `vkey auth` refuses it unless it and every directory above it are root's alone |
-| The port busy (the `vkey` shell open) | The login fails and PAM falls back to the password |
-| A `vkey auth` killed mid-wait (Ctrl+C) | The key still signs the old challenge; the next login may read that signature, fail it once and fall back to the password. Nothing is left broken |
+| A copy of the board's flash (the revision-2 glitch) | The credential's key is wrapped by fido-authenticator's key, which sits unsealed in Trussed's filesystem: whoever reads the flash can answer this host's logins, given the host |
+| A `.vkb` backup | Holds the login with the passkeys (since 2026-10-15): with the passphrase, another board then answers this host's `sudo` too |
+| The key in, nobody tapping | The password prompt comes when the key gives up, after 30 s; the old scheme gave up after 10 |
+| A FIDO PIN on the key | Its own, not vkey's; the credential is made without one, so a login does not ask for it |
 | The login screen after boot | COSMIC's greeter shares the `cosmic-greeter` service, so a tap may log in there too; the keyring, unlocked only by the password, then stays locked |
+
+**The scheme before, removed 2026-10-15** (restorable from commit `4bd49f3`:
+`cli/src/auth.rs`, `Respond`, `Category::Auth`, `vault::auth_key`). An Ed25519 seed on the
+key, sealed under the chip key alone, answered a fresh challenge after a tap through
+`pam_exec` of `/usr/local/bin/vkey auth`. It needed a burned chip key, which the nRF52840
+does not have, and `pam_u2f` does the same with a credential the key's FIDO side already
+makes. What it leaves:
+- an older `.vkb` may hold its seed; a restore leaves that item in the file and names it;
+- a vault that still holds one (only the C6 ever did) cannot open it on newer firmware,
+  because it was sealed under the chip key: `vkey rm <user>@<host>` before a backup;
+- `/usr/local/bin/vkey`, which `enable` points out and leaves for the owner to delete;
+- category 201 and command byte 0x19 stay unused, so an older CLI never means something else.
 
 Rejected: presence of the USB device as proof (any ESP32 shows `303a:1001`); PIN plus tap
 (a second password to type buys nothing over the one it replaces); HMAC challenge-response
-with a rotating expectation (the first version: state to write at every login and two copies
-of it); a PAM `cdylib` (`pam_exec` needs no C and no `unsafe`).
+with a rotating expectation (state to write at every login); a PAM `cdylib`; keeping a
+scheme of our own beside `pam_u2f`.
+
+### The passkey list and the FIDO PIN
+
+Since 2026-10-16 `vkey passkey` and the shell's `passkey` tab list and erase the
+discoverable passkeys through CTAP2 credentialManagement, and `vkey passkey pin` sets or
+changes the FIDO PIN (`cli/src/fido.rs`, PIN protocol 1). Nothing in the firmware
+changed: fido-authenticator enforces it all.
+
+| | |
+|---|---|
+| Given | Listing or erasing needs the FIDO PIN and gets a token for credential management only (permission `cm`), which the shell keeps in memory until the vault locks or it quits |
+| The FIDO PIN apart from vkey's | Maintainer's decision, 2026-10-16. fido-authenticator stores the PIN as the first 16 bytes of its SHA-256 in Trussed's filesystem: a copy of the flash (the revision-2 glitch) finds an 8-digit PIN in under a second. One PIN for both would hand that copy the vault's PIN, which Argon2 otherwise makes cost years |
+| Wrong FIDO PINs | Eight in all, then the FIDO side is blocked until authenticatorReset; three in a row want a replug. Separate from vkey's eight |
+| Malware running as the user | With the FIDO PIN, it can list and erase passkeys - a denial of service, not a sign-in: using one still needs the tap |
+| What the list does not show | Non-resident credentials: the `vkey auth` login and the commit signing key live as handles on the host, not on the key |
+
+Rejected: one PIN for vkey and FIDO (above); the firmware reading fido-authenticator's
+files itself to list passkeys under vkey's PIN (a second path to the passkeys around the
+authenticator, tied to its internal format, more code on the key).
+
+### Git commits signed with a tap
+
+Since 2026-10-15 `vkey commits enable` (or `/settings` → `commits`) makes an OpenSSH
+`ecdsa-sk` key on the nRF52840 after a tap and points git at it globally: `gpg.format
+ssh`, `user.signingkey ~/.config/vkey/commit-signing-key`, `commit.gpgsign true`, and an
+`allowed_signers` line for `user.email`. It writes only the user's own files, never a
+system one, and refuses when git already signs with something else. `disable` unsets
+`commit.gpgsign` and keeps the key. `tag.gpgsign` is left alone. Uploading the public
+half to GitHub is offered and asked, never done unasked.
+
+| | |
+|---|---|
+| Given | A signature needs this physical key, its handle file, and a tap after the request; no PIN and no user verification |
+| What a signature proves | That someone touched this key while a process with the handle asked. Not who, and not what the commit contains: the tap does not show the commit |
+| Malware running as the user | Can run `git commit` (or `ssh-keygen -Y sign` on anything) and wait for a reflex tap. The light is the same amber as a code or a login |
+| Key and laptop stolen together | Signs as the user with a tap, until the key is removed from GitHub |
+| The handle file `~/.config/vkey/commit-signing-key` | Useless without the key. Not in the `.vkb`: losing it means a new key and a new upload to GitHub |
+| A copy of the board's flash, or a `.vkb` with its passphrase | The credential is wrapped by fido-authenticator's key, which both carry: with the handle file, another board then signs too |
+| authenticatorReset | Ends the key; a restore from a `.vkb` taken before brings it back, if that `.vkb` was made at the current passkey layout (44 sectors since 2026-10-16) |
+| Every commit waits for a tap | A rebase or an amend signs each commit again, one tap each; a commit with no tap in 30 s fails |
 
 ## What it does not protect against
 
 | Threat | Why not |
 |---|---|
-| Phishing | A TOTP code typed into a fake site works on the real one. That is a property of TOTP, not of the device; only WebAuthn/passkey stops phishing, and it is **not** here and never will be on this board |
+| Phishing | A TOTP code typed into a fake site works on the real one. That is a property of TOTP, not of the device; only WebAuthn/passkey stops phishing, and the C6 never will have it (no USB HID). The nRF52840 board has passkeys since 2026-10-15 (its section above) |
 | The code, password or `.env` you just received | It passes through USB, the terminal and optionally the clipboard; host malware sees it at that moment, and it outlives the moment in the terminal's scrollback and in a clipboard manager's history (below) |
 | A host fully compromised at the moment of use | It waits for your press and takes the result; with no display the device cannot show what you are confirming |
 | A breach at the service | TOTP is a shared secret: the service stores it too |
@@ -365,6 +522,9 @@ Listed openly so nobody has to discover them.
 7. **No display** — the device cannot show what it is confirming.
 8. **No recovery mechanism** beyond the encrypted backup (`vkey backup` / `vkey restore`).
    Lose both the key and the backup and access is gone. Keep a second key.
+9. **One known advisory is ignored** (`cli/.cargo/audit.toml`): RUSTSEC-2026-0344, a zstd
+   decoder bug in `ruzstd` pulled in by `espflash`. vkey never parses an ELF, so the decoder
+   is never fed. It goes when a fixed `ruzstd` arrives or `espflash` leaves the CLI.
 
 ## Honest comparison
 
@@ -391,7 +551,8 @@ Suits: a second factor for personal accounts when you do not want secrets on a p
 in a cloud backup — **this is the main scenario**; and anyone who wants open hardware and
 control over the firmware.
 
-Does not suit: anyone expecting phishing protection (**get a passkey/WebAuthn key**);
+Does not suit: anyone expecting phishing protection from the C6 (**a passkey/WebAuthn
+key**, which the nRF52840 board now is, with the limits in its section);
 anyone expecting resistance to physical seizure of the key (**a certified key with an
 SE**); use as a sole factor or without the services' own recovery codes — the wipe after
 8 wrong PINs is final, and a backup exists only if one was made and the passphrase not
@@ -426,3 +587,4 @@ A link to this document belongs on the product page, not buried in the repositor
 - [Espressif Security Advisory AR2023-007](https://www.espressif.com/en/news/ESP32_FIA_Analysis)
 - [EUCLEAK Side-Channel Attack on the YubiKey 5 Series — NinjaLab](https://ninjalab.io/wp-content/uploads/2024/09/20240903_eucleak.pdf)
 - [Security Overview — ESP32-C6, ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/latest/esp32c6/security/security.html)
+- [Nordic IN-133 — APPROTECT bypass by fault injection](https://infocenter.nordicsemi.com/pdf/in_133_v1.0.pdf) · [CVE-2020-27211](https://nvd.nist.gov/vuln/detail/CVE-2020-27211) · [IN-141 — nRF52840 revision 3](https://infocenter.nordicsemi.com/pdf/in_141_v1.1.pdf)

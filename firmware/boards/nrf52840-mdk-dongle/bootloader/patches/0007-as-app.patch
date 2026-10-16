@@ -1,0 +1,104 @@
+--- a/lib/sdk11/components/libraries/bootloader_dfu/bootloader.c
++++ b/lib/sdk11/components/libraries/bootloader_dfu/bootloader.c
+@@ -150,8 +150,12 @@
+ 
+ static void bootloader_settings_save(bootloader_settings_t * p_settings)
+ {
++  // The on-board test build runs under the factory bootloader, whose settings page
++  // this is: it writes nothing outside its scratch window.
++#ifndef VKEY_AS_APP
+   nrfx_nvmc_page_erase(BOOTLOADER_SETTINGS_ADDRESS);
+   nrfx_nvmc_words_write(BOOTLOADER_SETTINGS_ADDRESS, (uint32_t *) p_settings, sizeof(bootloader_settings_t) / 4);
++#endif
+ 
+   pstorage_callback_handler(&m_bootsettings_handle, PSTORAGE_STORE_OP_CODE, NRF_SUCCESS, (uint8_t *) p_settings, sizeof(bootloader_settings_t));
+ }
+--- a/src/main.c
++++ b/src/main.c
+@@ -110,10 +110,20 @@
+ //--------------------------------------------------------------------+
+ static void dfu_mode(bool asked_by_app);
+ 
++#ifdef VKEY_AS_APP
++void app_test_run(void);
++#endif
++
+ //--------------------------------------------------------------------+
+ //
+ //--------------------------------------------------------------------+
+ int main(void) {
++#ifdef VKEY_AS_APP
++  // The on-board test build (bootloader/test/app_test.c) runs from 0x1000 under the
++  // factory bootloader: its interrupts go to its own vectors, whatever the MBR forwards.
++  SCB->VTOR = MBR_SIZE;
++#endif
++
+   // Populate Boot Address and MBR Param into MBR if not already
+   // MBR_BOOTLOADER_ADDR/MBR_PARAM_PAGE_ADDR are used if available, else UICR registers are used
+   // Note: skip it for now since this will prevent us to change the size of bootloader in the future
+@@ -128,6 +138,14 @@
+   PRINTF("Bootloader Start\r\n");
+   led_state(STATE_BOOTLOADER_STARTED);
+ 
++#ifdef VKEY_AS_APP
++  // It is the application, so there is none to check or start: it checks its test
++  // images, then serves the drive until a reset.
++  app_test_run();
++  dfu_mode(false);
++  NVIC_SystemReset();
++#endif
++
+   // The application asked for DFU mode: clear the request, so the next reset boots it
+   bool const uf2_dfu = (NRF_POWER->GPREGRET == DFU_MAGIC_UF2_RESET);
+   if (uf2_dfu) NRF_POWER->GPREGRET = 0;
+--- a/src/usb/msc_uf2.c
++++ b/src/usb/msc_uf2.c
+@@ -211,6 +211,9 @@
+         {
+           PRINTF("bootloader update is not signed\r\n");
+         }
++        // The on-board test build never copies: its next boot reports the staged
++        // image's verdict from the same check (bootloader/test/app_test.c).
++#ifndef VKEY_AS_APP
+         // skip if there is no bootloader change
+         else if ( memcmp(new_bootloader, (uint8_t*) BOOTLOADER_ADDR_START, DFU_BL_IMAGE_MAX_SIZE) )
+         {
+@@ -226,6 +229,7 @@
+           // on success, COPY_BL won't return but run the new bootloader right away.
+           sd_mbr_command(&command);
+         }
++#endif
+ 
+         PRINTF("bootloader update complete\r\n");
+       }else
+--- a/src/usb/uf2/ghostfat.c
++++ b/src/usb/uf2/ghostfat.c
+@@ -119,8 +119,13 @@
+ #define STR(x) STR0(x)
+ 
+ // The key's fingerprint tells a board running a test-key build from one running the
+-// real key; there is no SoftDevice line, since there is no SoftDevice.
++// real key; there is no SoftDevice line, since there is no SoftDevice. The on-board test
++// build appends its results (bootloader/test/app_test.c).
++#ifdef VKEY_AS_APP
++char infoUf2File[BPB_SECTOR_SIZE - 1] =
++#else
+ static char const infoUf2File[] =
++#endif
+     "UF2 Bootloader " UF2_VERSION "\r\n"
+     "Model: " UF2_PRODUCT_NAME "\r\n"
+     "Board-ID: " UF2_BOARD_ID "\r\n"
+--- a/src/usb/uf2/uf2cfg.h
++++ b/src/usb/uf2/uf2cfg.h
+@@ -25,7 +25,11 @@
+ // A UF2 block outside it is never written. A bootloader self-update is staged at the
+ // top of this window (BOOTLOADER_ADDR_NEW_RECIEVED below), so the application is
+ // flashed again after one.
++#ifdef VKEY_AS_APP
++#define USER_FLASH_START              BOARD_TEST_SCRATCH // the on-board test build's window
++#else
+ #define USER_FLASH_START              MBR_SIZE // skip MBR included in SD hex
++#endif
+ #define USER_FLASH_END                BOARD_APP_FLASH_END
+ STATIC_ASSERT(USER_FLASH_END <= BOOTLOADER_REGION_START);
+ STATIC_ASSERT(USER_FLASH_END - DFU_BL_IMAGE_MAX_SIZE >= USER_FLASH_START);

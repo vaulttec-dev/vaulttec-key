@@ -1,6 +1,6 @@
-//! Host protocol over whatever byte stream the board provides (on the C6-Zero: the
-//! built-in USB-Serial/JTAG port). The byte layout is in [`crate::wire`], which the
-//! host CLI compiles too.
+//! Host protocol over whatever byte stream the board provides (a USB serial port on
+//! every board so far). The byte layout is in [`crate::wire`], which the host CLI
+//! compiles too.
 //!
 //! The port may also carry log output, so frames start with a magic word the host
 //! scans for. Log lines are plain ASCII and never contain it. USB already guarantees
@@ -12,15 +12,14 @@ use rand_core::{CryptoRng, RngCore};
 use zeroize::Zeroizing;
 
 use crate::device::{Device, Reach};
-use crate::hal::{Clock, DeviceKey, Port, Ui};
+use crate::hal::{Attachment, Clock, DeviceKey, Port, Ui};
 use crate::item::{Category, ITEM_MAX};
 use crate::oath::{NAME_MAX, Name, len_u8};
 use crate::store::MAX_ENTRIES;
 use crate::vault::{Passphrase, Pin};
 use crate::wire::{
-    AUTH_CHALLENGE_LEN, AUTH_SIGNATURE_LEN, BAD_CMD, BAD_LEN, BackupHead, Cmd, FLAG_REPLACE, Fail,
-    MAGIC, MAX_PAYLOAD, OK, PinStatus, REACH_OPEN, REACH_SECRET, REACH_SEED, frame_head,
-    scan_magic,
+    BAD_CMD, BAD_LEN, BackupHead, Cmd, FLAG_REPLACE, Fail, MAGIC, MAX_PAYLOAD, OK, PinStatus,
+    REACH_OPEN, REACH_SECRET, REACH_SEED, frame_head, scan_magic,
 };
 
 /// ~5 s of silence mid-frame resynchronises the framer instead of leaving it stuck.
@@ -43,7 +42,8 @@ pub struct Proto<P: Port, C: Clock> {
 }
 
 impl<P: Port, C: Clock> Proto<P, C> {
-    /// `version` is what INFO answers - build it with `vaultkey_core::version!`.
+    /// `version` is what INFO answers. Its first line is `vaultkey_core::version!`; a
+    /// board may add lines about its chip after it.
     pub fn new(port: P, clock: C, version: &'static str) -> Self {
         Proto {
             port,
@@ -149,13 +149,14 @@ impl<P: Port, C: Clock> Proto<P, C> {
     }
 
     /// Runs forever, one request at a time.
-    pub fn run<F, R, U, DC, K>(&mut self, dev: &mut Device<'_, F, R, U, DC, K>) -> !
+    pub fn run<F, R, U, DC, K, A>(&mut self, dev: &mut Device<'_, F, R, U, DC, K, A>) -> !
     where
         F: NorFlash,
         R: RngCore + CryptoRng,
         U: Ui,
         DC: Clock,
         K: DeviceKey,
+        A: Attachment,
     {
         loop {
             self.await_magic();
@@ -186,13 +187,18 @@ impl<P: Port, C: Clock> Proto<P, C> {
         clippy::too_many_lines,
         reason = "one match over every wire command; splitting it would scatter the dispatch that is meant to be read in one place"
     )]
-    fn handle<F, R, U, DC, K>(&mut self, dev: &mut Device<'_, F, R, U, DC, K>, cmd: Cmd, p: &[u8])
-    where
+    fn handle<F, R, U, DC, K, A>(
+        &mut self,
+        dev: &mut Device<'_, F, R, U, DC, K, A>,
+        cmd: Cmd,
+        p: &[u8],
+    ) where
         F: NorFlash,
         R: RngCore + CryptoRng,
         U: Ui,
         DC: Clock,
         K: DeviceKey,
+        A: Attachment,
     {
         match cmd {
             Cmd::Info => self.respond(OK, self.version.as_bytes()),
@@ -237,20 +243,6 @@ impl<P: Port, C: Clock> Proto<P, C> {
                         code[n] = period;
                         self.respond(OK, &code[..=n]);
                     }
-                    Err(f) => self.fail(f),
-                }
-            }
-
-            Cmd::Respond => {
-                let Some((name, rest)) = take_name(p) else {
-                    return self.reject(Malformed::Len);
-                };
-                let Ok(challenge) = <&[u8; AUTH_CHALLENGE_LEN]>::try_from(rest) else {
-                    return self.reject(Malformed::Len);
-                };
-                let mut out = [0u8; AUTH_SIGNATURE_LEN];
-                match dev.respond(name, challenge, &mut out) {
-                    Ok(()) => self.respond(OK, &out),
                     Err(f) => self.fail(f),
                 }
             }

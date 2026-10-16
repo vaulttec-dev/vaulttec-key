@@ -4,7 +4,6 @@
 //!   kek      = `DeviceKey::mac`(pre)                 - chip-bound when the board has a key
 //!   dek      = HMAC(kek, "vaultkey/dek/v1")          - what actually encrypts
 //!   verifier = HMAC(kek, "vaultkey/verify/v1")       - stored, proves the PIN
-//!   auth     = `DeviceKey::mac`("vaultkey/auth-key/v1") - auth secrets only, no PIN
 //!
 //! Only the dek stays resident while unlocked; the kek exists just long enough to
 //! check the verifier and derive it. Sealed blobs are AES-256-GCM with the entry name
@@ -28,11 +27,13 @@ pub const SALT_LEN: usize = 16;
 pub const NONCE_LEN: usize = 12;
 pub const TAG_LEN: usize = 16;
 pub const OVERHEAD: usize = NONCE_LEN + TAG_LEN;
-/// Eight digits, no fewer and no more. Whoever holds the board erases the attempt
-/// counter through ROM download mode and guesses through the real firmware at about
-/// 1.3 s a try: six digits fall in a fortnight, seven in five months, eight in four
-/// years. No key derivation rescues a shorter PIN - a second per unlock is already as
-/// slow as the device may be, so length is the only lever left.
+/// Eight digits, no fewer and no more. Whoever holds a board with a chip key can still
+/// erase the attempt counter - every board so far can be rewritten by whoever holds it -
+/// and guess through the real firmware. At the 1.3 s a try measured on the first board,
+/// six digits fall in a fortnight, seven in five months, eight in four years. No key
+/// derivation rescues a shorter PIN - a second per unlock is already as slow as the
+/// device may be, so length is the only lever left. Without a chip key a copy of the
+/// flash is guessed offline instead, and eight digits do not hold there (docs/threat-model.md).
 pub const PIN_LEN: usize = 8;
 /// A backup file has no attempt counter: whoever holds it guesses forever, at the speed
 /// of their own hardware, and 128 KiB of Argon2id is not much of a brake. Twelve is a
@@ -41,7 +42,8 @@ pub const PIN_LEN: usize = 8;
 pub const PASS_MIN: usize = 12;
 pub const PASS_MAX: usize = 128;
 
-/// How many 1 KiB blocks the board must hand over for the key derivation.
+/// Argon2's working memory in 1 KiB blocks: what the device takes on the stack for one
+/// derivation (`device::with_kdf_memory`).
 pub const KDF_BLOCKS: usize = 128;
 /// What the env key is sealed under in the image header: a random key of its own,
 /// wrapped by the dek, so a PIN change re-seals sixty bytes instead of every blob.
@@ -49,16 +51,27 @@ pub const ENV_KEY_AAD: &[u8] = b"vaultkey/env-key/v1";
 /// What a backup item is sealed under, followed by its position in the file: an item
 /// moved, repeated or dropped from the middle fails to open on the way back in.
 pub const BACKUP_AAD: &[u8] = b"vaultkey/backup/v1";
+/// What a sector of the board's attachment (`hal::Attachment`, the nRF52840's passkeys)
+/// is sealed under in a backup, followed like an item by its position in the file:
+/// never read as an item, never moved unnoticed. Sectors come after the items.
+pub const REGION_AAD: &[u8] = b"vaultkey/backup-region/v1";
+/// A sealed sector's plaintext starts `sector_size u32le | sector_count u32le | index
+/// u32le`, then the sector: a board laid out differently refuses it rather than write
+/// a filesystem that would not mount.
+pub const REGION_HEAD: usize = 12;
 
-/// Argon2id cost: memory in KiB and passes over it. Stored per vault, so it can be
-/// raised later without breaking existing ones.
+/// Argon2id cost: memory in KiB and passes over it. Stored per vault and per backup, so
+/// a board can change its own without breaking either.
 ///
-/// The memory is what the board can spare beside an 80 KiB vault and a 300 KiB stack,
-/// not what a passphrase would like: 128 KiB fits in the cache of any desktop core, so
-/// it costs an attacker time, not the memory bandwidth Argon2 is meant to cost them.
-/// Against the PIN that changes nothing - eight digits behind the attempt counter and
-/// the eFuse key is what protects it. Against a stolen `.vkb` it is the whole defence,
-/// which is why the passphrase must carry the entropy itself.
+/// The board decides what a new vault and a new backup get - as many passes as fit in
+/// about a second on its core - and hands it to `Device::new`.
+///
+/// The memory is what a small board can spare, not what a passphrase would like: 128 KiB
+/// fits in the cache of any desktop core, so it costs an attacker time, not the memory
+/// bandwidth Argon2 is meant to cost them. Against the PIN that changes nothing where a
+/// chip key is mixed in; without one, a copy of the flash is guessed at the speed of
+/// this cost alone. Against a stolen `.vkb` it is the whole defence, which is why the
+/// passphrase must carry the entropy itself.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Cost {
     pub m_kib: u32,
@@ -66,9 +79,6 @@ pub struct Cost {
 }
 
 impl Cost {
-    /// What a new vault gets: all the memory the board offers, and as many passes as
-    /// fit in about a second on the ESP32-C6 - 48 passes measured at 1.2 s there.
-    pub const CURRENT: Cost = Cost { m_kib: 128, t: 48 };
     /// The most this firmware will run whatever flash says: a tampered header must not
     /// be able to park the key for hours.
     pub const MAX: Cost = Cost { m_kib: 128, t: 256 };
@@ -89,7 +99,7 @@ impl Cost {
 
 const _: () = assert!(
     KDF_BLOCKS == Cost::MAX.m_kib as usize,
-    "the board's buffer must hold the largest cost this firmware accepts"
+    "the derivation's memory must hold the largest cost this firmware accepts"
 );
 
 /// `PIN_LEN` ASCII digits, checked once at the edge. Anything else is not a PIN and
@@ -202,22 +212,6 @@ pub fn derive<K: DeviceKey>(
     }
     hmac(&k.kek, b"vaultkey/dek/v1", &mut k.dek);
     Some(k)
-}
-
-/// What the chip key is asked to MAC for the auth key: 32 bytes, as `DeviceKey::mac`
-/// takes, and never an Argon2 output by any chance worth naming.
-const AUTH_LABEL: &[u8; 32] = b"vaultkey/auth-key/v1\0\0\0\0\0\0\0\0\0\0\0\0";
-
-/// The key auth secrets are sealed under: the chip key alone, no PIN, so a login
-/// answers a tap on a locked device and a flash dump without the chip opens nothing.
-/// None on a chip without a key - there it would be no key at all - or when the chip
-/// cannot use it.
-pub fn auth_key<K: DeviceKey>(key: &mut K) -> Option<Zeroizing<[u8; KEY_LEN]>> {
-    if !key.bound() {
-        return None;
-    }
-    let mut out = Zeroizing::new([0u8; KEY_LEN]);
-    key.mac(AUTH_LABEL, &mut out).then_some(out)
 }
 
 #[must_use]

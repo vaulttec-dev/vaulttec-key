@@ -1,0 +1,20 @@
+diff --git a/Makefile b/Makefile
+index 32359873934a..7c494ee9ccd7 100644
+--- a/Makefile
++++ b/Makefile
+@@ -302,12 +302,9 @@ endif
+
+ # Defined Symbol (MACROS)
+ CFLAGS += -D__HEAP_SIZE=0
+-CFLAGS += -DCONFIG_GPIO_AS_PINRESET
+-
+-# Skip defining CONFIG_NFCT_PINS_AS_GPIOS if the device uses the NFCT.
+-ifneq ($(USE_NFCT),yes)
+-  CFLAGS += -DCONFIG_NFCT_PINS_AS_GPIOS
+-endif
++# No CONFIG_GPIO_AS_PINRESET and no CONFIG_NFCT_PINS_AS_GPIOS: with either, nrfx's
++# SystemInit writes UICR (PSELRESET, NFCPINS) on the first boot. On a board with no SWD
++# probe that write is permanent, and PSELRESET on P0.18 makes the only button a reset pin.
+
+ CFLAGS += -DSOFTDEVICE_PRESENT
+ CFLAGS += -DUF2_VERSION_BASE='"$(GIT_VERSION)"'

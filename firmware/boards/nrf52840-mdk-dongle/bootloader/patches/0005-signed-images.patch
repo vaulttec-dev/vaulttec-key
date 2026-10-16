@@ -1,0 +1,391 @@
+diff --git a/Makefile b/Makefile
+index 625a1c8..27710bf 100644
+--- a/Makefile
++++ b/Makefile
+@@ -137,6 +137,13 @@ C_SRC += \
+ # all files in boards
+ C_SRC += src/boards/boards.c
+ 
++# The signature check every image passes before it runs or is copied: src/signature.c
++# over Monocypher's Ed25519
++C_SRC += src/signature.c
++C_SRC += lib/monocypher/src/monocypher.c
++C_SRC += lib/monocypher/src/optional/monocypher-ed25519.c
++IPATH += lib/monocypher/src lib/monocypher/src/optional
++
+ # nrfx
+ C_SRC += $(NRFX_PATH)/drivers/src/nrfx_power.c
+ C_SRC += $(NRFX_PATH)/drivers/src/nrfx_nvmc.c
+diff --git a/lib/sdk11/components/libraries/bootloader_dfu/bootloader.c b/lib/sdk11/components/libraries/bootloader_dfu/bootloader.c
+index fe321ce..97a4999 100644
+--- a/lib/sdk11/components/libraries/bootloader_dfu/bootloader.c
++++ b/lib/sdk11/components/libraries/bootloader_dfu/bootloader.c
+@@ -31,6 +31,7 @@
+ #include "app_timer.h"
+ 
+ #include "boards.h"
++#include "signature.h"
+ 
+ #ifdef NRF_USBD
+ #include "tusb.h"
+@@ -138,40 +139,12 @@ static void wait_for_events(void)
+ }
+ 
+ 
++// Valid means signed, checked now, on every boot: a torn or unsigned upload never runs,
++// and no "valid" flag in the settings page is trusted.
+ bool bootloader_app_is_valid(void)
+ {
+-  bool success = false;
+-  uint32_t const app_addr = DFU_BANK_0_REGION_START;
+-
+-  bootloader_settings_t const *p_bootloader_settings;
+-  bootloader_util_settings_get(&p_bootloader_settings);
+-
+-  enum { EMPTY_FLASH = 0xFFFFFFFFUL };
+-
+-  // Application is invalid if first 2 words are all 0xFFFFFFF
+-  if ( *((uint32_t *)app_addr    ) == EMPTY_FLASH &&
+-       *((uint32_t *)(app_addr+4)) == EMPTY_FLASH )
+-  {
+-    return false;
+-  }
+-
+-  // The application in CODE region 1 is flagged as valid during update.
+-  if ( p_bootloader_settings->bank_0 == BANK_VALID_APP )
+-  {
+-    uint16_t image_crc = 0;
+-
+-    // A stored crc value of 0 indicates that CRC checking is not used.
+-    if ( p_bootloader_settings->bank_0_crc != 0 )
+-    {
+-      image_crc = crc16_compute((uint8_t*) app_addr,
+-                                p_bootloader_settings->bank_0_size,
+-                                NULL);
+-    }
+-
+-    success = (image_crc == p_bootloader_settings->bank_0_crc);
+-  }
+-
+-  return success;
++  return signature_valid((uint8_t const *) MBR_SIZE, (uint8_t const *) BOARD_APP_SLOT,
++                         SIGNATURE_KIND_APP, BOARD_APP_SLOT - MBR_SIZE, false);
+ }
+ 
+ 
+@@ -256,29 +229,17 @@ void bootloader_app_start(void)
+   NVIC->ICPR[1]=0xFFFFFFFF;
+ #endif
+ 
+-  uint32_t fwd_ret;
+-  uint32_t app_addr;
+-
+-  if ( is_sd_existed() )
++  // The app starts right after the MBR, always: there is no SoftDevice on this board,
++  // and asking the app region whether there is one would let unsigned bytes pick the
++  // address jumped to.
++  uint32_t const app_addr = MBR_SIZE;
++  sd_mbr_command_t command =
+   {
+-    PRINTF("SoftDevice exist\r\n");
+-    // App starts after SoftDevice
+-    app_addr = SD_SIZE_GET(MBR_SIZE);
+-    fwd_ret = sd_softdevice_vector_table_base_set(app_addr);
+-  }else
+-  {
+-    PRINTF("SoftDevice not exist\r\n");
+-
+-    // App starts right after MBR
+-    app_addr = MBR_SIZE;
+-    sd_mbr_command_t command =
+-    {
+-      .command = SD_MBR_COMMAND_IRQ_FORWARD_ADDRESS_SET,
+-      .params.irq_forward_address_set.address = app_addr,
+-    };
++    .command = SD_MBR_COMMAND_IRQ_FORWARD_ADDRESS_SET,
++    .params.irq_forward_address_set.address = app_addr,
++  };
+ 
+-    fwd_ret = sd_mbr_command(&command);
+-  }
++  uint32_t const fwd_ret = sd_mbr_command(&command);
+ 
+   // unlikely failed to forward vector table, manually set forward address
+   if ( fwd_ret != NRF_SUCCESS )
+diff --git a/src/main.c b/src/main.c
+index c72cf43..050c27a 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -108,15 +108,7 @@ extern void tusb_hal_nrf_power_event(uint32_t event);
+ //--------------------------------------------------------------------+
+ //
+ //--------------------------------------------------------------------+
+-static void check_dfu_mode(void);
+-
+-// The SoftDevice must only be initialized if a chip reset has occurred.
+-// Soft reset (jump ) from application must not reinitialize the SoftDevice.
+-static void mbr_init_sd(void) {
+-  PRINTF("SD_MBR_COMMAND_INIT_SD\r\n");
+-  sd_mbr_command_t com = {.command = SD_MBR_COMMAND_INIT_SD};
+-  sd_mbr_command(&com);
+-}
++static void dfu_mode(bool asked_by_app);
+ 
+ //--------------------------------------------------------------------+
+ //
+@@ -136,59 +128,38 @@ int main(void) {
+   PRINTF("Bootloader Start\r\n");
+   led_state(STATE_BOOTLOADER_STARTED);
+ 
+-  // Check all inputs and enter DFU if needed
+-  // Return when DFU process is complete (or not entered at all)
+-  check_dfu_mode();
+-
+-  // Reset peripherals
+-  board_teardown();
+-
+-  /* Jump to application if valid
+-   * "Master Boot Record and SoftDevice initializaton procedure"
+-   * - SD_MBR_COMMAND_INIT_SD (if not already)
+-   * - sd_softdevice_disable()
+-   * - sd_softdevice_vector_table_base_set(APP_ADDR)
+-   * - jump to App reset
+-   */
+-  if (bootloader_app_is_valid()) {
+-    PRINTF("App is valid\r\n");
+-    if (is_sd_existed()) {
+-      // MBR forward IRQ to SD
+-      mbr_init_sd();
+-
+-      // Make sure SD is disabled
+-      sd_softdevice_disable();
+-    }
+-
+-    // start application
+-    bootloader_app_start();
+-  }
+-
+-  NVIC_SystemReset();
+-}
+-
+-static void check_dfu_mode(void) {
+   // The application asked for DFU mode: clear the request, so the next reset boots it
+   bool const uf2_dfu = (NRF_POWER->GPREGRET == DFU_MAGIC_UF2_RESET);
+   if (uf2_dfu) NRF_POWER->GPREGRET = 0;
+ 
+-  bool const dfu_start = uf2_dfu || button_pressed(BUTTON_DFU);
+-  bool const valid_app = bootloader_app_is_valid();
++  // The signature is checked once, here, and nothing writes flash between this check
++  // and the jump below. DFU mode writes flash, so it always ends in a reset, and the
++  // next boot checks again.
++  if (uf2_dfu || button_pressed(BUTTON_DFU) || !bootloader_app_is_valid()) {
++    dfu_mode(uf2_dfu);
++    NVIC_SystemReset();
++  }
+ 
+-  if (dfu_start || !valid_app) {
+-    led_state(STATE_USB_UNMOUNTED);
+-    usb_init();
++  // Reset peripherals, then the application (no SoftDevice on this board)
++  board_teardown();
++  bootloader_app_start();
+ 
+-    if (uf2_dfu) {
+-      // If USB is not enumerated in 3s (eg. because we're running on battery), we restart into app.
+-      bootloader_dfu_start(3000, true);
+-    } else {
+-      // No timeout when a person asked (the button) or there is nothing valid to boot.
+-      bootloader_dfu_start(0, false);
+-    }
++  NVIC_SystemReset();
++}
++
++static void dfu_mode(bool asked_by_app) {
++  led_state(STATE_USB_UNMOUNTED);
++  usb_init();
+ 
+-    usb_teardown();
++  if (asked_by_app) {
++    // If USB is not enumerated in 3s (eg. because we're running on battery), we restart into app.
++    bootloader_dfu_start(3000, true);
++  } else {
++    // No timeout when a person asked (the button) or there is nothing valid to boot.
++    bootloader_dfu_start(0, false);
+   }
++
++  usb_teardown();
+ }
+ 
+ //--------------------------------------------------------------------+
+diff --git a/src/usb/msc_uf2.c b/src/usb/msc_uf2.c
+index 4b6817f..0edd872 100644
+--- a/src/usb/msc_uf2.c
++++ b/src/usb/msc_uf2.c
+@@ -28,6 +28,7 @@
+ #if CFG_TUD_MSC
+ 
+ #include "bootloader.h"
++#include "signature.h"
+ 
+ /*------------------------------------------------------------------*/
+ /* MACRO TYPEDEF CONSTANT ENUM
+@@ -198,11 +199,20 @@ void tud_msc_write10_complete_cb(uint8_t lun)
+ 
+         // Location of current stored new bootloader
+         uint32_t * new_bootloader = (uint32_t *) BOOTLOADER_ADDR_NEW_RECIEVED;
++        uint8_t const * staged = (uint8_t const *) new_bootloader;
++        uint32_t const signed_length = DFU_BL_IMAGE_MAX_SIZE - SIGNATURE_SLOT_SIZE;
+ 
+         PRINT_HEX(new_bootloader);
+ 
++        // Copied only if signed under the key this bootloader carries, over everything
++        // the MBR copies but the slot; the slot's own unsigned tail must be erased.
++        if ( !signature_valid(staged, staged + signed_length, SIGNATURE_KIND_BOOTLOADER,
++                              signed_length, true) )
++        {
++          PRINTF("bootloader update is not signed\r\n");
++        }
+         // skip if there is no bootloader change
+-        if ( memcmp(new_bootloader, (uint8_t*) BOOTLOADER_ADDR_START, DFU_BL_IMAGE_MAX_SIZE) )
++        else if ( memcmp(new_bootloader, (uint8_t*) BOOTLOADER_ADDR_START, DFU_BL_IMAGE_MAX_SIZE) )
+         {
+           PRINTF("Coyping new bootloader\r\n");
+ 
+diff --git a/src/usb/uf2/ghostfat.c b/src/usb/uf2/ghostfat.c
+index 7f1bbab..dc00338 100644
+--- a/src/usb/uf2/ghostfat.c
++++ b/src/usb/uf2/ghostfat.c
+@@ -35,6 +35,7 @@
+ 
+ #include "bootloader_settings.h"
+ #include "bootloader.h"
++#include "signing_key.h"
+ 
+ //--------------------------------------------------------------------+
+ //
+@@ -117,11 +118,14 @@ STATIC_ASSERT(FAT_ENTRIES_PER_SECTOR                       ==       256); // FAT
+ #define STR0(x) #x
+ #define STR(x) STR0(x)
+ 
+-char infoUf2File[128*3] =
++// The key's fingerprint tells a board running a test-key build from one running the
++// real key; there is no SoftDevice line, since there is no SoftDevice.
++static char const infoUf2File[] =
+     "UF2 Bootloader " UF2_VERSION "\r\n"
+     "Model: " UF2_PRODUCT_NAME "\r\n"
+     "Board-ID: " UF2_BOARD_ID "\r\n"
+-    "Date: " __DATE__ "\r\n";
++    "Date: " __DATE__ "\r\n"
++    "Key: " SIGNING_KEY_FINGERPRINT "\r\n";
+ 
+ const char indexFile[] =
+     "<!doctype html>\n"
+@@ -231,43 +235,6 @@ static inline bool in_uicr_space(uint32_t addr)
+ //
+ //--------------------------------------------------------------------+
+ 
+-void uf2_init(void)
+-{
+-  strcat(infoUf2File, "SoftDevice: ");
+-
+-  if ( is_sd_existed() )
+-  {
+-    uint32_t const sd_id      = SD_ID_GET(MBR_SIZE);
+-    uint32_t const sd_version = SD_VERSION_GET(MBR_SIZE);
+-
+-    uint32_t ver[3];
+-    ver[0] = sd_version / 1000000;
+-    ver[1] = (sd_version - ver[0]*1000000)/1000;
+-    ver[2] = (sd_version - ver[0]*1000000 - ver[1]*1000);
+-
+-    char str[10];
+-    utoa(sd_id, str, 10);
+-
+-    strcat(infoUf2File, "S");
+-    strcat(infoUf2File, str);
+-    strcat(infoUf2File, " ");
+-
+-    utoa(ver[0], str, 10);
+-    strcat(infoUf2File, str);
+-    strcat(infoUf2File, ".");
+-
+-    utoa(ver[1], str, 10);
+-    strcat(infoUf2File, str);
+-    strcat(infoUf2File, ".");
+-
+-    utoa(ver[2], str, 10);
+-    strcat(infoUf2File, str);
+-    strcat(infoUf2File, "\r\n");
+-  }else
+-  {
+-    strcat(infoUf2File, "not found\r\n");
+-  }
+-}
+ 
+ /*------------------------------------------------------------------*/
+ /* Read the drive: boot block, FAT, root directory, the text files
+diff --git a/src/usb/uf2/uf2.h b/src/usb/uf2/uf2.h
+index 081280c..8c985ce 100644
+--- a/src/usb/uf2/uf2.h
++++ b/src/usb/uf2/uf2.h
+@@ -79,6 +79,5 @@ typedef struct {
+     uint32_t magicEnd;
+ } UF2_Block;
+ 
+-void uf2_init(void);
+ 
+ #endif
+diff --git a/src/usb/usb.c b/src/usb/usb.c
+index c4f6f5c..c1e41f2 100644
+--- a/src/usb/usb.c
++++ b/src/usb/usb.c
+@@ -58,32 +58,18 @@ void usb_init(void) {
+   NVIC_SetPriority(USBD_IRQn, 2);
+ 
+   // USB power may already be ready at this time -> no event generated
+-  // We need to invoke the handler based on the status initially
+-  uint32_t usb_reg;
+-  uint8_t sd_en = false;
++  // We need to invoke the handler based on the status initially. No SoftDevice on this
++  // board: the power events come from nrfx directly.
++  const nrfx_power_config_t pwr_cfg = {0};
++  nrfx_power_init(&pwr_cfg);
+ 
+-  if (is_sd_existed()) {
+-    sd_softdevice_is_enabled(&sd_en);
+-  }
+-
+-  if (sd_en) {
+-    sd_power_usbdetected_enable(true);
+-    sd_power_usbpwrrdy_enable(true);
+-    sd_power_usbremoved_enable(true);
+-    sd_power_usbregstatus_get(&usb_reg);
+-  } else {
+-    // Power module init
+-    const nrfx_power_config_t pwr_cfg = {0};
+-    nrfx_power_init(&pwr_cfg);
++  // Register USB power handler
++  const nrfx_power_usbevt_config_t config = {.handler = power_event_handler};
++  nrfx_power_usbevt_init(&config);
+ 
+-    // Register USB power handler
+-    const nrfx_power_usbevt_config_t config = {.handler = power_event_handler};
+-    nrfx_power_usbevt_init(&config);
++  nrfx_power_usbevt_enable();
+ 
+-    nrfx_power_usbevt_enable();
+-
+-    usb_reg = NRF_POWER->USBREGSTATUS;
+-  }
++  uint32_t const usb_reg = NRF_POWER->USBREGSTATUS;
+ 
+   if (usb_reg & POWER_USBREGSTATUS_VBUSDETECT_Msk) {
+     tusb_hal_nrf_power_event(NRFX_POWER_USB_EVT_DETECTED);
+@@ -94,7 +80,6 @@ void usb_init(void) {
+   }
+ 
+   usb_desc_init();
+-  uf2_init();
+   tusb_init();
+ 
+   #ifdef DISPLAY_PIN_SCK

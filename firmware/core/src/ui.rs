@@ -5,12 +5,17 @@
 //! exists to stop.
 //!
 //! There are three gestures, and the differences are the point. A code or a password
-//! is approved by a tap while the light is amber. The wipe needs five seconds of red.
+//! is approved by a tap while the light is amber. The wipe needs five seconds of red,
+//! and so does a restore, which replaces everything as a wipe does.
 //! A backup - every secret leaving at once, sealed - needs two taps in a row while
 //! the light is blue. Without that split the button would guard nothing against a
 //! hostile host: it would ask for a wipe while the owner expected a code request, and
 //! the reflex that approves a code would hand it over. A tap never wipes and never
 //! exports; a hold never exports either, and two taps never wipe.
+//!
+//! A request can be withdrawn while it waits (`Ui::withdrawn`, a passkey request the
+//! host cancels). That ends the wait the way its deadline would - refused - and never
+//! counts as a press or a hold.
 
 use crate::hal::{Clock, Ui};
 
@@ -70,20 +75,25 @@ pub fn await_double_tap<U: Ui, C: Clock>(ui: &mut U, clock: &C, timeout_ms: u64)
     finish(ui, clock, true)
 }
 
-/// Waits for a press that survives the debounce. False if the deadline passes first.
+/// Waits for a press that survives the debounce. False if the wait is over first.
 fn await_press<U: Ui, C: Clock>(ui: &U, clock: &C, deadline: u64) -> bool {
     loop {
-        if clock.now_ms() > deadline {
+        if over(ui, clock, deadline) {
             return false;
         }
         if ui.pressed() {
             let t = clock.now_ms();
             while clock.now_ms() - t < DEBOUNCE_MS {}
-            if ui.pressed() {
+            if ui.pressed() && !ui.withdrawn() {
                 return true;
             }
         }
     }
+}
+
+/// Whether a wait is over: its deadline has passed, or the request was withdrawn.
+fn over<U: Ui, C: Clock>(ui: &U, clock: &C, deadline: u64) -> bool {
+    ui.withdrawn() || clock.now_ms() > deadline
 }
 
 /// Blocks until the button has been held down for `hold_ms` without letting go, or the
@@ -95,13 +105,18 @@ pub fn await_hold<U: Ui, C: Clock>(ui: &mut U, clock: &C, timeout_ms: u64, hold_
     if !await_release(ui, clock, deadline) {
         return finish(ui, clock, false);
     }
-    while clock.now_ms() <= deadline {
+    while !over(ui, clock, deadline) {
         if !ui.pressed() {
             continue;
         }
         ui.set(State::Danger);
         let start = clock.now_ms();
         while !released(ui, clock) {
+            // Asked before the time is counted: a request withdrawn mid-hold ends it,
+            // and must never be the moment that completes it.
+            if ui.withdrawn() {
+                break;
+            }
             if clock.now_ms() - start >= hold_ms {
                 // The release too, so one hold cannot confirm twice.
                 await_release(ui, clock, deadline);
@@ -124,10 +139,12 @@ fn released<U: Ui, C: Clock>(ui: &U, clock: &C) -> bool {
     !ui.pressed()
 }
 
-/// Waits out a button that is already down. False if the deadline passes first.
+/// Waits out a button that is down, until it has been up long enough to be really up:
+/// a bounce in the middle of one press is not a release, or that press would count as
+/// two taps, and two taps at blue let a backup out. False if the wait is over first.
 fn await_release<U: Ui, C: Clock>(ui: &U, clock: &C, deadline: u64) -> bool {
-    while ui.pressed() {
-        if clock.now_ms() > deadline {
+    while !released(ui, clock) {
+        if over(ui, clock, deadline) {
             return false;
         }
     }

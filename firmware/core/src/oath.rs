@@ -15,9 +15,6 @@ use zeroize::Zeroizing;
 use crate::vault::OVERHEAD;
 
 pub const NAME_MAX: usize = 32;
-/// An auth secret is an Ed25519 seed, exactly this long: the host draws it, keeps the
-/// public key and forgets the seed.
-pub const AUTH_SECRET_LEN: usize = 32;
 
 /// The HMAC hash, numbered as the wire and the flash spell it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

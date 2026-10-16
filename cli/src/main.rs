@@ -11,7 +11,7 @@
 //! vkey backup vault.vkb                   # everything into one file, sealed on the key; two taps
 //! vkey restore vault.vkb                  # everything back, onto this or another key
 //! vkey check --wipe-everything            # lifecycle test; ERASES the device
-//! sudo vkey auth enable                   # sudo and the lock screen with a tap
+//! sudo vkey auth enable                   # sudo and the lock screen with a tap (pam_u2f)
 //! vkey install                            # copy this binary to ~/.local/bin
 //! ```
 //!
@@ -24,11 +24,15 @@ mod auth;
 mod backup;
 mod boards;
 mod check;
+mod commits;
 mod device;
+mod fido;
+mod file;
 mod import;
 mod install;
 mod item;
 mod op;
+mod passkeys;
 mod prompt;
 mod setup;
 mod shell;
@@ -177,6 +181,10 @@ enum Cmd {
         /// 1Password Developer Environment to import (name:id or name=id)
         #[arg(short = 'E', long = "environment")]
         environments: Vec<String>,
+        /// Only these items out of a .vkb, added beside what the key holds; nothing
+        /// else is replaced
+        #[arg(long = "only", value_name = "NAME")]
+        only: Vec<String>,
     },
     /// Lifecycle test of a development board; ERASES everything
     #[command(long_about = "vkey check --wipe-everything\n\n\
@@ -188,21 +196,53 @@ enum Cmd {
         #[arg(long)]
         wipe_everything: bool,
     },
-    /// sudo and the lock screen with a tap: `sudo vkey auth enable`; bare, what PAM runs
+    /// sudo and the lock screen with a tap, through `pam_u2f`: `sudo vkey auth enable`
     Auth {
         #[command(subcommand)]
-        cmd: Option<AuthCmd>,
+        cmd: AuthCmd,
+    },
+    /// Every git commit signed with a tap: an SSH key on the key, git told to use it
+    Commits {
+        #[command(subcommand)]
+        cmd: CommitsCmd,
+    },
+    /// The passkeys the key keeps, under its FIDO PIN (not vkey's PIN)
+    Passkey {
+        #[command(subcommand)]
+        cmd: PasskeyCmd,
     },
     /// Copy this binary to ~/.local/bin/vkey
     Install,
 }
 
 #[derive(Subcommand, Clone, Copy)]
-enum AuthCmd {
-    /// A login secret on the key, its public key here, and the PAM lines for sudo and
-    /// the lock screen; PIN and a tap
+enum PasskeyCmd {
+    /// Site and account of every passkey on the key
+    List,
+    /// One passkey erased from the key, picked from the list
+    Rm,
+    /// The FIDO PIN set, or changed
+    Pin,
+}
+
+#[derive(Subcommand, Clone, Copy)]
+enum CommitsCmd {
+    /// An SSH key on the key (a tap, once), git set to sign every commit with it, and
+    /// its public half offered to GitHub as a signing key
     Enable,
-    /// The PAM lines out, the public key and the login secret gone
+    /// git stops signing; the key stays for the next enable
+    Disable,
+    /// The signing key on GitHub, so the commits show as verified; signs gh in, or
+    /// gives it the permission, in the browser when it has to
+    Github,
+}
+
+#[derive(Subcommand, Clone, Copy)]
+enum AuthCmd {
+    /// A credential on the key for this host's logins (a tap), its public half in
+    /// `/etc/u2f_mappings`, and the `pam_u2f` line for sudo and the lock screen
+    Enable,
+    /// The `pam_u2f` lines out and the user out of `/etc/u2f_mappings`
     Disable,
 }
 
@@ -289,17 +329,41 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<u8, Error> {
-    match cli.cmd {
-        Some(Cmd::Install) => return install::install().map(|()| 0),
-        Some(Cmd::Setup { erase, board }) => {
-            return cmd_setup(cli.port.as_deref(), board.as_deref(), erase);
-        }
-        // What PAM runs: straight to the key, no probing, no shell on the way.
-        Some(Cmd::Auth { cmd: None }) => return auth::verify(cli.port.as_deref()),
-        _ => {}
-    }
+/// The commands that do not talk to vkey's port: installing, flashing, and what reaches
+/// the key over FIDO. None for every other command.
+fn run_off_port(cli: &Cli) -> Option<Result<u8, Error>> {
+    Some(match cli.cmd.as_ref()? {
+        Cmd::Install => install::install().map(|()| 0),
+        // The enrolment and ssh-keygen talk to the key over FIDO themselves.
+        Cmd::Auth {
+            cmd: AuthCmd::Enable,
+        } => auth::enable(),
+        Cmd::Auth {
+            cmd: AuthCmd::Disable,
+        } => auth::disable(),
+        Cmd::Commits {
+            cmd: CommitsCmd::Enable,
+        } => commits::enable(),
+        Cmd::Commits {
+            cmd: CommitsCmd::Disable,
+        } => commits::disable(),
+        Cmd::Commits {
+            cmd: CommitsCmd::Github,
+        } => commits::github(),
+        Cmd::Passkey { cmd } => match cmd {
+            PasskeyCmd::List => passkeys::list(),
+            PasskeyCmd::Rm => passkeys::rm(),
+            PasskeyCmd::Pin => passkeys::pin(),
+        },
+        Cmd::Setup { erase, board } => cmd_setup(cli.port.as_deref(), board.as_deref(), *erase),
+        _ => return None,
+    })
+}
 
+fn run(cli: Cli) -> Result<u8, Error> {
+    if let Some(done) = run_off_port(&cli) {
+        return done;
+    }
     let mut dev = Device::open(cli.port.as_deref())?;
     let version = dev.probe();
     let Some(cmd) = cli.cmd else {
@@ -313,15 +377,13 @@ fn run(cli: Cli) -> Result<u8, Error> {
     };
 
     match cmd {
-        Cmd::Install | Cmd::Setup { .. } | Cmd::Auth { cmd: None } => {
+        Cmd::Install
+        | Cmd::Setup { .. }
+        | Cmd::Auth { .. }
+        | Cmd::Commits { .. }
+        | Cmd::Passkey { .. } => {
             unreachable!("handled above")
         }
-        Cmd::Auth {
-            cmd: Some(AuthCmd::Enable),
-        } => auth::enable(&mut dev),
-        Cmd::Auth {
-            cmd: Some(AuthCmd::Disable),
-        } => auth::disable(&mut dev),
 
         Cmd::Info => run_info(&mut dev, &version),
 
@@ -347,20 +409,7 @@ fn run(cli: Cli) -> Result<u8, Error> {
             Ok(0)
         }
 
-        Cmd::Wipe { yes } => {
-            if !confirm("wipe every secret and the PIN from this key?", yes)? {
-                println!("kept");
-                return Ok(0);
-            }
-            eprintln!(
-                "hold {} on the board down for five seconds - the light turns red...",
-                boards::button(Some(&version))
-            );
-            dev.wipe()?;
-            sources::forget_all();
-            println!("wiped: no PIN, no credentials - run  vkey pin set  or /pin");
-            Ok(0)
-        }
+        Cmd::Wipe { yes } => run_wipe(&mut dev, &version, yes),
 
         Cmd::Check { wipe_everything } => {
             if !wipe_everything {
@@ -399,8 +448,31 @@ fn run(cli: Cli) -> Result<u8, Error> {
             file,
             op,
             environments,
-        } => run_restore(&mut dev, file.as_deref(), op, &environments),
+            only,
+        } => run_restore(
+            &mut dev,
+            &version,
+            file.as_deref(),
+            op,
+            &environments,
+            &only,
+        ),
     }
+}
+
+fn run_wipe(dev: &mut Device, version: &str, yes: bool) -> Result<u8, Error> {
+    if !confirm("wipe every secret and the PIN from this key?", yes)? {
+        println!("kept");
+        return Ok(0);
+    }
+    eprintln!(
+        "hold {} on the board down for five seconds - the light turns red...",
+        boards::button(Some(version))
+    );
+    dev.wipe()?;
+    sources::forget_all();
+    println!("wiped: no PIN, no credentials - run  vkey pin set  or /pin");
+    Ok(0)
 }
 
 fn run_list(dev: &mut Device, long: bool) -> Result<u8, Error> {
@@ -414,11 +486,7 @@ fn run_list(dev: &mut Device, long: bool) -> Result<u8, Error> {
             continue;
         }
         // The open reach costs the PIN and no gesture, so a whole vault can be listed
-        // this way; an auth item refuses to be read at all and is reported as it lists.
-        if e.category == Category::Auth {
-            println!("{}\t{}\t\t", e.name, item::category_name(e.category));
-            continue;
-        }
+        // this way.
         let (open, shape) = dev.get_with_shape(&e.name, Reach::Open)?;
         let login = open
             .by_label("username")
@@ -446,6 +514,9 @@ fn run_info(dev: &mut Device, version: &str) -> Result<u8, Error> {
     let st = dev.pin_status()?;
     println!("port:    {}", dev.path);
     println!("device:  {version}");
+    for line in dev.chip_report()? {
+        println!("chip:    {line}");
+    }
     println!(
         "pin:     {}, {}, {} attempts left",
         if st.has_pin { "set" } else { "NOT SET" },
@@ -486,8 +557,8 @@ fn run_backup(dev: &mut Device, version: &str, file: &Path) -> Result<u8, Error>
         backup::export(d, &file, passphrase(&pass)?)
     })?;
     println!(
-        "{n} item{} sealed into {} - it opens only with the passphrase, on any vkey",
-        if n == 1 { "" } else { "s" },
+        "{} sealed into {} - it opens only with the passphrase, on any vkey",
+        n.describe(),
         file.display()
     );
     Ok(0)
@@ -500,12 +571,35 @@ enum RestoreSource {
     Backup,
 }
 
+/// `vkey restore --only NAME file.vkb`: those items added, the rest of the key as it was.
+fn run_pick(dev: &mut Device, file: &Path, names: &[String]) -> Result<u8, Error> {
+    let file = backup::source(file)?;
+    let pass = prompt_secret("backup passphrase")?;
+    passphrase(&pass)?;
+    let added = with_unlock(dev, |d| backup::pick(d, &file, passphrase(&pass)?, names))?;
+    for name in &added {
+        println!("added '{name}' from {}", file.display());
+    }
+    println!("nothing else on the key changed");
+    Ok(0)
+}
+
 fn run_restore(
     dev: &mut Device,
+    version: &str,
     file: Option<&Path>,
     op: bool,
     environments: &[String],
+    only: &[String],
 ) -> Result<u8, Error> {
+    if !only.is_empty() {
+        let Some(file) = file else {
+            return Err(Error::Value(
+                "--only takes items out of a .vkb: name the file".into(),
+            ));
+        };
+        return run_pick(dev, file, only);
+    }
     if op {
         return run_op(dev, None, None, None, environments, false);
     }
@@ -565,15 +659,32 @@ fn run_restore(
     let file = backup::source(&file)?;
     let pass = prompt_secret("backup passphrase")?;
     passphrase(&pass)?;
-    let done = with_unlock(dev, |d| backup::import(d, &file, passphrase(&pass)?))?;
+    let button = boards::button(Some(version));
+    let done = with_unlock(dev, |d| {
+        eprintln!(
+            "a restore replaces everything on the key: hold {button} on the board down for \
+             five seconds - the light turns red..."
+        );
+        backup::import(d, &file, passphrase(&pass)?)
+    })?;
     println!(
-        "{} item{} restored from {}",
+        "{} item{}{} restored from {}",
         done.count,
         if done.count == 1 { "" } else { "s" },
+        if done.passkeys {
+            " and the passkeys"
+        } else {
+            ""
+        },
         file.display()
     );
     for line in &done.skipped {
         eprintln!("  left in the file: {line}");
+    }
+    if done.passkeys {
+        println!("if a passkey changed, the key restarts to load them...");
+        // Past the reset, so a command run right after does not land in it.
+        std::thread::sleep(std::time::Duration::from_secs(3));
     }
     Ok(0)
 }
@@ -638,19 +749,22 @@ fn run_op(
         }
     }
 
-    if item.is_none() && env_pairs.is_empty() && prompt::is_tty() {
-        println!("  ● 1Password Developer Environments (.env)");
-        if !saved.is_empty() {
-            println!("    Saved environments:");
-            for (name, id) in &saved {
+    // `op` cannot list Developer Environments, so the saved ones are the whole known set:
+    // a run that names none takes all of them, and a new one is only ever added. One
+    // that names only unknown ones takes none, not all.
+    if item.is_none() && environments.is_empty() {
+        env_pairs.extend(saved);
+        env_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        if prompt::is_tty() {
+            println!("  ● 1Password Developer Environments (.env)");
+            for (name, id) in &env_pairs {
                 println!("      • {name} (ID: {id})");
             }
-            if prompt::yes_no("update saved environments?") {
-                env_pairs.extend(saved);
-            }
         }
-
-        if env_pairs.is_empty() {
+        // With some saved, the run just takes them; a new one comes in through -E.
+        if !env_pairs.is_empty() && prompt::is_tty() {
+            println!("    (another one: vkey op -E name:ID)");
+        } else if prompt::is_tty() {
             println!(
                 "    (in 1Password: Developer -> View Environments -> View environment -> Manage environment -> Copy environment ID)"
             );
@@ -675,7 +789,9 @@ fn run_op(
                     }
                     (trimmed.to_string(), id_trimmed)
                 };
-                env_pairs.push((name, id));
+                if !env_pairs.iter().any(|(n, _)| *n == name) {
+                    env_pairs.push((name, id));
+                }
             }
         }
     }
@@ -799,9 +915,6 @@ fn run_get(dev: &mut Device, version: &str, name: &str, copy: bool) -> Result<u8
             .find(|e| e.name == name)
             .ok_or(Error::NotFound)
     })?;
-    if stored.category == Category::Auth {
-        return Err(Error::Value(auth::USED_BY_AUTH.into()));
-    }
 
     let (open, shape) = dev.get_with_shape(name, Reach::Open)?;
 

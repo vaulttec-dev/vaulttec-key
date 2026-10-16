@@ -4,8 +4,8 @@
 # the hook at the first failure and says what to do.
 #
 #   pre-commit   fmt, clippy, rustdoc, tests, shellcheck, mypy, lint tables, no radio,
-#                forbidden marketing claims, and the firmware image must be the one
-#                these sources build
+#                forbidden marketing claims, the firmware image must be the one these
+#                sources build, and every signed image must be signed from it
 #   pre-push     the same on a clean tree and only for HEAD, so what is pushed is what
 #                was checked
 #
@@ -67,11 +67,20 @@ check_scripts() {
 }
 
 check_lint_tables() {
-    step "the [lints] tables of firmware/ and cli/ are identical"
-    local a b
+    step "the [lints] tables of firmware/, cli/ and every board with its own are identical"
+    local a b d
     a=$(sed -n '/^\[workspace\.lints\.rust\]/,$p' "$ROOT/firmware/Cargo.toml" | sed 's/^\[workspace\.lints\./[lints./')
     b=$(sed -n '/^\[lints\.rust\]/,$p' "$ROOT/cli/Cargo.toml")
     diff <(echo "$a") <(echo "$b") || fail "the [lints] tables differ - one strictness for both crates"
+    # A board whose flash driver needs memory-mapped flash as a slice carries its own
+    # copy, identical but for `unsafe_code = "deny"`, so that one place can say why
+    # with #[expect]. Nothing else may differ.
+    for d in $(boards); do
+        grep -q '^\[lints\.rust\]' "$d/Cargo.toml" || continue
+        b=$(sed -n '/^\[lints\.rust\]/,$p' "$d/Cargo.toml")
+        diff <(echo "${a//unsafe_code = \"forbid\"/unsafe_code = \"deny\"}") <(echo "$b") \
+            || fail "$(basename "$d"): its [lints] table differs from the workspace's in more than unsafe_code"
+    done
 }
 
 check_no_radio() {
@@ -129,6 +138,59 @@ check_signed_images() {
     done
 }
 
+# A board's UF2 bootloader fork runs only images signed with one Ed25519 key, whose
+# public half the board commits as bootloader/signing-key.pem. Checked without the
+# secret: that file is a public key and nothing more, every signed UF2 is its unsigned
+# twin plus a slot whose signature verifies under it, and a bootloader.bin trusts that
+# key and not a test one - installed, a bootloader trusting the wrong key freezes the board.
+check_signed_uf2() {
+    step "signed UF2s match their unsigned twins and bootloader/signing-key.pem"
+    local pem dir name signed plain kind tmp fp ok
+    # Driven by the UF2s too: a key taken away must not silently end their check.
+    for signed in "$ROOT"/firmware/boards/*/images/*.signed.uf2; do
+        [[ -f "$signed" ]] || continue
+        dir="$(dirname "$(dirname "$signed")")"
+        [[ -f "$dir/bootloader/signing-key.pem" ]] \
+            || fail "$(basename "$dir"): $(basename "$signed") has no bootloader/signing-key.pem to verify it under"
+    done
+    for pem in "$ROOT"/firmware/boards/*/bootloader/signing-key.pem; do
+        [[ -f "$pem" ]] || continue
+        dir="$(dirname "$(dirname "$pem")")"
+        name="$(basename "$dir")"
+        # A file equal to its own public re-encoding holds no private key.
+        if [[ "$(openssl pkey -pubin -in "$pem" -noout -text 2>/dev/null)" != "ED25519 Public-Key:"* ]] \
+            || ! openssl pkey -pubin -in "$pem" 2>/dev/null | cmp -s - "$pem"; then
+            fail "$name: bootloader/signing-key.pem must be an Ed25519 public key and nothing else"
+        fi
+        [[ -f "$dir/images/vaultkey.signed.uf2" ]] \
+            || fail "$name: no images/vaultkey.signed.uf2:  bootloader/sign-vaultkey.sh"
+        for signed in "$dir"/images/*.signed.uf2; do
+            plain="${signed%.signed.uf2}.bin"
+            case "$(basename "$plain")" in
+                vaultkey.bin) kind=app ;;
+                bootloader.bin) kind=bootloader ;;
+                *) fail "$name: $(basename "$signed") is neither the app nor the bootloader" ;;
+            esac
+            [[ -f "$plain" ]] || fail "$name: $(basename "$signed") has no unsigned twin"
+            tmp="$(mktemp -d)"
+            ok=0
+            if python3 -I "$dir/bootloader/signed_image.py" verify "$kind" "$plain" "$signed" "$tmp" >/dev/null 2>&1 \
+                && openssl pkeyutl -verify -pubin -inkey "$pem" -rawin -in "$tmp/message" \
+                    -sigfile "$tmp/signature" >/dev/null 2>&1; then
+                ok=1
+            fi
+            rm -rf "$tmp"
+            ((ok)) || fail "$name: $(basename "$signed") is stale or not signed by bootloader/signing-key.pem:  bootloader/sign-vaultkey.sh"
+        done
+        [[ -f "$dir/images/bootloader.bin" ]] || continue
+        # INFO_UF2.TXT names the key the build compiled in; a test key's line goes on
+        # with " TEST KEY" before it ends.
+        fp="$(openssl pkey -pubin -in "$pem" -outform DER | tail -c 32 | sha256sum | cut -c1-16)"
+        grep -qa "^Key: $fp"$'\r$' "$dir/images/bootloader.bin" \
+            || fail "$name: images/bootloader.bin does not trust bootloader/signing-key.pem ($fp)"
+    done
+}
+
 # docs/threat-model.md calls breaking its wording rules a failure of the project, by the
 # definition the project gave itself. Only claims that can never be true here are matched:
 # phishing, certification and FIDO appear throughout the docs as denials ("does not
@@ -167,4 +229,5 @@ check_all() {
     check_wording
     check_images
     check_signed_images
+    check_signed_uf2
 }

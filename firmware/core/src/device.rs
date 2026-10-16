@@ -6,33 +6,28 @@
 //! that a backup needs - a whole secret leaving the key is one act with one gesture.
 //! Categories are labels; classes are the boundary.
 
-use ed25519_dalek::{Signer, SigningKey};
 use embedded_storage::nor_flash::NorFlash;
 use rand_core::{CryptoRng, RngCore};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::hal::{Clock, DeviceKey, Ui};
+use crate::hal::{Attachment, Clock, DeviceKey, Ui};
 use crate::item::{Category, Class, Item, Writer};
-use crate::oath::{self, AUTH_SECRET_LEN, NAME_MAX, Name, Params, len_u8};
-use crate::store::{Header, ITEM_BUF_LEN, Index, MAX_ATTEMPTS, Slot, Store, StoredName};
+use crate::oath::{self, NAME_MAX, Name, Params, len_u8};
+use crate::store::{self, Header, ITEM_BUF_LEN, Index, MAX_ATTEMPTS, Slot, Store, StoredName};
 use crate::ui;
 use crate::vault::{
-    self, BACKUP_AAD, Block, Cost, KEY_LEN, Keys, NONCE_LEN, Passphrase, Pin, SALT_LEN,
+    self, BACKUP_AAD, Block, Cost, KDF_BLOCKS, KEY_LEN, Keys, NONCE_LEN, Passphrase, Pin,
+    REGION_AAD, REGION_HEAD, SALT_LEN,
 };
-use crate::wire::{
-    AUTH_CHALLENGE_LEN, AUTH_SIGNATURE_LEN, AUTH_SIGNED_PREFIX, BackupHead, Fail, HAS_OPEN,
-    HAS_SECRET, HAS_SEED, PinStatus,
-};
+use crate::wire::{BackupHead, Fail, HAS_OPEN, HAS_SECRET, HAS_SEED, PinStatus};
 
 /// Unlocked and idle this long, the device forgets the key on its own. Two minutes:
 /// long enough to finish a login, short enough that a key left on the desk is a
 /// locked key.
 const AUTOLOCK_MS: u64 = 120_000;
 const TOUCH_TIMEOUT_MS: u64 = 30_000;
-/// A login waits for the tap this long and no longer: the password prompt behind it is
-/// the other way in, and nobody should wait half a minute to reach it.
-const AUTH_TOUCH_TIMEOUT_MS: u64 = 10_000;
-/// A wipe after five seconds of red: no reflex reaches it.
+/// A wipe, or a restore that replaces everything, after five seconds of red: no reflex
+/// reaches it.
 const WIPE_HOLD_MS: u64 = 5_000;
 
 /// The board's working buffer: two item-sized halves. Two, because rewriting the image
@@ -42,6 +37,21 @@ pub const BUF_LEN: usize = 2 * ITEM_BUF_LEN;
 
 /// A resident copy of the data key that scrubs itself when dropped.
 type Dek = Zeroizing<[u8; KEY_LEN]>;
+
+/// Argon2's working memory, 128 KiB on the stack for one derivation: it exists only
+/// while `f` runs, and `vault` scrubs it before handing the key back. Never inlined, so
+/// the frame that holds it is gone before the key waits for its next request. A board
+/// can then run other deep work in that same RAM between derivations - the nRF52840's
+/// passkeys - where a static would hold it for the life of the program.
+#[inline(never)]
+#[expect(
+    clippy::large_stack_arrays,
+    reason = "on the stack on purpose: there is no heap, and a static would hold the 128 KiB for good"
+)]
+fn with_kdf_memory<T>(f: impl FnOnce(&mut [Block]) -> T) -> T {
+    let mut mem = [Block::new(); KDF_BLOCKS];
+    f(&mut mem)
+}
 
 /// Which classes a request may have. The device never returns a field outside it, and
 /// the gesture is decided by the highest class in it.
@@ -67,11 +77,13 @@ impl Reach {
 }
 
 /// A backup in flight: the passphrase key, and how far it got. Ended by the last item,
-/// by a lock, or by any operation that reloads the index it walks.
+/// by a lock, or by any operation that reloads the index it walks - always through
+/// `end_session`, which lets the board's attachment go.
 enum Session {
     Export {
         key: Dek,
-        /// The index position to look at next.
+        /// What to look at next: an index position, and past the last item the
+        /// attachment's sectors, counted on from there.
         slot: usize,
         /// Items handed out so far: the next one's position in the file.
         item: u32,
@@ -79,17 +91,36 @@ enum Session {
     Import {
         key: Dek,
         item: u32,
+        /// The first sector the next one may be, once a sector has come; None while
+        /// the file is still on items.
+        sector: Option<u32>,
+        /// Whether a sector was rewritten: the board restarts what uses them.
+        changed: bool,
     },
 }
 
-pub struct Device<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey> {
+/// A sector of the attachment, as `store` counts them.
+const SECTOR_LEN: usize = store::SECTOR as usize;
+
+pub struct Device<
+    'm,
+    F: NorFlash,
+    R: RngCore + CryptoRng,
+    U: Ui,
+    C: Clock,
+    K: DeviceKey,
+    A: Attachment,
+> {
     store: Store<F>,
     ui: U,
     rng: R,
     clock: C,
     key: K,
-    /// The Argon2 working memory, owned by the board for the life of the program.
-    mem: &'m mut [Block],
+    /// What a backup carries besides the items, on a board that has it.
+    attachment: A,
+    /// What a new vault and a new backup are derived at: the board's measure of about a
+    /// second. An existing vault opens at the cost its header records.
+    cost: Cost,
     /// Where every item is, as last read from flash. The bodies stay in flash; this is
     /// ~10 KiB and the board owns it. Every operation reloads it before looking at it.
     index: &'m mut Index,
@@ -118,8 +149,22 @@ fn item_aad(item: u32) -> [u8; BACKUP_AAD.len() + 4] {
     aad
 }
 
-impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
-    Device<'m, F, R, U, C, K>
+/// `REGION_AAD` followed by the sector's position in the file.
+fn region_aad(item: u32) -> [u8; REGION_AAD.len() + 4] {
+    let mut aad = [0u8; REGION_AAD.len() + 4];
+    aad[..REGION_AAD.len()].copy_from_slice(REGION_AAD);
+    aad[REGION_AAD.len()..].copy_from_slice(&item.to_le_bytes());
+    aad
+}
+
+/// A little-endian u32 at `at` in `bytes`.
+fn le_u32(bytes: &[u8], at: usize) -> Option<u32> {
+    let word = bytes.get(at..at + 4)?;
+    Some(u32::from_le_bytes(word.try_into().ok()?))
+}
+
+impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey, A: Attachment>
+    Device<'m, F, R, U, C, K, A>
 {
     #[expect(
         clippy::too_many_arguments,
@@ -131,7 +176,8 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         rng: R,
         clock: C,
         key: K,
-        mem: &'m mut [Block],
+        attachment: A,
+        cost: Cost,
         index: &'m mut Index,
         buf: &'m mut [u8; BUF_LEN],
     ) -> Self {
@@ -142,7 +188,8 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
             rng,
             clock,
             key,
-            mem,
+            attachment,
+            cost,
             index,
             buf,
             dek: None,
@@ -168,9 +215,28 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
 
     pub fn lock(&mut self) {
         self.dek = None; // Zeroizing scrubs it on drop
-        self.backup = None;
+        self.end_session();
         self.store.save_abort();
         self.buf.zeroize();
+    }
+
+    /// A backup or a restore begins: the board keeps its own user of the attachment off
+    /// it until `end_session`.
+    fn start_session(&mut self, session: Session) {
+        self.end_session();
+        self.attachment.freeze();
+        self.backup = Some(session);
+    }
+
+    /// The backup or restore in flight, if any, is over, however it ended, and the
+    /// board's attachment is let go - told whether a restore rewrote it. Every way a
+    /// session ends comes through here.
+    fn end_session(&mut self) {
+        match self.backup.take() {
+            Some(Session::Import { changed, .. }) => self.attachment.thaw(changed),
+            Some(Session::Export { .. }) => self.attachment.thaw(false),
+            None => {}
+        }
     }
 
     /// Factory reset: every secret and the PIN. Confirmed by the longest hold, never by
@@ -196,7 +262,7 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
     /// nothing gets written over it without `wipe`. A backup in flight walks the index
     /// as it was when it began; reloading ends it.
     fn load(&mut self) -> Result<(), Fail> {
-        self.backup = None;
+        self.end_session();
         self.store.save_abort();
         self.store.load(self.index).map_err(|_| Fail::Internal)
     }
@@ -221,7 +287,8 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
     }
 
     fn derive(&mut self, pin: Pin<'_>, salt: &[u8; SALT_LEN], cost: Cost) -> Result<Keys, Fail> {
-        vault::derive(pin, salt, cost, &mut self.key, self.mem).ok_or(Fail::Internal)
+        let key = &mut self.key;
+        with_kdf_memory(|mem| vault::derive(pin, salt, cost, key, mem)).ok_or(Fail::Internal)
     }
 
     /// A header for `pin`, and the resident key switched to match. The caller writes it;
@@ -229,10 +296,10 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
     fn install_pin(&mut self, pin: Pin<'_>) -> Result<Header, Fail> {
         let mut salt = [0u8; SALT_LEN];
         self.rng.fill_bytes(&mut salt);
-        let keys = self.derive(pin, &salt, Cost::CURRENT)?;
+        let keys = self.derive(pin, &salt, self.cost)?;
         let header = Header {
             salt,
-            cost: Cost::CURRENT,
+            cost: self.cost,
             bound: self.key.bound(),
             verifier: vault::verifier_of(&keys.kek),
         };
@@ -300,8 +367,6 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
 
     /// Verifies the old PIN, re-seals every item under the new one, writes all of it as
     /// a single image. A host that found the device unlocked still cannot take it over.
-    /// Auth items are sealed under the chip key, not the PIN: they are carried across
-    /// untouched.
     pub fn pin_change(&mut self, old: Pin<'_>, new: Pin<'_>) -> Result<(), Fail> {
         self.pin_unlock(old)?; // loads the index too
         let old_dek = self.dek()?;
@@ -331,14 +396,6 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
             .map_err(|_| Fail::Internal)?;
         for i in 0..self.index.len() {
             let slot = *self.index.get(i).ok_or(Fail::Internal)?;
-            // An auth item's key does not change with the PIN.
-            if slot.category == Category::Auth.wire() {
-                let (_, carry) = self.buf.split_at_mut(ITEM_BUF_LEN);
-                self.store
-                    .save_keep(&slot, carry)
-                    .map_err(|_| Fail::Internal)?;
-                continue;
-            }
             let n = {
                 let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
                 self.store
@@ -402,15 +459,6 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         vault::open_in_place(key, aad, buf)
     }
 
-    /// The key an item of this category is sealed under: the chip key alone for an auth
-    /// secret, the PIN's for everything else. The one place that decides.
-    fn item_key(&mut self, dek: &[u8; KEY_LEN], category: u8) -> Result<Dek, Fail> {
-        if category == Category::Auth.wire() {
-            return vault::auth_key(&mut self.key).ok_or(Fail::Incompatible);
-        }
-        Ok(Zeroizing::new(*dek))
-    }
-
     /// Stores an item. The PIN is enough, like every write: nothing comes out.
     pub fn put(
         &mut self,
@@ -429,11 +477,14 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         if at.is_some() && !replace {
             return Err(Fail::Exists);
         }
-        if !self.index.room_for(name, plain.len() + vault::OVERHEAD, at) {
+        let capacity = self.store.capacity();
+        if !self
+            .index
+            .room_for(name, plain.len() + vault::OVERHEAD, at, capacity)
+        {
             return Err(Fail::Full);
         }
-        let key = self.item_key(&dek, category.wire())?;
-        let r = self.write_item(&key, name, category.wire(), plain, at);
+        let r = self.write_item(&dek, name, category.wire(), plain, at);
         self.buf.zeroize();
         r?;
         self.touch();
@@ -514,15 +565,11 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
     }
 
     /// The item called `name`, opened into the working half of the buffer: how many
-    /// plaintext bytes, sitting at `NONCE_LEN`. Never an auth item, which only
-    /// `respond` opens.
+    /// plaintext bytes, sitting at `NONCE_LEN`.
     fn open_named(&mut self, dek: &[u8; KEY_LEN], name: Name<'_>) -> Result<(usize, u8), Fail> {
         self.load()?;
         let i = self.index.find(name).ok_or(Fail::NotFound)?;
         let slot = *self.index.get(i).ok_or(Fail::Internal)?;
-        if slot.category == Category::Auth.wire() {
-            return Err(Fail::BadArg);
-        }
         let n = {
             let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
             self.store
@@ -627,73 +674,6 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         Ok((len, params.period.get()))
     }
 
-    /// The host's challenge signed with the auth item called `name`, after a tap - the
-    /// same gesture as a code. The one command that needs no PIN: the secret is sealed
-    /// under the chip key, it never comes out, and a login is proven by the finger on
-    /// this board. Leaves the PIN session as it was, and spends no attempt.
-    pub fn respond(
-        &mut self,
-        name: Name<'_>,
-        challenge: &[u8; AUTH_CHALLENGE_LEN],
-        out: &mut [u8; AUTH_SIGNATURE_LEN],
-    ) -> Result<(), Fail> {
-        self.load()?;
-        // Any other category reads as absent: without the PIN, which names exist is
-        // nobody's to learn, and a different answer for "exists, but not auth" would
-        // tell.
-        let i = self
-            .index
-            .find(name)
-            .filter(|&i| {
-                self.index
-                    .get(i)
-                    .is_some_and(|s| s.category == Category::Auth.wire())
-            })
-            .ok_or(Fail::NotFound)?;
-        let slot = *self.index.get(i).ok_or(Fail::Internal)?;
-        let key = vault::auth_key(&mut self.key).ok_or(Fail::Incompatible)?;
-        let r = self.sign_with(&key, &slot, name, challenge, out);
-        self.buf.zeroize();
-        r
-    }
-
-    fn sign_with(
-        &mut self,
-        key: &[u8; KEY_LEN],
-        slot: &Slot,
-        name: Name<'_>,
-        challenge: &[u8; AUTH_CHALLENGE_LEN],
-        out: &mut [u8; AUTH_SIGNATURE_LEN],
-    ) -> Result<(), Fail> {
-        let n = {
-            let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
-            self.store
-                .read_item(slot, work)
-                .map_err(|_| Fail::Internal)?
-        };
-        let opened = {
-            let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
-            Self::open_in(key, name, slot.category, &mut work[..n]).ok_or(Fail::Internal)?
-        };
-        if !ui::await_confirmation(&mut self.ui, &self.clock, AUTH_TOUCH_TIMEOUT_MS) {
-            return Err(Fail::Refused);
-        }
-        let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
-        let item = Item::parse(&work[NONCE_LEN..NONCE_LEN + opened]).ok_or(Fail::Internal)?;
-        let seed: &[u8; AUTH_SECRET_LEN] = item
-            .first(Class::Secret)
-            .ok_or(Fail::Internal)?
-            .value()
-            .try_into()
-            .map_err(|_| Fail::Internal)?;
-        let signing = SigningKey::from_bytes(seed);
-        let mut msg = [0u8; AUTH_SIGNED_PREFIX.len() + AUTH_CHALLENGE_LEN];
-        msg[..AUTH_SIGNED_PREFIX.len()].copy_from_slice(AUTH_SIGNED_PREFIX);
-        msg[AUTH_SIGNED_PREFIX.len()..].copy_from_slice(challenge);
-        *out = signing.sign(&msg).to_bytes();
-        Ok(())
-    }
-
     /// An item, gone.
     pub fn delete(&mut self, name: Name<'_>) -> Result<(), Fail> {
         self.dek()?;
@@ -724,8 +704,7 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
             return Err(Fail::Exists);
         }
         let slot = *self.index.get(at).ok_or(Fail::Internal)?;
-        let key = self.item_key(&dek, slot.category)?;
-        let r = self.rename_into(&key, &slot, from, to, at);
+        let r = self.rename_into(&dek, &slot, from, to, at);
         self.buf.zeroize();
         r?;
         self.touch();
@@ -784,9 +763,10 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         }
         let mut salt = [0u8; SALT_LEN];
         self.rng.fill_bytes(&mut salt);
-        let cost = Cost::CURRENT;
-        let key = vault::backup_key(pass, &salt, cost, self.mem).ok_or(Fail::Internal)?;
-        self.backup = Some(Session::Export {
+        let cost = self.cost;
+        let key = with_kdf_memory(|mem| vault::backup_key(pass, &salt, cost, mem))
+            .ok_or(Fail::Internal)?;
+        self.start_session(Session::Export {
             key,
             slot: 0,
             item: 0,
@@ -809,7 +789,7 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         }
         self.buf.zeroize();
         if !matches!(r, Ok(Some(_))) {
-            self.backup = None;
+            self.end_session();
         }
         r.map(|_| self.touch())
     }
@@ -823,11 +803,11 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         };
         let (key, at, item) = (Zeroizing::new(**key), *slot, *item);
         if at >= self.index.len() {
-            return Ok(None);
+            let first = u32::try_from(at - self.index.len()).map_err(|_| Fail::Internal)?;
+            return self.export_sector(&key, first, item);
         }
         let slot = *self.index.get(at).ok_or(Fail::Internal)?;
         let name = StoredName::of(slot.name());
-        let item_key = self.item_key(&dek, slot.category)?;
 
         let n = {
             let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
@@ -837,8 +817,7 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
         };
         let opened = {
             let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
-            Self::open_in(&item_key, name.get(), slot.category, &mut work[..n])
-                .ok_or(Fail::Internal)?
+            Self::open_in(&dek, name.get(), slot.category, &mut work[..n]).ok_or(Fail::Internal)?
         };
         // The plaintext moves back to make room for the prefix, which goes after the
         // nonce that `seal_in_place` writes over.
@@ -860,25 +839,78 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
             vault::seal_in_place(&key, &mut self.rng, &item_aad(item), work, total)
                 .ok_or(Fail::Internal)?
         };
-        self.backup = Some(Session::Export {
-            key,
-            slot: at + 1,
-            item: item + 1,
-        });
+        self.advance_export(at + 1);
         Ok(Some(sealed))
     }
 
-    /// Starts a restore: the key for `pass` as the backup's head describes it, and a
-    /// fresh image to write the items into. The PIN is enough, like `put`: nothing
-    /// comes out. Everything already stored is replaced - a restore is a restore.
+    /// The export moves on to `slot`, one more item handed out.
+    fn advance_export(&mut self, next: usize) {
+        if let Some(Session::Export { slot, item, .. }) = &mut self.backup {
+            *slot = next;
+            *item += 1;
+        }
+    }
+
+    /// The first sector of the attachment from `first` on that is not blank, sealed into
+    /// the working half: its length, or None once there are no more. A blank sector is
+    /// not carried; a restore makes every sector the file leaves out blank.
+    fn export_sector(
+        &mut self,
+        key: &[u8; KEY_LEN],
+        first: u32,
+        item: u32,
+    ) -> Result<Option<usize>, Fail> {
+        let count = self.attachment.sectors();
+        for sector in first..count {
+            let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+            let data = &mut work[NONCE_LEN + REGION_HEAD..NONCE_LEN + REGION_HEAD + SECTOR_LEN];
+            if !self.attachment.read(sector, data) {
+                return Err(Fail::Internal);
+            }
+            if data.iter().all(|&b| b == 0xFF) {
+                continue;
+            }
+            work[NONCE_LEN..NONCE_LEN + 4].copy_from_slice(&store::SECTOR.to_le_bytes());
+            work[NONCE_LEN + 4..NONCE_LEN + 8].copy_from_slice(&count.to_le_bytes());
+            work[NONCE_LEN + 8..NONCE_LEN + 12].copy_from_slice(&sector.to_le_bytes());
+            let sealed = vault::seal_in_place(
+                key,
+                &mut self.rng,
+                &region_aad(item),
+                work,
+                REGION_HEAD + SECTOR_LEN,
+            )
+            .ok_or(Fail::Internal)?;
+            let next = usize::try_from(sector).map_err(|_| Fail::Internal)?;
+            self.advance_export(self.index.len() + next + 1);
+            return Ok(Some(sealed));
+        }
+        Ok(None)
+    }
+
+    /// Starts a restore: the wipe's hold, then the key for `pass` as the backup's head
+    /// describes it, and a fresh image to write the items into. Everything already
+    /// stored is replaced - the vault, and on a board with passkeys those too - so it
+    /// takes what a wipe and erasing every passkey take, never the PIN alone: a host
+    /// that learned the PIN must not swap in passkeys of its own. Nothing comes out, so
+    /// a hold is enough, and it is asked before anything is touched.
     pub fn import_begin(&mut self, pass: Passphrase<'_>, head: BackupHead) -> Result<(), Fail> {
         self.dek()?;
         self.load()?;
-        let key = vault::backup_key(pass, &head.salt, head.cost, self.mem).ok_or(Fail::Internal)?;
+        if !ui::await_hold(&mut self.ui, &self.clock, TOUCH_TIMEOUT_MS, WIPE_HOLD_MS) {
+            return Err(Fail::Refused);
+        }
+        let key = with_kdf_memory(|mem| vault::backup_key(pass, &head.salt, head.cost, mem))
+            .ok_or(Fail::Internal)?;
         self.store
             .save_begin(self.index.header.as_ref())
             .map_err(|_| Fail::Internal)?;
-        self.backup = Some(Session::Import { key, item: 0 });
+        self.start_session(Session::Import {
+            key,
+            item: 0,
+            sector: None,
+            changed: false,
+        });
         self.touch();
         Ok(())
     }
@@ -887,38 +919,51 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
     /// being written and become visible together at `import_end`; any failure ends the
     /// restore and leaves what was there before, because the new image never got its
     /// magic word.
+    ///
+    /// The attachment's sectors come after the items and are written in place as they
+    /// arrive - there is no second copy of them to switch to. A restore cut short leaves
+    /// that region torn, and the board formats it on its next start; the file still
+    /// holds it. A file with no sectors leaves the region as it was.
     pub fn import_item(&mut self, sealed: &[u8]) -> Result<(), Fail> {
         let dek = self.dek()?;
-        let Some(Session::Import { key, item }) = &self.backup else {
+        let Some(Session::Import {
+            key, item, sector, ..
+        }) = &self.backup
+        else {
             return Err(Fail::BadBackup);
         };
-        let (key, item) = (Zeroizing::new(**key), *item);
-        let r = self.import_sealed(&dek, &key, item, sealed);
+        let (key, item, sector) = (Zeroizing::new(**key), *item, *sector);
+        let r = self.import_sealed(&dek, &key, item, sector, sealed);
         self.buf.zeroize();
         match r {
-            Ok(()) => {
-                self.backup = Some(Session::Import {
-                    key,
-                    item: item + 1,
-                });
+            Ok(next) => {
+                if let Some(Session::Import { item, sector, .. }) = &mut self.backup {
+                    *item += 1;
+                    if next.is_some() {
+                        *sector = next;
+                    }
+                }
                 self.touch();
                 Ok(())
             }
             Err(f) => {
-                self.backup = None;
+                self.end_session();
                 self.store.save_abort();
                 Err(f)
             }
         }
     }
 
+    /// An item, or a sector of the attachment: for a sector, the first sector the next
+    /// one may be.
     fn import_sealed(
         &mut self,
         dek: &[u8; KEY_LEN],
         key: &[u8; KEY_LEN],
         item: u32,
+        sector: Option<u32>,
         sealed: &[u8],
-    ) -> Result<(), Fail> {
+    ) -> Result<Option<u32>, Fail> {
         if sealed.len() > ITEM_BUF_LEN {
             return Err(Fail::BadBackup);
         }
@@ -926,8 +971,14 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
             let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
             work[..sealed.len()].copy_from_slice(sealed);
             vault::open_in_place(key, &item_aad(item), &mut work[..sealed.len()])
-                .ok_or(Fail::BadBackup)?
         };
+        let Some(n) = n else {
+            return self.import_region(key, item, sector, sealed).map(Some);
+        };
+        // Items come before sectors; one after them was never written by a backup.
+        if sector.is_some() {
+            return Err(Fail::BadBackup);
+        }
         // `category | name_len | name | item`, as `export_item` packed it.
         let (category, name, body_at, body_len) = {
             let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
@@ -944,35 +995,95 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey>
                 body.len(),
             )
         };
-        let item_key = self.item_key(dek, category)?;
         let resealed = {
             let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
             work.copy_within(body_at..body_at + body_len, NONCE_LEN);
-            Self::seal_in(
-                &item_key,
-                &mut self.rng,
-                name.get(),
-                category,
-                work,
-                body_len,
-            )
-            .ok_or(Fail::Internal)?
+            Self::seal_in(dek, &mut self.rng, name.get(), category, work, body_len)
+                .ok_or(Fail::Internal)?
         };
         let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
         self.store
             .save_put(name.get(), category, &work[..resealed])
             .map_err(|_| Fail::Full)
+            .map(|()| None)
     }
 
-    /// The restored items become the image, and the restore is over.
+    /// A sector of the attachment back in its place, every sector the file skipped
+    /// before it made blank: the sector after it. Refused by a board without the
+    /// attachment, or laid out differently from the one the file came from, and out
+    /// of order.
+    fn import_region(
+        &mut self,
+        key: &[u8; KEY_LEN],
+        item: u32,
+        sector: Option<u32>,
+        sealed: &[u8],
+    ) -> Result<u32, Fail> {
+        let count = self.attachment.sectors();
+        if count == 0 {
+            return Err(Fail::BadBackup);
+        }
+        let at = {
+            let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+            work[..sealed.len()].copy_from_slice(sealed);
+            let n = vault::open_in_place(key, &region_aad(item), &mut work[..sealed.len()])
+                .ok_or(Fail::BadBackup)?;
+            let plain = &work[NONCE_LEN..NONCE_LEN + n];
+            if n != REGION_HEAD + SECTOR_LEN
+                || le_u32(plain, 0) != Some(store::SECTOR)
+                || le_u32(plain, 4) != Some(count)
+            {
+                return Err(Fail::BadBackup);
+            }
+            le_u32(plain, 8).ok_or(Fail::BadBackup)?
+        };
+        let from = sector.unwrap_or(0);
+        if at < from || at >= count {
+            return Err(Fail::BadBackup);
+        }
+        for blank in from..at {
+            self.region_blank(blank)?;
+        }
+        let changed = {
+            let (work, _) = self.buf.split_at_mut(ITEM_BUF_LEN);
+            let data = &work[NONCE_LEN + REGION_HEAD..NONCE_LEN + REGION_HEAD + SECTOR_LEN];
+            self.attachment.put(at, Some(data)).ok_or(Fail::Internal)?
+        };
+        self.region_changed(changed);
+        Ok(at + 1)
+    }
+
+    fn region_blank(&mut self, sector: u32) -> Result<(), Fail> {
+        let changed = self.attachment.put(sector, None).ok_or(Fail::Internal)?;
+        self.region_changed(changed);
+        Ok(())
+    }
+
+    /// Noted at once, so a restore that fails later still has the board restart.
+    fn region_changed(&mut self, now: bool) {
+        if let Some(Session::Import { changed, .. }) = &mut self.backup {
+            *changed |= now;
+        }
+    }
+
+    /// The restored items become the image, the sectors after the last one the file
+    /// carried are made blank, and the restore is over.
     pub fn import_end(&mut self) -> Result<(), Fail> {
-        let Some(Session::Import { .. }) = &self.backup else {
+        let Some(Session::Import { sector, .. }) = &self.backup else {
             return Err(Fail::BadBackup);
         };
-        self.backup = None;
-        self.store
-            .save_finish(self.index)
-            .map_err(|_| Fail::Internal)?;
+        if let Some(from) = *sector {
+            for blank in from..self.attachment.sectors() {
+                if let Err(f) = self.region_blank(blank) {
+                    self.end_session();
+                    self.store.save_abort();
+                    return Err(f);
+                }
+            }
+        }
+        let r = self.store.save_finish(self.index);
+        self.end_session();
+        r.map_err(|_| Fail::Internal)?;
         self.touch();
         Ok(())
     }

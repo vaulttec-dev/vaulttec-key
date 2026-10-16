@@ -45,9 +45,13 @@ jobs:
           cargo fmt --check --manifest-path cli/Cargo.toml
       - name: clippy - firmware core
         run: cargo clippy -p vaultkey-core --all-targets --locked -q --manifest-path firmware/Cargo.toml -- -D warnings
-      - name: clippy - board
-        working-directory: firmware/boards/esp32c6-zero
-        run: cargo clippy --locked -q -- -D warnings
+      - name: clippy - every board folder
+        run: |
+          for d in firmware/boards/*/; do
+            [ -f "$d/board.toml" ] || continue
+            echo "== $d"
+            (cd "$d" && cargo clippy --locked -q -- -D warnings)
+          done
       - name: clippy - cli
         run: cargo clippy --all-targets --locked -q --manifest-path cli/Cargo.toml -- -D warnings
       - name: rustdoc
@@ -130,6 +134,8 @@ jobs:
             cmp -n "$(stat -c %s "$plain")" "$plain" "$s"
             espsecure verify-signature --version 2 --keyfile "$pub" "$s"
           done
+      - name: signed UF2s verify under each board's bootloader key
+        run: bash -c '. tools/checks.sh && check_signed_uf2'
 
   wording:
     name: no forbidden marketing claim

@@ -11,9 +11,7 @@
 //! per item; `Code` sends `name | time u64le` and gets the ASCII code back; `ItemGet`
 //! sends `name | reach u8` and gets `category u8 | item` back, holding only the fields
 //! that reach allows - and taking the gesture that reach costs; `Rename` carries two
-//! names, `old | new`; `Respond` sends `name | challenge(32)` and gets the Ed25519
-//! signature of `AUTH_SIGNED_PREFIX | challenge` back after a tap; `PinChange` is
-//! `old_len u8 | old | new`; `PinStatus` answers
+//! names, `old | new`; `PinChange` is `old_len u8 | old | new`; `PinStatus` answers
 //! `has_pin | unlocked | attempts_left | chip_bound`.
 //!
 //! An item's own bytes are `crate::item`'s: `category | count | field*`, where a field
@@ -72,6 +70,8 @@ const _: () = assert!(
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum Cmd {
+    /// Text, no PIN: the version line, which ends with the board's folder name, then
+    /// whatever lines the board adds about its own chip.
     Info = 0x01,
     /// A whole item in; the PIN is enough - nothing comes out.
     ItemPut = 0x10,
@@ -84,9 +84,8 @@ pub enum Cmd {
     ItemGet = 0x14,
     /// A new name for an item; the PIN is enough, nothing leaves the device.
     Rename = 0x16,
-    /// A challenge signed with an auth secret; the button must be tapped, the PIN is
-    /// not needed.
-    Respond = 0x19,
+    // 0x19 was `Respond`, `vkey auth`'s signed login, removed 2026-10-15 (restorable
+    // from 4bd49f3; docs/threat-model.md says why). Never reused: an older CLI means it.
     PinStatus = 0x20,
     PinSet = 0x21,
     PinUnlock = 0x22,
@@ -118,7 +117,6 @@ impl Cmd {
             0x13 => Self::Delete,
             0x14 => Self::ItemGet,
             0x16 => Self::Rename,
-            0x19 => Self::Respond,
             0x20 => Self::PinStatus,
             0x21 => Self::PinSet,
             0x22 => Self::PinUnlock,
@@ -139,14 +137,6 @@ impl Cmd {
         self as u8
     }
 }
-
-/// The host's challenge in a `Respond`.
-pub const AUTH_CHALLENGE_LEN: usize = 32;
-/// The answer: an Ed25519 signature.
-pub const AUTH_SIGNATURE_LEN: usize = 64;
-/// What a `Respond` signs in front of the challenge, so a login signature is never
-/// valid as anything else.
-pub const AUTH_SIGNED_PREFIX: &[u8; 16] = b"vaultkey/auth/v1";
 
 /// `ItemPut` flags.
 pub const FLAG_REPLACE: u8 = 0x01;

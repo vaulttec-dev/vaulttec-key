@@ -30,10 +30,14 @@ dirs = "6"
 # The self-test's second opinion: an HMAC that is not the firmware's.
 hmac = "0.13"
 sha1 = "0.11"
+# The key's FIDO PIN, spoken as CTAP2 PIN protocol 1 asks: an ECDH agreement on P-256,
+# its SHA-256 as the shared key, AES-256-CBC for the PIN and the token, HMAC-SHA-256 for
+# every request that needs one (cli/src/fido.rs).
+p256 = { version = "0.13", default-features = false, features = ["ecdh", "std"] }
+sha2 = "0.11"
+aes = "0.9"
+cbc = "0.2"
 zeroize = "1"
-# `vkey auth`: the key's signature checked against the public key kept at enrolment.
-# The same crate the firmware signs with.
-ed25519-dalek = { version = "2.2", default-features = false, features = ["zeroize"] }
 # Generated passwords: the OS random source, nothing seeded in userland.
 getrandom = "0.2"
 serde = { version = "1.0", features = ["derive"] }

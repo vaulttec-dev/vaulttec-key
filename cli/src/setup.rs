@@ -137,11 +137,26 @@ fn flash(
         .flags
         & SECURE_BOOT_EN
         != 0;
+    let state = if secure { "on" } else { "off" };
     log(&format!(
-        "  chip {chip}, board {}, secure boot {}",
-        board.name,
-        if secure { "on" } else { "off" }
+        "  chip {chip}, board {}, secure boot {state}",
+        board.name
     ));
+
+    let images: Vec<&'static Image> = board.images_for(secure).collect();
+    // Every place the board writes gets an image on this chip too, checked before
+    // anything is erased: a signed image the folder does not have yet would leave a
+    // Secure Boot chip with a bootloader and nothing to boot.
+    if let Some(gap) = board
+        .images
+        .iter()
+        .find(|i| !images.iter().any(|j| j.addr == i.addr))
+    {
+        return Err(Error::Value(format!(
+            "{}: no image at {:#x} for a chip with secure boot {state} - sign one first: tools/sign-vaultkey.sh",
+            board.name, gap.addr
+        )));
+    }
 
     if erase {
         log("  erasing the whole flash - every secret and the PIN are gone");
@@ -149,7 +164,6 @@ fn flash(
             .erase_flash()
             .map_err(|e| Error::Value(format!("erase failed: {e}")))?;
     }
-    let images: Vec<&'static Image> = board.images_for(secure).collect();
     let chip_id = flasher.chip();
     let mut progress = Progress {
         log,
@@ -187,7 +201,21 @@ pub fn wait_for_firmware(port_hint: &str, timeout: Duration) -> Result<Device, E
     let mut last = Error::Value("board did not come back after flashing".into());
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_secs(1));
-        let port = find_port().unwrap_or_else(|| port_hint.to_string());
+        // Still rebooting is no board yet. A second key is a reason to stop, unless the
+        // port just flashed is among them: that one was named, or found alone.
+        let port = match find_port() {
+            Ok(p) => p,
+            Err(Error::NoBoard) => port_hint.to_string(),
+            Err(Error::ManyBoards(ports)) if ports.iter().any(|p| p == port_hint) => {
+                port_hint.to_string()
+            }
+            Err(e @ Error::ManyBoards(_)) => return Err(e),
+            // The ports could not be listed this second, mid-reset: try again.
+            Err(e) => {
+                last = e;
+                continue;
+            }
+        };
         let mut dev = match Device::open(Some(&port)) {
             Ok(d) => d,
             Err(e) => {

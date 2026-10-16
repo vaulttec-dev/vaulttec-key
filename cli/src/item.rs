@@ -173,7 +173,6 @@ pub fn category_name(c: Category) -> &'static str {
         Category::SshKey => "ssh key",
         Category::CryptoWallet => "crypto wallet",
         Category::Env => "env",
-        Category::Auth => "auth",
     }
 }
 
@@ -241,12 +240,11 @@ pub const fn field_kind_name(kind: FieldKind) -> &'static str {
     }
 }
 
-/// The 1Password category name (`op --category`) for an item written back. `Env` and
-/// `Auth` have no category there: an `.env` goes back as a secure note, and an auth
-/// seed never goes back at all.
+/// The 1Password category name (`op --category`) for an item written back. `Env` has
+/// no category there: an `.env` goes back as a secure note.
 #[must_use]
-pub const fn op_category(c: Category) -> Option<&'static str> {
-    Some(match c {
+pub const fn op_category(c: Category) -> &'static str {
+    match c {
         Category::Login => "Login",
         Category::CreditCard => "Credit Card",
         Category::SecureNote | Category::Env => "Secure Note",
@@ -269,8 +267,7 @@ pub const fn op_category(c: Category) -> Option<&'static str> {
         Category::MedicalRecord => "Medical Record",
         Category::SshKey => "SSH Key",
         Category::CryptoWallet => "Crypto Wallet",
-        Category::Auth => return None,
-    })
+    }
 }
 
 #[cfg(test)]

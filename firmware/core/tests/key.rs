@@ -8,7 +8,6 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use ed25519_dalek::{Signer, SigningKey};
 use embedded_storage::nor_flash::{
     ErrorType, NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash,
 };
@@ -16,30 +15,41 @@ use hmac::{Hmac, KeyInit, Mac};
 use rand_core::{CryptoRng, RngCore};
 use sha2::Sha256;
 use vaultkey_core::device::{self, Device, Reach};
-use vaultkey_core::hal::{Clock, DeviceKey, Ui};
+use vaultkey_core::hal::{Attachment, Clock, DeviceKey, NoAttachment, Ui};
 use vaultkey_core::item::{Category, Class, Field, FieldKind, Item, Writer};
-use vaultkey_core::oath::{AUTH_SECRET_LEN, Algo, Digits, Name, Params};
+use vaultkey_core::oath::{Algo, Digits, Name, Params};
 use vaultkey_core::store::{self, Layout, MAX_ATTEMPTS, Store};
-use vaultkey_core::ui::State;
+use vaultkey_core::ui::{self, State};
 use vaultkey_core::vault::{self, Block, Cost, KDF_BLOCKS, Passphrase, Pin};
 use vaultkey_core::wire::{
-    AUTH_CHALLENGE_LEN, AUTH_SIGNED_PREFIX, BackupHead, Cmd, Fail, HAS_OPEN, HAS_SECRET, HAS_SEED,
-    OK, REACH_OPEN, REACH_SECRET, REACH_SEED,
+    BackupHead, Cmd, Fail, HAS_OPEN, HAS_SECRET, HAS_SEED, OK, REACH_OPEN, REACH_SECRET, REACH_SEED,
 };
 
 // --- the hardware, faked -------------------------------------------------------------
+
+/// Few passes: these tests are about what the key does, not how long it takes, and a
+/// board's own cost is its measure, not theirs.
+const COST: Cost = Cost::from_wire(128, 2).expect("a cost Argon2 runs");
 
 const LAYOUT: Layout = Layout {
     attempts: 0x0000,
     state_a: 0x1000,
     state_b: 0x36000,
+    state_sectors: 53,
 };
+const _: () = assert!(LAYOUT.fits(), "the test layout is one a board could use");
 const FLASH_BYTES: usize = 0x6B000;
+/// How many times a word may be written between erases: the strictest flash
+/// controller a board has. A third write is a fault here, so it cannot pass on the
+/// host and corrupt a word on the chip.
+const WRITES_PER_WORD: u8 = 2;
 
-/// A flash chip with NOR semantics: erase sets 0xFF, a write can only clear bits.
-/// Shared by reference so a "power cycle" is just a second `Device` on the same chip.
+/// A flash chip with NOR semantics: erase sets 0xFF, a write can only clear bits, and a
+/// word takes `WRITES_PER_WORD` writes between erases. The bytes, then the writes each
+/// word has taken since its last erase. Shared by reference so a "power cycle" is just a
+/// second `Device` on the same chip.
 #[derive(Clone)]
-struct MemFlash(Rc<RefCell<Vec<u8>>>);
+struct MemFlash(Rc<RefCell<Vec<u8>>>, Rc<RefCell<Vec<u8>>>);
 
 #[derive(Debug)]
 struct Fault;
@@ -83,12 +93,21 @@ impl NorFlash for MemFlash {
 
     fn erase(&mut self, from: u32, to: u32) -> Result<(), Fault> {
         self.0.borrow_mut()[at(from)..at(to)].fill(0xFF);
+        self.1.borrow_mut()[at(from) / 4..at(to) / 4].fill(0);
         Ok(())
     }
 
     fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Fault> {
         if !offset.is_multiple_of(4) || !bytes.len().is_multiple_of(4) {
             return Err(Fault);
+        }
+        let words = at(offset) / 4..(at(offset) + bytes.len()) / 4;
+        let mut writes = self.1.borrow_mut();
+        if writes[words.clone()].iter().any(|w| *w >= WRITES_PER_WORD) {
+            return Err(Fault);
+        }
+        for w in &mut writes[words] {
+            *w += 1;
         }
         let mut chip = self.0.borrow_mut();
         for (cell, b) in chip[at(offset)..].iter_mut().zip(bytes) {
@@ -100,7 +119,10 @@ impl NorFlash for MemFlash {
 
 impl MemFlash {
     fn blank() -> Self {
-        MemFlash(Rc::new(RefCell::new(vec![0xFF; FLASH_BYTES])))
+        MemFlash(
+            Rc::new(RefCell::new(vec![0xFF; FLASH_BYTES])),
+            Rc::new(RefCell::new(vec![0; FLASH_BYTES / 4])),
+        )
     }
 
     fn word(&self, offset: u32) -> u32 {
@@ -163,9 +185,24 @@ impl MemFlash {
 
     /// Power on with a finger on the button and, maybe, a chip key.
     fn key_with<K: DeviceKey>(&self, button: Button, clock: Ticker, key: K) -> Key<K> {
-        // The Argon2 memory, the index and the buffer outlive the device, as on the
-        // board.
-        let mem = Box::leak(vec![Block::new(); KDF_BLOCKS].into_boxed_slice());
+        self.key_full(button, clock, key, NoAttachment)
+    }
+
+    /// Power on a board that keeps passkeys beside the vault, its owner at the button.
+    fn key_attached(&self, passkeys: &Passkeys) -> Key<Unbound, Passkeys> {
+        let clock = Ticker::default();
+        let button = Button::new(&clock, Finger::Owner);
+        self.key_full(button, clock, Unbound, passkeys.clone())
+    }
+
+    fn key_full<K: DeviceKey, A: Attachment>(
+        &self,
+        button: Button,
+        clock: Ticker,
+        key: K,
+        attachment: A,
+    ) -> Key<K, A> {
+        // The index and the buffer outlive the device, as on the board.
         let index = Box::leak(Box::new(store::Index::empty()));
         let buf: Box<[u8; device::BUF_LEN]> = vec![0u8; device::BUF_LEN]
             .into_boxed_slice()
@@ -178,10 +215,93 @@ impl MemFlash {
             Repeatable(7),
             clock,
             key,
-            mem,
+            attachment,
+            COST,
             index,
             buf,
         )
+    }
+}
+
+/// A board's passkey flash, faked: its sectors, and what the device did with the
+/// freeze - whether it holds, and every thaw with whether it was told of a change.
+#[derive(Clone)]
+struct Passkeys(Rc<RefCell<PasskeyState>>);
+
+struct PasskeyState {
+    sectors: Vec<Vec<u8>>,
+    frozen: bool,
+    /// The board let go on its own: reads and writes fail.
+    expired: bool,
+    thaws: Vec<bool>,
+}
+
+const SECTOR: usize = store::SECTOR as usize;
+
+impl Passkeys {
+    fn blank(count: usize) -> Self {
+        Passkeys(Rc::new(RefCell::new(PasskeyState {
+            sectors: vec![vec![0xFF; SECTOR]; count],
+            frozen: false,
+            expired: false,
+            thaws: Vec::new(),
+        })))
+    }
+
+    fn fill(&self, sector: usize, byte: u8) -> &Self {
+        self.0.borrow_mut().sectors[sector] = vec![byte; SECTOR];
+        self
+    }
+
+    /// Each sector as the byte it is filled with, 0xFF for blank.
+    fn bytes(&self) -> Vec<u8> {
+        self.0.borrow().sectors.iter().map(|s| s[0]).collect()
+    }
+
+    fn frozen(&self) -> bool {
+        self.0.borrow().frozen
+    }
+
+    fn last_thaw(&self) -> Option<bool> {
+        self.0.borrow().thaws.last().copied()
+    }
+}
+
+impl Attachment for Passkeys {
+    fn sectors(&self) -> u32 {
+        u32::try_from(self.0.borrow().sectors.len()).expect("a few")
+    }
+
+    fn read(&mut self, i: u32, out: &mut [u8]) -> bool {
+        let s = self.0.borrow();
+        if !s.frozen || s.expired {
+            return false;
+        }
+        out.copy_from_slice(&s.sectors[i as usize]);
+        true
+    }
+
+    fn put(&mut self, i: u32, data: Option<&[u8]>) -> Option<bool> {
+        let mut s = self.0.borrow_mut();
+        if !s.frozen || s.expired {
+            return None;
+        }
+        let want = data.map_or_else(|| vec![0xFF; SECTOR], <[u8]>::to_vec);
+        let changed = s.sectors[i as usize] != want;
+        s.sectors[i as usize] = want;
+        Some(changed)
+    }
+
+    fn freeze(&mut self) {
+        let mut s = self.0.borrow_mut();
+        s.frozen = true;
+        s.expired = false;
+    }
+
+    fn thaw(&mut self, changed: bool) {
+        let mut s = self.0.borrow_mut();
+        s.frozen = false;
+        s.thaws.push(changed);
     }
 }
 
@@ -276,6 +396,11 @@ enum Finger {
     DoubleTap {
         gap: u64,
     },
+    /// One tap whose contact opens for 15 ms in the middle: one press, bouncing.
+    BouncyTap,
+    /// The owner, doing what the light asks: two taps at blue, otherwise down for six
+    /// seconds, which a tap wait takes as a tap and a hold wait as the hold.
+    Owner,
     /// Down before the request arrives, and never let go.
     Taped,
 }
@@ -287,6 +412,8 @@ struct Button {
     finger: Finger,
     down: Vec<(u64, u64)>,
     asked: u32,
+    /// When the request is withdrawn, if it ever is.
+    withdrawn_at: Option<u64>,
 }
 
 impl Button {
@@ -296,6 +423,15 @@ impl Button {
             finger,
             down: Vec::new(),
             asked: 0,
+            withdrawn_at: None,
+        }
+    }
+
+    /// The same finger, on a request withdrawn at `ms` on the clock.
+    fn withdrawn_at(self, ms: u64) -> Self {
+        Button {
+            withdrawn_at: Some(ms),
+            ..self
         }
     }
 }
@@ -313,6 +449,11 @@ impl Ui for Button {
             Finger::DoubleTap { gap } => {
                 vec![(from, from + 200), (from + 200 + gap, from + 400 + gap)]
             }
+            Finger::BouncyTap => vec![(from, from + 100), (from + 115, from + 300)],
+            Finger::Owner if state == State::Export => {
+                vec![(from, from + 200), (from + 320, from + 520)]
+            }
+            Finger::Owner => vec![(from, from + 6_000)],
             Finger::Away | Finger::Taped => Vec::new(),
         };
     }
@@ -324,9 +465,14 @@ impl Ui for Button {
                 .iter()
                 .any(|(a, b)| (*a..*b).contains(&self.clock.peek()))
     }
+
+    fn withdrawn(&self) -> bool {
+        self.withdrawn_at.is_some_and(|t| self.clock.peek() >= t)
+    }
 }
 
-type Key<K = Unbound> = Device<'static, MemFlash, Repeatable, Button, Ticker, K>;
+type Key<K = Unbound, A = NoAttachment> =
+    Device<'static, MemFlash, Repeatable, Button, Ticker, K, A>;
 
 // --- helpers ---------------------------------------------------------------------------
 
@@ -398,8 +544,8 @@ fn totp_item(secret: &[u8]) -> Vec<u8> {
     )
 }
 
-fn put<K: DeviceKey>(
-    dev: &mut Key<K>,
+fn put<K: DeviceKey, A: Attachment>(
+    dev: &mut Key<K, A>,
     n: &str,
     category: Category,
     item: &[u8],
@@ -449,7 +595,7 @@ fn code<K: DeviceKey>(dev: &mut Key<K>, n: &str, t: u64) -> Result<String, Fail>
     Ok(String::from_utf8_lossy(&out[..len]).into_owned())
 }
 
-fn names<K: DeviceKey>(dev: &mut Key<K>) -> Result<Vec<String>, Fail> {
+fn names<K: DeviceKey, A: Attachment>(dev: &mut Key<K, A>) -> Result<Vec<String>, Fail> {
     let mut out = Vec::new();
     dev.list(|n, _| out.push(String::from_utf8_lossy(n.as_bytes()).into_owned()))?;
     Ok(out)
@@ -475,11 +621,19 @@ fn double_tapping(flash: &MemFlash) -> Key {
     )
 }
 
+fn owned(flash: &MemFlash) -> Key {
+    let clock = Ticker::default();
+    flash.key_with(Button::new(&clock, Finger::Owner), clock, Unbound)
+}
+
 fn passphrase(s: &str) -> Passphrase<'_> {
     Passphrase::new(s.as_bytes()).expect("a valid test passphrase")
 }
 
-fn export<K: DeviceKey>(dev: &mut Key<K>, pass: &str) -> Result<(BackupHead, Vec<Vec<u8>>), Fail> {
+fn export<K: DeviceKey, A: Attachment>(
+    dev: &mut Key<K, A>,
+    pass: &str,
+) -> Result<(BackupHead, Vec<Vec<u8>>), Fail> {
     let head = dev.export_begin(passphrase(pass))?;
     let mut items = Vec::new();
     loop {
@@ -492,8 +646,8 @@ fn export<K: DeviceKey>(dev: &mut Key<K>, pass: &str) -> Result<(BackupHead, Vec
     }
 }
 
-fn import<K: DeviceKey>(
-    dev: &mut Key<K>,
+fn import<K: DeviceKey, A: Attachment>(
+    dev: &mut Key<K, A>,
     pass: &str,
     head: BackupHead,
     items: &[Vec<u8>],
@@ -561,10 +715,9 @@ fn the_chip_key_changes_every_derived_key() {
     let mem = &mut vec![Block::new(); KDF_BLOCKS];
     let salt = [1u8; vault::SALT_LEN];
 
-    let a = vault::derive(pin("12345678"), &salt, Cost::CURRENT, &mut plain, mem)
+    let a = vault::derive(pin("12345678"), &salt, COST, &mut plain, mem)
         .expect("derives without a chip key");
-    let b = vault::derive(pin("12345678"), &salt, Cost::CURRENT, &mut chip, mem)
-        .expect("derives with one");
+    let b = vault::derive(pin("12345678"), &salt, COST, &mut chip, mem).expect("derives with one");
     assert_ne!(a.dek, b.dek, "the same PIN and salt, a different data key");
     assert_ne!(a.kek, b.kek, "and a different verifier key");
     assert!(
@@ -573,14 +726,7 @@ fn the_chip_key_changes_every_derived_key() {
     );
     let mut short = vec![Block::new(); 8];
     assert!(
-        vault::derive(
-            pin("12345678"),
-            &salt,
-            Cost::CURRENT,
-            &mut plain,
-            &mut short
-        )
-        .is_none(),
+        vault::derive(pin("12345678"), &salt, COST, &mut plain, &mut short).is_none(),
         "too little memory is an error, not a cheaper derivation"
     );
 }
@@ -615,6 +761,10 @@ fn only_valid_values_exist() {
         Category::from_wire(250).is_none(),
         "a category this firmware does not know is refused, not defaulted"
     );
+    assert!(
+        Category::from_wire(201).is_none() && Cmd::from_wire(0x19).is_none(),
+        "vkey auth's category and command are gone, and nothing took their numbers"
+    );
 }
 
 #[test]
@@ -627,7 +777,6 @@ fn wire_codes_round_trip() {
         Cmd::Delete,
         Cmd::ItemGet,
         Cmd::Rename,
-        Cmd::Respond,
         Cmd::PinStatus,
         Cmd::PinSet,
         Cmd::PinUnlock,
@@ -961,6 +1110,59 @@ fn a_tap_never_wipes_and_never_exports_a_seed() {
 }
 
 #[test]
+fn a_bounce_in_one_press_is_not_two_taps() {
+    let flash = MemFlash::blank();
+    let clock = Ticker::default();
+    let mut dev = flash.key_with(Button::new(&clock, Finger::BouncyTap), clock, Unbound);
+    dev.pin_set(pin("12345678")).expect("sets the PIN");
+    put(
+        &mut dev,
+        "rfc",
+        Category::Login,
+        &totp_item(b"12345678901234567890"),
+        false,
+    )
+    .expect("stores");
+    assert_eq!(
+        dev.export_begin(passphrase("correct horse battery staple")),
+        Err(Fail::Refused),
+        "the contact opening for 15 ms mid-press is not a release"
+    );
+    code(&mut dev, "rfc", 59).expect("and the bouncing tap still approves a code");
+}
+
+#[test]
+fn a_withdrawn_tap_wait_ends_refused_and_at_once() {
+    let clock = Ticker::default();
+    let mut button = Button::new(&clock, Finger::Away).withdrawn_at(1_000);
+    assert!(!ui::await_confirmation(&mut button, &clock, 30_000));
+    assert!(
+        clock.peek() < 2_000,
+        "the wait ends when the request goes, not at its deadline: {} ms",
+        clock.peek()
+    );
+}
+
+#[test]
+fn a_withdrawn_hold_never_completes() {
+    // Down from 100 ms for ten seconds; withdrawn two seconds into the hold.
+    let clock = Ticker::default();
+    let mut button = Button::new(&clock, Finger::Hold(10_000)).withdrawn_at(2_100);
+    assert!(
+        !ui::await_hold(&mut button, &clock, 30_000, 5_000),
+        "a hold that goes on past five seconds after the request was withdrawn is no wipe"
+    );
+}
+
+#[test]
+fn a_withdrawn_second_tap_window_ends_refused() {
+    // First tap 100..300 ms, second 700..900 ms; withdrawn between them.
+    let clock = Ticker::default();
+    let mut button = Button::new(&clock, Finger::DoubleTap { gap: 400 }).withdrawn_at(500);
+    assert!(!ui::await_double_tap(&mut button, &clock, 30_000));
+}
+
+#[test]
 fn a_hold_wipes_and_nothing_else_does() {
     let flash = MemFlash::blank();
     let clock = Ticker::default();
@@ -1272,7 +1474,7 @@ fn a_backup_moves_every_item_to_another_board() {
 
     // A different board: a blank flash and a new PIN of its own.
     let target = MemFlash::blank();
-    let mut other = double_tapping(&target);
+    let mut other = owned(&target);
     other.pin_set(pin("87654321")).expect("sets its own PIN");
     import(&mut other, "correct horse battery staple", head, &items).expect("restores");
 
@@ -1323,7 +1525,7 @@ fn a_backup_refuses_the_wrong_passphrase_and_a_reordered_file() {
     let (head, items) = export(&mut dev, "correct horse battery staple").expect("exports");
 
     let target = MemFlash::blank();
-    let mut other = double_tapping(&target);
+    let mut other = owned(&target);
     other.pin_set(pin("87654321")).expect("sets a PIN");
     assert_eq!(
         import(&mut other, "wrong passphrase here", head, &items),
@@ -1339,60 +1541,16 @@ fn a_backup_refuses_the_wrong_passphrase_and_a_reordered_file() {
     );
 }
 
-// --- vkey auth ----------------------------------------------------------------------------
+// --- passkeys in a backup -----------------------------------------------------------------
 
-fn chip(flash: &MemFlash, finger: Finger, key: [u8; 32]) -> Key<ChipKey> {
-    let clock = Ticker::default();
-    flash.key_with(Button::new(&clock, finger), clock, ChipKey(key))
-}
+const PASS: &str = "correct horse battery staple";
 
-const SEED: [u8; AUTH_SECRET_LEN] = [4u8; AUTH_SECRET_LEN];
-const CHALLENGE: [u8; AUTH_CHALLENGE_LEN] = [5u8; AUTH_CHALLENGE_LEN];
-
-fn auth_item() -> Vec<u8> {
-    pack(
-        Category::Auth,
-        &[(Class::Secret, FieldKind::Concealed, "seed", &SEED)],
-    )
-}
-
-fn respond<K: DeviceKey>(dev: &mut Key<K>, n: &str) -> Result<Vec<u8>, Fail> {
-    let mut out = [0u8; 64];
-    dev.respond(name(n), &CHALLENGE, &mut out)?;
-    Ok(out.to_vec())
-}
-
-fn expected_response() -> Vec<u8> {
-    let key = SigningKey::from_bytes(&SEED);
-    let mut msg = Vec::from(*AUTH_SIGNED_PREFIX);
-    msg.extend_from_slice(&CHALLENGE);
-    key.sign(&msg).to_bytes().to_vec()
-}
-
-#[test]
-fn an_auth_item_answers_a_tap_without_the_pin() {
+/// A board with passkeys in sectors 1 and 3 of four, a PIN and one item.
+fn board_with_passkeys() -> (MemFlash, Passkeys, Key<Unbound, Passkeys>) {
     let flash = MemFlash::blank();
-    let mut dev = chip(&flash, Finger::Tap, [1u8; 32]);
-    dev.pin_set(pin("12345678")).expect("sets the PIN");
-    put(&mut dev, "hifes", Category::Auth, &auth_item(), false).expect("stores the seed");
-    dev.lock();
-
-    assert_eq!(
-        respond(&mut dev, "hifes").expect("signs while locked"),
-        expected_response(),
-        "a login is proven by the finger on the board, not by the PIN"
-    );
-    assert_eq!(
-        get(&mut dev, "hifes", Reach::Seed),
-        Err(Fail::Locked),
-        "and the seed itself still never comes out, at any reach"
-    );
-}
-
-#[test]
-fn a_locked_key_names_no_item_that_is_not_an_auth_secret() {
-    let flash = MemFlash::blank();
-    let mut dev = chip(&flash, Finger::Tap, [1u8; 32]);
+    let passkeys = Passkeys::blank(4);
+    passkeys.fill(1, 0x11).fill(3, 0x33);
+    let mut dev = flash.key_attached(&passkeys);
     dev.pin_set(pin("12345678")).expect("sets the PIN");
     put(
         &mut dev,
@@ -1402,55 +1560,179 @@ fn a_locked_key_names_no_item_that_is_not_an_auth_secret() {
         false,
     )
     .expect("stores");
-    dev.lock();
+    (flash, passkeys, dev)
+}
 
+#[test]
+fn passkeys_go_into_a_backup_and_come_back_exactly() {
+    let (_, passkeys, mut dev) = board_with_passkeys();
+    let (head, blobs) = export(&mut dev, PASS).expect("exports");
     assert_eq!(
-        respond(&mut dev, "github.com"),
-        Err(Fail::NotFound),
-        "an item that is not an auth secret reads as absent while locked: a different \
-         answer would tell a stranger which names exist"
+        blobs.len(),
+        3,
+        "one item and the two sectors that are not blank"
+    );
+    assert!(!passkeys.frozen(), "and the passkeys are served again");
+
+    let target = Passkeys::blank(4);
+    target.fill(0, 0x55).fill(2, 0x77);
+    let other_flash = MemFlash::blank();
+    let mut other = other_flash.key_attached(&target);
+    other.pin_set(pin("87654321")).expect("sets the PIN");
+    import(&mut other, PASS, head, &blobs).expect("restores");
+    assert_eq!(
+        target.bytes(),
+        [0xFF, 0x11, 0xFF, 0x33],
+        "the copy exactly: what the file skipped is blank, whatever was there"
+    );
+    assert_eq!(
+        target.last_thaw(),
+        Some(true),
+        "told it changed: the board restarts"
+    );
+    assert_eq!(names(&mut other).expect("lists"), ["github.com"]);
+
+    import(&mut other, PASS, head, &blobs).expect("restores again");
+    assert_eq!(
+        target.last_thaw(),
+        Some(false),
+        "the same passkeys again change nothing, so nothing restarts"
     );
 }
 
 #[test]
-fn an_auth_item_needs_a_chip_key_to_exist() {
+fn a_backup_without_passkeys_leaves_them_alone() {
     let flash = MemFlash::blank();
-    let mut dev = tapping(&flash); // no chip key burned
-    dev.pin_set(pin("12345678")).expect("sets the PIN");
-    assert_eq!(
-        put(&mut dev, "hifes", Category::Auth, &auth_item(), false),
-        Err(Fail::Incompatible),
-        "without the eFuse key there is nothing to seal an auth secret under"
-    );
-}
-
-#[test]
-fn an_auth_item_is_not_re_sealed_by_a_pin_change() {
-    let flash = MemFlash::blank();
-    let mut dev = chip(&flash, Finger::Tap, [1u8; 32]);
-    dev.pin_set(pin("12345678")).expect("sets the PIN");
-    put(&mut dev, "hifes", Category::Auth, &auth_item(), false).expect("stores the seed");
+    let mut plain = double_tapping(&flash);
+    plain.pin_set(pin("12345678")).expect("sets the PIN");
     put(
-        &mut dev,
+        &mut plain,
         "github.com",
         Category::Login,
-        &login_item("me", "hunter2"),
+        &login_item("me", "pw"),
         false,
     )
     .expect("stores");
+    let (head, blobs) = export(&mut plain, PASS).expect("exports");
 
-    dev.pin_change(pin("12345678"), pin("87654321"))
-        .expect("changes the PIN");
+    let (_, passkeys, mut dev) = board_with_passkeys();
+    import(&mut dev, PASS, head, &blobs).expect("restores");
     assert_eq!(
-        respond(&mut dev, "hifes").expect("still signs"),
-        expected_response(),
-        "its key is the chip's, not the PIN's: a PIN change must leave it alone"
+        passkeys.bytes(),
+        [0xFF, 0x11, 0xFF, 0x33],
+        "an older backup, or one from the C6, keeps the passkeys there are"
     );
+    assert_eq!(passkeys.last_thaw(), Some(false));
+}
+
+#[test]
+fn a_board_without_passkeys_or_laid_out_otherwise_refuses_them() {
+    let (_, _, mut dev) = board_with_passkeys();
+    let (head, blobs) = export(&mut dev, PASS).expect("exports");
+
+    let flash = MemFlash::blank();
+    let mut plain = owned(&flash);
+    plain.pin_set(pin("12345678")).expect("sets the PIN");
     assert_eq!(
-        value(&mut dev, "github.com", Reach::Secret, "password"),
-        Some(b"hunter2".to_vec()),
-        "while everything else was re-sealed under the new PIN"
+        import(&mut plain, PASS, head, &blobs),
+        Err(Fail::BadBackup),
+        "a board with nowhere to put passkeys says so rather than drop them"
     );
+
+    let wider = Passkeys::blank(5);
+    wider.fill(4, 0x44);
+    let other_flash = MemFlash::blank();
+    let mut other = other_flash.key_attached(&wider);
+    other.pin_set(pin("12345678")).expect("sets the PIN");
+    assert_eq!(import(&mut other, PASS, head, &blobs), Err(Fail::BadBackup));
+    assert_eq!(
+        wider.bytes(),
+        [0xFF, 0xFF, 0xFF, 0xFF, 0x44],
+        "a filesystem of another size would not mount: nothing of it is written"
+    );
+    assert!(!wider.frozen());
+}
+
+#[test]
+fn a_restore_takes_the_wipes_hold_and_nothing_less() {
+    let (_, _, mut dev) = board_with_passkeys();
+    let (head, blobs) = export(&mut dev, PASS).expect("exports");
+
+    for finger in [
+        Finger::Tap,
+        Finger::DoubleTap { gap: 120 },
+        Finger::Hold(2_000),
+    ] {
+        let passkeys = Passkeys::blank(4);
+        passkeys.fill(0, 0x55);
+        let flash = MemFlash::blank();
+        let clock = Ticker::default();
+        let mut other = flash.key_full(
+            Button::new(&clock, finger),
+            clock,
+            Unbound,
+            passkeys.clone(),
+        );
+        other.pin_set(pin("87654321")).expect("sets the PIN");
+        put(
+            &mut other,
+            "mine",
+            Category::Login,
+            &login_item("me", "pw"),
+            false,
+        )
+        .expect("stores");
+        assert_eq!(
+            import(&mut other, PASS, head, &blobs),
+            Err(Fail::Refused),
+            "a host that knows the PIN must not swap in passkeys of its own"
+        );
+        assert_eq!(passkeys.bytes(), [0x55, 0xFF, 0xFF, 0xFF], "untouched");
+        assert_eq!(names(&mut other).expect("lists"), ["mine"]);
+    }
+}
+
+#[test]
+fn every_way_a_session_ends_lets_the_passkeys_go() {
+    let (_, passkeys, mut dev) = board_with_passkeys();
+
+    dev.export_begin(passphrase(PASS)).expect("begins");
+    assert!(passkeys.frozen(), "held from the double tap on");
+    dev.lock();
+    assert!(!passkeys.frozen(), "a lock ends it");
+
+    dev.pin_unlock(pin("12345678")).expect("unlocks");
+    dev.export_begin(passphrase(PASS)).expect("begins");
+    names(&mut dev).expect("lists");
+    assert!(
+        !passkeys.frozen(),
+        "anything that reloads the index ends it"
+    );
+
+    let (head, blobs) = export(&mut dev, PASS).expect("exports");
+    dev.import_begin(passphrase(PASS), head).expect("begins");
+    assert!(passkeys.frozen(), "a restore holds it too");
+    assert_eq!(
+        dev.import_item(&blobs[2]),
+        Err(Fail::BadBackup),
+        "out of order"
+    );
+    assert!(!passkeys.frozen(), "and a refused item ends it");
+
+    dev.import_begin(passphrase(PASS), head).expect("begins");
+    dev.import_end().expect("an empty restore");
+    assert!(!passkeys.frozen(), "as does the end");
+
+    dev.export_begin(passphrase(PASS)).expect("begins");
+    let mut item = Vec::new();
+    dev.export_next(|b| item = b.to_vec()).expect("the item");
+    passkeys.0.borrow_mut().expired = true;
+    assert_eq!(
+        dev.export_next(|_| {}),
+        Err(Fail::Internal),
+        "a board that let go mid-backup gives no sector, so no copy is torn"
+    );
+    assert!(!passkeys.frozen());
 }
 
 // --- the shape of a reach on the wire -------------------------------------------------------

@@ -1,7 +1,8 @@
 //! A backup file: every entry and blob on the key, each sealed by the device itself
 //! under a key made from a passphrase, so the file opens on any key that is told the
-//! passphrase - and on nothing else. This side never sees inside an item; it keeps
-//! them in the order they came out, which is the order the device will take them.
+//! passphrase - and on nothing else. Making one, this side never sees inside an item;
+//! it keeps them in the order they came out, which is the order the device will take
+//! them. Restoring, it has the passphrase, and opens them (`import`).
 //!
 //! ```text
 //! "VKB1" | salt(16) | m_kib u32le | t u32le | count u32le | (len u16le | item)*
@@ -36,15 +37,58 @@ pub fn target(path: &Path) -> Result<PathBuf, Error> {
     Ok(file)
 }
 
-/// Every item off the device into `path`; how many there were. Nothing is written
-/// until the last item is in hand, so a refused tap or a pulled cable leaves no
-/// half file behind.
-pub fn export(dev: &mut Device, path: &Path, pass: Passphrase<'_>) -> Result<usize, Error> {
+/// What a backup holds: the items, and the sectors of the board's passkeys.
+pub struct Exported {
+    pub items: usize,
+    pub sectors: usize,
+}
+
+impl Exported {
+    /// "50 items" or "50 items and the passkeys", for the line that reports it.
+    pub fn describe(&self) -> String {
+        let items = format!(
+            "{} item{}",
+            self.items,
+            if self.items == 1 { "" } else { "s" }
+        );
+        if self.sectors == 0 {
+            items
+        } else {
+            format!("{items} and the passkeys")
+        }
+    }
+}
+
+/// Every item off the device into `path`, and the passkeys after them on a board that
+/// keeps them. Nothing is written until the last one is in hand, so a refused tap or a
+/// pulled cable leaves no half file behind; and before saying it is done, this side
+/// opens every one with the passphrase it was given, so a file that would not open is
+/// never reported as a backup.
+pub fn export(dev: &mut Device, path: &Path, pass: Passphrase<'_>) -> Result<Exported, Error> {
     let path = &target(path)?;
     let head = dev.export_begin(pass)?;
     let mut items = Vec::new();
     while let Some(item) = dev.export_next()? {
         items.push(item);
+    }
+    let mut mem = vec![Block::new(); KDF_BLOCKS];
+    let key = vault::backup_key(pass, &head.salt, head.cost, &mut mem)
+        .ok_or_else(|| Error::Value("the backup's key cannot be made here".into()))?;
+    let mut exported = Exported {
+        items: 0,
+        sectors: 0,
+    };
+    for (i, sealed) in (0u32..).zip(&items) {
+        match open_item(&key, i, sealed) {
+            Some(Incoming::Region(_)) => exported.sectors += 1,
+            Some(_) => exported.items += 1,
+            None => {
+                return Err(Error::Value(
+                    "the key's backup does not open with the passphrase; nothing was written"
+                        .into(),
+                ));
+            }
+        }
     }
     let count = u32::try_from(items.len()).map_err(|_| Error::BadArg)?;
     let mut file = Vec::with_capacity(FIXED + items.iter().map(|i| 2 + i.len()).sum::<usize>());
@@ -58,7 +102,7 @@ pub fn export(dev: &mut Device, path: &Path, pass: Passphrase<'_>) -> Result<usi
     }
     write_private(path, &file)
         .map_err(|e| Error::Value(format!("cannot write {}: {e}", path.display())))?;
-    Ok(items.len())
+    Ok(exported)
 }
 
 /// Written readable by the owner alone where the filesystem has owners: the file
@@ -95,7 +139,7 @@ pub fn source(path: &Path) -> Result<PathBuf, Error> {
 use vaultkey_core::item::{Category, Class, FieldKind, Item as CoreItem};
 use vaultkey_core::oath::{Name, Params};
 use vaultkey_core::vault::{
-    self, BACKUP_AAD, Block, CryptoRng, KDF_BLOCKS, NONCE_LEN, RngCore, TAG_LEN,
+    self, BACKUP_AAD, Block, CryptoRng, KDF_BLOCKS, NONCE_LEN, REGION_AAD, RngCore, TAG_LEN,
 };
 use zeroize::Zeroizing;
 
@@ -133,71 +177,81 @@ impl RngCore for BackupRng {
 
 impl CryptoRng for BackupRng {}
 
-fn convert_legacy_item(
-    key: &[u8; vault::KEY_LEN],
-    item_idx: u32,
-    sealed: &[u8],
-) -> Result<Option<Vec<u8>>, Error> {
-    let mut aad = [0u8; BACKUP_AAD.len() + 4];
-    aad[..BACKUP_AAD.len()].copy_from_slice(BACKUP_AAD);
-    aad[BACKUP_AAD.len()..].copy_from_slice(&item_idx.to_le_bytes());
+/// `vkey auth`'s category, and its kind in a backup older than items: the login secret
+/// it served, removed 2026-10-15 (restorable from 4bd49f3). An older backup may still
+/// hold one. Nothing here uses it any more and the device refuses its category, so a
+/// restore leaves it in the file and says so.
+const RETIRED_AUTH: u8 = 201;
+const RETIRED_AUTH_KIND: [u8; 4] = [4, 0, 0, 0];
 
+/// One backup item as this side reads it: what goes back on the key, as the plaintext
+/// the device packed - `category | name_len | name | item` - a sector of the board's
+/// passkeys, or a retired item's name.
+enum Incoming {
+    Keep(Zeroizing<Vec<u8>>),
+    Region(Zeroizing<Vec<u8>>),
+    Retired(String),
+}
+
+/// Where item `item_idx` sits in the file, as its seal binds it: after `BACKUP_AAD` for
+/// an item, `REGION_AAD` for a sector.
+fn aad(prefix: &[u8], item_idx: u32) -> Vec<u8> {
+    let mut aad = prefix.to_vec();
+    aad.extend_from_slice(&item_idx.to_le_bytes());
+    aad
+}
+
+/// Item `item_idx` opened, and converted when it comes from a backup written before
+/// items existed. None when it does not open or parse.
+fn open_item(key: &[u8; vault::KEY_LEN], item_idx: u32, sealed: &[u8]) -> Option<Incoming> {
     let mut buf = Zeroizing::new(sealed.to_vec());
-    let Some(n) = vault::open_in_place(key, &aad, &mut buf) else {
-        return Ok(None);
+    let Some(n) = vault::open_in_place(key, &aad(BACKUP_AAD, item_idx), &mut buf) else {
+        // Not an item: a sector of the passkeys, or nothing this key opens.
+        let mut buf = Zeroizing::new(sealed.to_vec());
+        let n = vault::open_in_place(key, &aad(REGION_AAD, item_idx), &mut buf)?;
+        return Some(Incoming::Region(Zeroizing::new(
+            buf[NONCE_LEN..NONCE_LEN + n].to_vec(),
+        )));
     };
     let plain = &buf[NONCE_LEN..NONCE_LEN + n];
 
-    // Already v2?
     if let Some((&category, rest)) = plain.split_first()
-        && let Some((_, body)) = Name::take(rest)
-        && CoreItem::parse(body).is_some()
-        && Category::from_wire(category).is_some()
+        && let Some((name, body)) = Name::take(rest)
     {
-        return Ok(Some(sealed.to_vec()));
+        // Before the body is parsed: its own category byte is the retired one too, and
+        // the parser refuses a category it cannot name. No legacy kind is 201.
+        if category == RETIRED_AUTH {
+            return Some(retired(name));
+        }
+        if CoreItem::parse(body).is_some() && Category::from_wire(category).is_some() {
+            return Some(Incoming::Keep(Zeroizing::new(plain.to_vec())));
+        }
     }
 
     // Legacy format: Kind::WIRE_LEN (4) | name_len u8 | name | secret
-    let Some((kind_bytes, rest)) = plain.split_first_chunk::<4>() else {
-        return Ok(None);
-    };
-    let Some((name, secret)) = Name::take(rest) else {
-        return Ok(None);
-    };
+    let (kind_bytes, rest) = plain.split_first_chunk::<4>()?;
+    let (name, secret) = Name::take(rest)?;
+    if *kind_bytes == RETIRED_AUTH_KIND {
+        return Some(retired(name));
+    }
     let item = match *kind_bytes {
         [1, algo, digits, period] => {
-            let Some(params) = Params::from_wire([algo, digits, period]) else {
-                return Ok(None);
-            };
-            let Ok(sf) = crate::totp::seed_field(params, secret) else {
-                return Ok(None);
-            };
-            Item::new(Category::Login).with(sf)
+            let params = Params::from_wire([algo, digits, period])?;
+            Item::new(Category::Login).with(crate::totp::seed_field(params, secret).ok()?)
         }
         [2, 0, 0, 0] => {
-            let Some((&login_len, rest)) = secret.split_first() else {
-                return Ok(None);
-            };
-            let Some((login, rest)) = rest.split_at_checked(usize::from(login_len)) else {
-                return Ok(None);
-            };
-            let Some((&pw_len, note)) = rest.split_first() else {
-                return Ok(None);
-            };
-            let Some((password, note)) = note.split_at_checked(usize::from(pw_len)) else {
-                return Ok(None);
-            };
+            let (&login_len, rest) = secret.split_first()?;
+            let (login, rest) = rest.split_at_checked(usize::from(login_len))?;
+            let (&pw_len, note) = rest.split_first()?;
+            let (password, note) = note.split_at_checked(usize::from(pw_len))?;
             let (Ok(login), Ok(password), Ok(note)) = (
                 std::str::from_utf8(login),
                 std::str::from_utf8(password),
                 std::str::from_utf8(note),
             ) else {
-                return Ok(None);
+                return None;
             };
-            let Ok(login_item) = crate::device::login_item(login, password, note) else {
-                return Ok(None);
-            };
-            login_item
+            crate::device::login_item(login, password, note).ok()?
         }
         [3, 0, 0, 0] => Item::new(Category::Env).with(OwnedField::new(
             Class::Secret,
@@ -205,78 +259,227 @@ fn convert_legacy_item(
             ".env",
             secret,
         )),
-        [4, 0, 0, 0] => Item::new(Category::Auth).with(OwnedField::new(
-            Class::Secret,
-            FieldKind::Concealed,
-            "seed",
-            secret,
-        )),
-        _ => return Ok(None),
+        _ => return None,
     };
 
-    let Ok(packed) = item.pack() else {
-        return Ok(None);
-    };
+    let packed = item.pack().ok()?;
     let name_bytes = name.as_bytes();
-    let Ok(name_len) = u8::try_from(name_bytes.len()) else {
-        return Ok(None);
-    };
+    let name_len = u8::try_from(name_bytes.len()).ok()?;
     let mut new_plain = Zeroizing::new(Vec::with_capacity(2 + name_bytes.len() + packed.len()));
     new_plain.push(item.category.wire());
     new_plain.push(name_len);
     new_plain.extend_from_slice(name_bytes);
     new_plain.extend_from_slice(&packed);
+    Some(Incoming::Keep(new_plain))
+}
 
-    let total = new_plain.len();
-    let mut out_buf = vec![0u8; NONCE_LEN + total + TAG_LEN];
-    out_buf[NONCE_LEN..NONCE_LEN + total].copy_from_slice(&new_plain);
+fn retired(name: Name<'_>) -> Incoming {
+    Incoming::Retired(format!(
+        "{}: a `vkey auth` login secret, which vkey no longer has",
+        String::from_utf8_lossy(name.as_bytes())
+    ))
+}
+
+/// `plain` sealed as backup item `item_idx`, as the device would have sealed it.
+fn seal_item(key: &[u8; vault::KEY_LEN], item_idx: u32, plain: &[u8]) -> Result<Vec<u8>, Error> {
+    seal_at(key, &aad(BACKUP_AAD, item_idx), plain)
+}
+
+fn seal_at(key: &[u8; vault::KEY_LEN], aad: &[u8], plain: &[u8]) -> Result<Vec<u8>, Error> {
+    let total = plain.len();
+    let mut out = vec![0u8; NONCE_LEN + total + TAG_LEN];
+    out[NONCE_LEN..NONCE_LEN + total].copy_from_slice(plain);
     let mut rng = BackupRng::new();
-    let Some(sealed_len) = vault::seal_in_place(key, &mut rng, &aad, &mut out_buf, total) else {
-        return Ok(None);
-    };
+    let sealed = vault::seal_in_place(key, &mut rng, aad, &mut out, total);
     if rng.failed {
         return Err(Error::Value("no randomness from OS".into()));
     }
-    out_buf.truncate(sealed_len);
-    Ok(Some(out_buf))
+    out.truncate(sealed.ok_or(Error::BadArg)?);
+    Ok(out)
 }
 
-/// Every item in `path` onto the device; how many there were. The items go back sealed,
-/// and the device opens them - except for a backup written before items existed, which
-/// this side converts first, because the device no longer speaks the old shape.
+/// Every item in `path` onto the device; how many there were. This side holds the
+/// passphrase too, so it opens each item on the way: an item from a backup written
+/// before items existed is converted, because the device no longer speaks that shape,
+/// and a retired one is left out. What remains is sealed again in its new position -
+/// the position is in the seal, and an item left out moves every later one up. A file
+/// that does not open here goes as it is, for the device to refuse.
 pub fn import(dev: &mut Device, path: &Path, pass: Passphrase<'_>) -> Result<Restored, Error> {
     let (head, items) = read(&source(path)?)?;
+    let sectors = passkey_sectors(dev)?;
     let mut mem = vec![Block::new(); KDF_BLOCKS];
-    let converted = match vault::backup_key(pass, &head.salt, head.cost, &mut mem) {
-        Some(k) => {
-            let mut res = Vec::with_capacity(items.len());
-            for (i, item) in items.iter().enumerate() {
-                let idx = u32::try_from(i).unwrap_or(0);
-                let conv = convert_legacy_item(&k, idx, item)?.unwrap_or_else(|| item.clone());
-                res.push(conv);
-            }
-            res
-        }
-        None => items,
+    let prepared = match vault::backup_key(pass, &head.salt, head.cost, &mut mem) {
+        Some(key) => prepare(&key, items, sectors)?,
+        None => Restored {
+            count: items.len(),
+            blobs: items,
+            skipped: Vec::new(),
+            passkeys: false,
+        },
     };
 
     dev.import_begin(pass, head)?;
-    for item in &converted {
-        dev.import_item(item)?;
+    for blob in &prepared.blobs {
+        dev.import_item(blob)?;
     }
     dev.import_end()?;
-    Ok(Restored {
-        count: converted.len(),
-        skipped: Vec::new(),
-    })
+    Ok(prepared)
 }
 
-/// What a restore did: how many items are on the key, and what the file held that this
-/// build could not store. Nothing is left behind by a backup this version wrote; the
-/// field is what a caller prints when one is.
+/// The items called `names` out of the backup at `path`, put on the key beside what it
+/// holds, under the PIN: a restore of a few things that replaces nothing. An item the
+/// key already has under that name is refused, never overwritten. The names put on.
+pub fn pick(
+    dev: &mut Device,
+    path: &Path,
+    pass: Passphrase<'_>,
+    names: &[String],
+) -> Result<Vec<String>, Error> {
+    let (head, blobs) = read(&source(path)?)?;
+    let mut mem = vec![Block::new(); KDF_BLOCKS];
+    let key = vault::backup_key(pass, &head.salt, head.cost, &mut mem)
+        .ok_or_else(|| Error::Value("the backup's key cannot be made here".into()))?;
+    let mut found = Vec::new();
+    for (i, sealed) in (0u32..).zip(&blobs) {
+        let Some(incoming) = open_item(&key, i, sealed) else {
+            return Err(Error::Value(format!(
+                "{} does not open with that passphrase",
+                path.display()
+            )));
+        };
+        let Incoming::Keep(plain) = incoming else {
+            continue;
+        };
+        let Some((_, rest)) = plain.split_first() else {
+            continue;
+        };
+        let Some((name, body)) = Name::take(rest) else {
+            continue;
+        };
+        let name = String::from_utf8_lossy(name.as_bytes()).into_owned();
+        if names.contains(&name) {
+            found.push((name, Item::unpack(body)?));
+        }
+    }
+    let missing: Vec<&String> = names
+        .iter()
+        .filter(|n| !found.iter().any(|(f, _)| f == *n))
+        .collect();
+    if !missing.is_empty() {
+        return Err(Error::Value(format!(
+            "not in {}: {}; nothing was added",
+            path.display(),
+            missing
+                .iter()
+                .map(|n| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    // Every name checked before the first is written, so a refusal adds nothing.
+    let on_key = dev.list()?;
+    let taken: Vec<&str> = found
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .filter(|n| on_key.iter().any(|e| e.name == *n))
+        .collect();
+    if !taken.is_empty() {
+        return Err(Error::Value(format!(
+            "already on the key: {}; nothing was added",
+            taken.join(", ")
+        )));
+    }
+    for (name, item) in &found {
+        dev.put(name, item, false)?;
+    }
+    Ok(found.into_iter().map(|(name, _)| name).collect())
+}
+
+/// How many sectors the board on the other end keeps its passkeys in, as its folder
+/// says; 0 for none.
+pub fn passkey_sectors(dev: &mut Device) -> Result<u32, Error> {
+    let version = dev.info()?;
+    Ok(version
+        .rsplit(' ')
+        .next()
+        .and_then(crate::boards::by_name)
+        .map_or(0, |b| b.passkey_sectors))
+}
+
+/// The sector count a passkey sector was laid out for: `sector_size | count | index`
+/// lead its plaintext.
+fn region_count(plain: &[u8]) -> Option<u32> {
+    plain
+        .get(4..8)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// The items and the passkeys as the device takes them back - the passkeys only on a
+/// board that keeps them in as many sectors (`sectors`) as the file was made with, since
+/// the device refuses any other and with it the whole restore - and the names of what is
+/// left out.
+fn prepare(
+    key: &[u8; vault::KEY_LEN],
+    items: Vec<Vec<u8>>,
+    sectors: u32,
+) -> Result<Restored, Error> {
+    let opened = (0u32..)
+        .zip(&items)
+        .map(|(i, sealed)| open_item(key, i, sealed))
+        .collect::<Option<Vec<Incoming>>>();
+    let Some(opened) = opened else {
+        return Ok(Restored {
+            count: items.len(),
+            blobs: items,
+            skipped: Vec::new(),
+            passkeys: false,
+        });
+    };
+    let mut out = Restored {
+        count: 0,
+        blobs: Vec::with_capacity(opened.len()),
+        skipped: Vec::new(),
+        passkeys: false,
+    };
+    // The count the file's passkeys were laid out for, when they were left out.
+    let mut left_out: Option<u32> = None;
+    for item in opened {
+        let at = u32::try_from(out.blobs.len()).map_err(|_| Error::BadArg)?;
+        match item {
+            Incoming::Keep(plain) => {
+                out.blobs.push(seal_item(key, at, &plain)?);
+                out.count += 1;
+            }
+            Incoming::Region(plain) if sectors > 0 && region_count(&plain) == Some(sectors) => {
+                out.blobs.push(seal_at(key, &aad(REGION_AAD, at), &plain)?);
+                out.passkeys = true;
+            }
+            Incoming::Region(plain) => left_out = Some(region_count(&plain).unwrap_or(0)),
+            Incoming::Retired(name) => out.skipped.push(name),
+        }
+    }
+    match left_out {
+        None => {}
+        Some(_) if sectors == 0 => out
+            .skipped
+            .push("the passkeys: this board does not keep passkeys".to_string()),
+        Some(theirs) => out.skipped.push(format!(
+            "the passkeys: laid out for {theirs} sectors, this board keeps {sectors}"
+        )),
+    }
+    Ok(out)
+}
+
+/// What a restore did: how many items are on the key, whether the passkeys went back
+/// too - the key then restarts to load them - and what the file held that this board
+/// could not take: the passkeys on one without them, a retired `vkey auth` secret from
+/// an older backup.
 pub struct Restored {
     pub count: usize,
+    pub passkeys: bool,
     pub skipped: Vec<String>,
+    /// The sealed items and sectors as they went to the device.
+    blobs: Vec<Vec<u8>>,
 }
 
 /// The file's head and items, checked for shape only: what is inside an item is the
@@ -339,7 +542,7 @@ mod tests {
             vault::seal_in_place(&key, &mut rng, &aad, &mut sealed, total).expect("seals");
         sealed.truncate(sealed_len);
 
-        let res = convert_legacy_item(&key, item_idx, &sealed).expect("no error");
+        let res = open_item(&key, item_idx, &sealed);
         assert!(res.is_none(), "invalid UTF-8 in login must fail conversion");
 
         // Invalid UTF-8 in note
@@ -359,7 +562,7 @@ mod tests {
             vault::seal_in_place(&key, &mut rng, &aad, &mut sealed2, total2).expect("seals");
         sealed2.truncate(sealed_len2);
 
-        let res2 = convert_legacy_item(&key, item_idx, &sealed2).expect("no error");
+        let res2 = open_item(&key, item_idx, &sealed2);
         assert!(res2.is_none(), "invalid UTF-8 in note must fail conversion");
 
         // Valid legacy login
@@ -379,7 +582,133 @@ mod tests {
             vault::seal_in_place(&key, &mut rng, &aad, &mut sealed3, total3).expect("seals");
         sealed3.truncate(sealed_len3);
 
-        let res3 = convert_legacy_item(&key, item_idx, &sealed3).expect("no error");
-        assert!(res3.is_some(), "valid legacy login must convert");
+        let res3 = open_item(&key, item_idx, &sealed3);
+        assert!(
+            matches!(res3, Some(Incoming::Keep(_))),
+            "valid legacy login must convert"
+        );
+    }
+
+    /// `category | name_len | name | item` for an item of `category` holding one field.
+    fn backup_plain(category: u8, name: &str, body_category: u8) -> Vec<u8> {
+        let mut plain = vec![category, u8::try_from(name.len()).expect("fits")];
+        plain.extend_from_slice(name.as_bytes());
+        // An item of no fields: `category | count`.
+        plain.extend_from_slice(&[body_category, 0]);
+        plain
+    }
+
+    #[test]
+    fn a_retired_auth_item_is_left_out_and_the_rest_move_up() {
+        let key = [7u8; vault::KEY_LEN];
+        let login = Category::Login.wire();
+        let env = Category::Env.wire();
+        let file = [
+            backup_plain(login, "github", login),
+            backup_plain(RETIRED_AUTH, "hifes@pop-os", RETIRED_AUTH),
+            backup_plain(env, "app", env),
+        ];
+        let sealed: Vec<Vec<u8>> = (0u32..)
+            .zip(&file)
+            .map(|(i, p)| seal_item(&key, i, p).expect("seals"))
+            .collect();
+
+        let Restored {
+            blobs: items,
+            skipped,
+            ..
+        } = prepare(&key, sealed, 44).expect("prepares");
+        assert_eq!(items.len(), 2, "the auth secret stays in the file");
+        assert_eq!(skipped.len(), 1, "and is named: {skipped:?}");
+        assert!(skipped[0].starts_with("hifes@pop-os:"), "{skipped:?}");
+        for (i, (item, want)) in (0u32..).zip(items.iter().zip([&file[0], &file[2]])) {
+            let Some(Incoming::Keep(plain)) = open_item(&key, i, item) else {
+                panic!("item {i} opens at its new position");
+            };
+            assert_eq!(
+                plain.as_slice(),
+                want.as_slice(),
+                "item {i} unchanged inside"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_that_does_not_open_here_goes_as_it_is() {
+        let key = [7u8; vault::KEY_LEN];
+        let login = Category::Login.wire();
+        let sealed =
+            vec![seal_item(&key, 0, &backup_plain(login, "github", login)).expect("seals")];
+        let out = prepare(&[8u8; vault::KEY_LEN], sealed.clone(), 44).expect("prepares");
+        assert_eq!(
+            out.blobs, sealed,
+            "a wrong passphrase is the device's to refuse"
+        );
+        assert!(out.skipped.is_empty());
+    }
+
+    /// A passkey sector's plaintext as the device writes it: `sector_size | count | index`
+    /// and then the sector, here cut short.
+    fn region_plain(count: u32) -> Vec<u8> {
+        let mut plain = Vec::new();
+        for word in [4096u32, count, 0] {
+            plain.extend_from_slice(&word.to_le_bytes());
+        }
+        plain.extend_from_slice(&[0x5A; 16]);
+        plain
+    }
+
+    #[test]
+    fn passkeys_move_up_behind_the_items_or_stay_in_the_file() {
+        let key = [7u8; vault::KEY_LEN];
+        let login = Category::Login.wire();
+        let sector = region_plain(44);
+        let file = [
+            seal_item(
+                &key,
+                0,
+                &backup_plain(RETIRED_AUTH, "hifes@pop-os", RETIRED_AUTH),
+            )
+            .expect("seals"),
+            seal_item(&key, 1, &backup_plain(login, "github", login)).expect("seals"),
+            seal_at(&key, &aad(REGION_AAD, 2), &sector).expect("seals"),
+        ];
+
+        let out = prepare(&key, file.to_vec(), 44).expect("prepares");
+        assert_eq!((out.count, out.passkeys, out.blobs.len()), (1, true, 2));
+        let Some(Incoming::Region(plain)) = open_item(&key, 1, &out.blobs[1]) else {
+            panic!("the sector opens one place up, under the sectors' associated data");
+        };
+        assert_eq!(plain.as_slice(), sector.as_slice());
+
+        let out = prepare(&key, file.to_vec(), 0).expect("prepares");
+        assert_eq!((out.count, out.passkeys, out.blobs.len()), (1, false, 1));
+        assert!(
+            out.skipped.iter().any(|s| s.starts_with("the passkeys")),
+            "a board without passkeys takes the items and names what it leaves: {:?}",
+            out.skipped
+        );
+    }
+
+    #[test]
+    fn passkeys_laid_out_for_another_size_stay_in_the_file() {
+        let key = [7u8; vault::KEY_LEN];
+        let login = Category::Login.wire();
+        let file = [
+            seal_item(&key, 0, &backup_plain(login, "github", login)).expect("seals"),
+            seal_at(&key, &aad(REGION_AAD, 1), &region_plain(20)).expect("seals"),
+            seal_at(&key, &aad(REGION_AAD, 2), &region_plain(20)).expect("seals"),
+        ];
+        let out = prepare(&key, file.to_vec(), 44).expect("prepares");
+        assert_eq!(
+            (out.count, out.passkeys, out.blobs.len()),
+            (1, false, 1),
+            "the items go back, the sectors the device would refuse do not"
+        );
+        assert_eq!(
+            out.skipped,
+            ["the passkeys: laid out for 20 sectors, this board keeps 44"],
+            "and the restore says why"
+        );
     }
 }

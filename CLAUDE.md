@@ -1,11 +1,13 @@
 # Project rules
 
-**vaulttecdev** — a hardware key on ESP32-C6: TOTP codes, passwords and project `.env`
-files. One board, own code.
+**vaulttecdev** — a hardware key for TOTP codes, passwords and project `.env` files, own
+code. Two boards: the Makerdiary nRF52840 MDK USB Dongle (the key, not yet for real
+secrets) and the Waveshare ESP32-C6-Zero (a test board, not a fallback). Neither holds
+real secrets yet.
 
 | Part | What it is |
 |---|---|
-| `firmware/core` | Firmware as a chip-free library: `proto` (frames), `device` (PIN, entries), `vault` (KDF/AEAD), `store` (flash, A/B image), `oath` (entry kinds, HOTP/TOTP), `ui` (button rules), `hal` (four traits — port, clock, button+LED, chip key; flash and RNG arrive via `embedded-storage` and `rand_core`). Bare-metal Rust, `no_std`, no RTOS; crypto from RustCrypto. |
+| `firmware/core` | Firmware as a chip-free library: `proto` (frames), `device` (PIN, entries), `vault` (KDF/AEAD), `store` (flash, A/B image), `oath` (entry kinds, HOTP/TOTP), `ui` (button rules), `hal` (five traits — port, clock, button+LED, chip key, attachment: flash a backup carries besides the vault; flash and RNG arrive via `embedded-storage` and `rand_core`). Bare-metal Rust, `no_std`, no RTOS; crypto from RustCrypto. |
 | `firmware/boards/<board>/` | One board = one folder: `Cargo.toml` with the chip crates, `.cargo/config.toml` with the target, `src/main.rs` with pins and trait impls, `board.toml`, `bootloader/`, `images/`. The chip name appears **nowhere** outside such a folder. |
 | `cli/` | The `vkey` command: one static binary. Subcommands for scripts (`clap`), an interactive shell (`crossterm`, draws itself), flashing through `espflash` as a library with images embedded via `include_bytes!`. All user work goes through this CLI. |
 
@@ -13,7 +15,16 @@ files. One board, own code.
 
 Decision of 2026-09-07. The key is built for the maintainer's own accounts. Sales,
 production runs, enclosures, provisioning, certifications and marketing are **not built and
-not proposed** unless the maintainer says otherwise. Passkey/WebAuthn is closed permanently.
+not proposed** unless the maintainer says otherwise. Passkey/WebAuthn was closed because the
+C6 has no USB HID; reopened 2026-10-03 for the nRF52840 board on Trussed +
+`fido-authenticator`, not an own CTAP2 (maintainer's decision, `docs/makerdiary.md`). It
+never exists on the C6.
+
+**The nRF52840 board is the key; the C6 is a test board, not a fallback** (maintainer's
+decisions, 2026-10-13 and 2026-10-14). Every feature is built for the nRF. Nothing is kept
+only so the C6 works. A C6 need that remains is driven by its board folder or
+`board.toml`, not by shared code. Real secrets go onto the nRF when phases 3-5 of
+`docs/roadmap.md` are done, not when features are done.
 
 Consequence for code: "convenience for a buyer" is not an argument; security of the
 maintainer's own secrets and minimal code are.
@@ -98,16 +109,21 @@ This is a security device. The rules below are not recommendations.
   that as dead code).
 - **Never log** keys, PINs or secrets. Not even in a debug build: a debug build eventually
   ships.
-- **Randomness comes only from `Trng` with `TrngSource` enabled.** Without it the RNG
-  register is not random. The handle lives for the whole runtime.
+- **Randomness comes only from the chip's hardware RNG, set up as the chip requires.** On
+  the nRF52840 it is the RNG peripheral with bias correction, which
+  `nrf52840_hal::rng::Rng::new` switches on. On the C6 it is `Trng` with `TrngSource`
+  enabled - without it the RNG register is not random - and the handle lives for the whole
+  runtime.
 - **Validate every input** that arrives over USB. The host is assumed hostile.
 - **Fail closed.** If anything goes wrong, the operation does not happen.
 - **Spend the PIN attempt before checking, not after.** Otherwise cutting power mid-check
   yields free attempts. In flash this is one word write without an erase.
 - **A claim in the protocol must hold in the code.** Advertising a guarantee only half the
   paths enforce is worse than not advertising it.
-- **Irreversible actions get their own gesture.** Code, password and a `vkey auth` login — a tap (amber); wipe —
-  hold 5 s (red); backup — double tap (blue). A tap never wipes and never exports; a hold
+- **Irreversible actions get their own gesture.** Code, password, a `vkey auth` login, a
+  signed git commit and a passkey on the nRF52840 — a tap (amber); wipe, a restore from a
+  `.vkb` (it replaces every item, and the passkeys when the file carries them; 2026-10-16) and erasing every passkey
+  (authenticatorReset) — hold 5 s (red); backup — double tap (blue). A tap never wipes and never exports; a hold
   never exports; a double tap never wipes. Password on a tap is the maintainer's decision of
   2026-09-08 — do not reintroduce a separate hold. A new command with consequences gets a
   new gesture, not an existing one.
@@ -121,29 +137,57 @@ This is a security device. The rules below are not recommendations.
 ### A board is a folder
 
 A new board is `firmware/boards/<name>/` and nothing else: copy an existing folder,
-**measure the pins with a probe** (never copy from the datasheet — silent breakage), fix
-`main.rs`, the chip crates, the target and `board.toml`. `./tools/build-vaultkey.sh` builds
+**confirm every pin on the board itself** - with a probe, or by watching it work (the LED
+lights, the button registers) - never trust the datasheet or wiki alone (silent breakage),
+fix `main.rs`, the chip crates, the target and `board.toml`. There is no SWD probe and
+there will not be one: anything that needs it is off the table. `./tools/build-vaultkey.sh` builds
 it and embeds its images into the CLI. Acceptance is the same as for any board.
 
 Core requires flash with a 4 KiB sector and word-aligned 4-byte reads and writes (checked in
 `Store::new`; the fake flash in tests rejects unaligned access too, because `esp-storage`
-without `bytewise-read` behaves that way). Everything else is the board folder's business.
+without `bytewise-read` behaves that way), and writes a word at most twice between erases
+(the nRF52840's limit; the fake flash refuses a third write). Everything else is the board
+folder's business.
 
-The one board today is the Waveshare ESP32-C6-Zero: USB is a fixed Serial/JTAG
-(`303a:1001`), HID is impossible, so passkey will never exist here; one port carries both
-the protocol and logs — hence the `VTC2` magic word in frames. Pins and pitfalls:
-`docs/hardware.md`.
+The boards:
+
+- **`nrf52840-mdk-dongle`**, the primary. USB from the firmware (`1209:0001`), polled:
+  CDC-ACM for vkey and CTAPHID for passkeys (Trussed + `fido-authenticator` in
+  `src/fido.rs`, their littlefs at 0xC8000..0xF4000, 44 blocks up to the bootloader,
+  `passkey_sectors` in its `board.toml`). The stack sits at the bottom of RAM,
+  200 KiB, so an overflow resets the chip ("lockup" in `vkey info`). Our UF2 bootloader fork (installed 2026-10-14, below) is how it is flashed: hold
+  the button while plugging in, copy `images/vaultkey.signed.uf2` to `UF2BOOT`, replug. It
+  runs only images signed with the key in `bootloader/signing-key.pem`; the app ends by
+  its signature slot at 0x96000. No chip key, so it holds no real secrets yet. `vkey
+  info` prints the chip's build code, UICR `APPROTECT` and last reset cause. Notes,
+  measurements and factory state: `docs/makerdiary.md`; the plan: `docs/roadmap.md`.
+- **`esp32c6-zero`**, the test board (2026-10-14): no feature is built for it, and it takes
+  `check --wipe-everything` for core changes. Its images are signed by
+  `tools/sign-vaultkey.sh` with `vkey-signing`, which also lives on the nRF since
+  2026-10-15, so a core change is signed without touching the C6. Secure Boot v2 is burned, so before its
+  first wipe a `.vkb` holding `vkey-signing` (its Secure Boot key) must exist: losing that
+  key ends its updates for good. USB is a fixed Serial/JTAG (`303a:1001`), HID is impossible, so passkey will never exist
+  here; one port carries both the protocol and logs — hence the `VTC2` magic word in
+  frames. Pins and pitfalls: `docs/hardware.md`.
 
 ### Firmware design
 
-- Crates: `esp-hal` (features `esp32c6`, `rt`, `unstable`), `esp-storage`,
-  `esp-hal-smartled`, `esp-println` (`jtag-serial`), `esp-backtrace`; RustCrypto:
-  `aes-gcm`, `argon2`, `hmac`, `sha1`, `sha2`, `subtle`, `zeroize`; `ed25519-dalek` (built on
-  RustCrypto's `signature` and `sha2`) for `vkey auth`; `crc`. Not
-  `esp-idf-hal`, not own crypto, not `esp-radio`. Toolchain: stable rustup with target
-  `riscv32imac-unknown-none-elf`; no espup, no compiler fork. Read exact API signatures in
-  `~/.cargo/registry/src/*/esp-hal-*/src/` rather than recalling them.
-- Keys: pre = Argon2id(PIN, salt; 128 KiB, `t` measured for ~1 s on the board); KEK =
+- Core crates: RustCrypto `aes-gcm`, `argon2`, `hmac`, `sha1`, `sha2`, `subtle`,
+  `zeroize`; `crc`. Not own crypto. Toolchain: stable rustup, no compiler fork.
+  - nRF52840: `nrf52840-hal`, `cortex-m`, `cortex-m-rt` (`set-vtor`, `paint-stack`),
+    `usb-device`, `usbd-serial`, `usbd-ctaphid`, `ctaphid-dispatch`, `static_cell`,
+    `heapless`; for passkeys `trussed`, `trussed-staging`, `fido-authenticator`,
+    `littlefs2`; target `thumbv7em-none-eabihf`. littlefs and `p256-cortex-m4` are C,
+    built by the host's clang with the headers in `c-headers/`. No radio driver
+    (`radio_base` below).
+  - C6: `esp-hal` (features `esp32c6`, `rt`, `unstable`), `esp-storage`,
+    `esp-hal-smartled`, `esp-println` (`jtag-serial`), `esp-backtrace`; target
+    `riscv32imac-unknown-none-elf`; no espup. Not `esp-idf-hal`, not `esp-radio`.
+
+  Read exact API signatures in `~/.cargo/registry/src/*/<crate>-*/src/` rather than
+  recalling them.
+- Keys: pre = Argon2id(PIN, salt; 128 KiB, `t` measured for ~1 s on the board - the
+  board's `KDF_COST`, handed to `Device::new`: 20 on the nRF52840, 48 on C6-Zero); KEK =
   `DeviceKey::mac`(pre) — HMAC with the eFuse key when burned (2026-09-08), otherwise
   `Unbound`; DEK = HMAC(KEK, "vaultkey/dek/v1"); verifier = HMAC(KEK, "vaultkey/verify/v1");
   AEAD with the entry name in the AAD. The header remembers the cost and whether the key is
@@ -152,6 +196,9 @@ the protocol and logs — hence the `VTC2` magic word in frames. Pins and pitfal
   the real firmware with the counter erased was costed: a fortnight for six digits, four years
   for eight). A backup passphrase is 12–128 bytes, and the CLI asks for five or six random
   words, because 128 KiB of Argon2id does not make up for a phrase a person invented.
+  Argon2's 128 KiB is taken on the stack for one derivation (`device::with_kdf_memory`,
+  never inlined), not held in a static (2026-10-15): passkeys on the nRF52840 need the
+  same RAM between derivations.
 - **A field's class decides what may leave the device**, not the item's category
   (2026-09-19, maintainer's decision; `docs/items-v2.md`). An item is a name, a category
   and up to 32 fields; a field is `class | kind | section | label | value`, the value up
@@ -173,36 +220,63 @@ the protocol and logs — hence the `VTC2` magic word in frames. Pins and pitfal
   because the device has nowhere else to keep them, and a code's shape is not a secret.
   The CLI turns an `otpauth://` URI into that on the way in and back into a URI on the way
   out (`totp::seed_field`, `totp::seed_uri`).
-- The one exception is `Auth` (2026-09-14, maintainer's decision): a 32-byte Ed25519 seed
-  for `vkey auth` (`sudo` and the lock screen via `pam_exec`), sealed under
-  `DeviceKey::mac("vaultkey/auth-key/v1")` — the eFuse key alone, never the DEK — so
-  `Respond` signs `AUTH_SIGNED_PREFIX | challenge` after a tap while locked, spending no
-  attempt. Refused on an unbound chip. Which key an item is under is decided in one place,
-  `Device::item_key`; a PIN change carries `Auth` items across untouched. A login waits 10 s for the tap
-  (`AUTH_TOUCH_TIMEOUT_MS`), then PAM asks for the password. The host keeps only the public
-  key, `/etc/vkey/auth/<user>`, and writes nothing at login. `sudo vkey auth enable` is the
-  one place the CLI writes system files: `/usr/local/bin/vkey`, the public key, and one
-  `sufficient` line in the PAM services of `SERVICES` (`cli/src/auth.rs`), each original
-  kept as `*.before-vkey`; `disable` undoes it.
+- Every item is sealed under the DEK. `vkey auth` (`sudo` and the lock screen with a tap)
+  is `pam_u2f` over the nRF52840's FIDO2 since 2026-10-15: `sudo vkey auth enable` makes
+  a `pam://<host>` credential and tries it, two taps, over its own CTAP2
+  (`cli/src/fido.rs`, because `pamu2fcfg` 1.1.0 refuses a self-attesting key), writes its
+  public half to
+  `/etc/u2f_mappings` (root's) and one `sufficient` line in the PAM services of
+  `SERVICES` (`cli/src/auth.rs`), each original kept as `*.before-vkey`; `disable` undoes
+  it. That is the one place the CLI writes system files. Both refuse to run as root
+  from a binary anyone but root can change, and name `/usr/local/sbin/vkey`
+  (`auth::ROOT_COPY`, in sudo's `secure_path`); `/settings` installs that copy
+  through `/usr/bin/sudo` when it differs and runs it. The Ed25519 scheme before it
+  (category 201 sealed under the chip key, command `Respond` 0x19) is gone, restorable
+  from 4bd49f3; both numbers stay unused, and a restore leaves such an item in the file.
+- `vkey commits enable` (2026-10-15, `cli/src/commits.rs`) signs every git commit with
+  a tap: an OpenSSH `ecdsa-sk` key on the nRF52840, its handle in `~/.config/vkey/commit-signing-key` (not `~/.ssh`, whose keys GNOME
+  Keyring's agent takes and then refuses to sign with),
+  git's global signing settings pointed at it; `disable` unsets `commit.gpgsign` only.
+  The shell's `/settings` turns `auth` and `commits` on and off by running these same
+  commands outside raw mode (`sudo` for `auth`). Linux only; macOS and Windows are
+  issues #18 and #19.
+- `vkey passkey list|rm|pin` and the shell's `passkey` tab (2026-10-16,
+  `cli/src/passkeys.rs`) list and erase the discoverable passkeys through CTAP2
+  credentialManagement under the key's FIDO PIN, which stays apart from vkey's PIN
+  (maintainer's decision): fido-authenticator keeps it as a bare SHA-256, so one PIN
+  for both would give a flash dump the vault's PIN.
 - A TOTP seed leaves the device two ways. The backup (`ExportBegin`/`ExportNext`, after a
   double tap; 2026-09-09) reseals every item under a key derived from a passphrase
   (Argon2id, `Passphrase` 12–128 bytes, without the chip key, so the file opens on another
   board) and returns them one at a time; the host sees only ciphertext and assembles a
-  `.vkb`. `ImportBegin`/`ImportItem`/`ImportEnd` is the reverse, under the PIN with no
-  gesture: the items are appended to a fresh image as they arrive and become the vault at
+  `.vkb`. `ImportBegin`/`ImportItem`/`ImportEnd` is the reverse, under the PIN and the
+  wipe's hold (2026-10-16; the PIN alone before, which let a host that knew it swap in
+  passkeys without the hold authenticatorReset takes): the items are appended to a fresh image as they arrive and become the vault at
   `ImportEnd`, so a restore that stops half-way leaves what was there before. A backup
   session is killed by any `load()`, by `lock`, and by the first error. An item's AAD is
   `BACKUP_AAD` plus its index in the file: a reordered or altered item does not open
   (`BadBackup`).
+  On the nRF52840 the backup also carries the passkeys (2026-10-15): the board's
+  `hal::Attachment`, Trussed's flash, as sealed 4 KiB sectors after the items under
+  `REGION_AAD` plus the same index, blank sectors left out, the region's geometry in each.
+  The session freezes Trussed (`start_session`/`end_session`, the one place every session
+  begins and ends), and the board lets the freeze go by itself after 10 s of a silent vkey
+  line. A restore rewrites only sectors that differ, and when it changed any the board
+  resets once the answer has left. A file with no sectors leaves the passkeys alone; a
+  board without them, or with another count of them, refuses sectors, and the CLI leaves
+  them in the file and names them (`passkey_sectors` in `board.toml`), so the items still
+  go back.
   The second way is `vkey export` (2026-09-19): an item written back into 1Password
   through `op item create`, under the same double tap, with the seed in the clear. That
   ends the claim that a seed never leaves — `docs/threat-model.md` says what it costs.
 - Secrets and PINs never come from command arguments or environment variables: the CLI asks
   hidden or reads a line from stdin, and holds them in `Zeroizing`.
-- Flash: `store.rs` knows *how*, the board says *where* (`Layout` in its `main.rs`; on
+- Flash: `store.rs` knows *how*, the board says *where* and *how big* (`Layout` in its
+  `main.rs`, checked by `Layout::fits` at compile time and again in `Store::new`; on
   C6-Zero 0x110000..0x17B000, raw flash past the `factory` partition, which the stock
   partition table does not describe). Three regions: one sector of attempt words and two
-  image copies of `STATE_SECTORS` = 53 each, filling the region exactly.
+  image copies of `state_sectors` each - 53 on C6-Zero, 24 on the nRF52840, whose 1 MiB
+  also holds the firmware, Trussed and the bootloader - filling the region exactly.
 - The image is the PIN header and every item, **packed** - `name_len | category |
   sealed_len | name | pad | sealed | pad` - not fixed slots: a seed is twenty bytes and an
   SSH key three kilobytes, and slots would make every write cost what the biggest item
@@ -222,7 +296,8 @@ the protocol and logs — hence the `VTC2` magic word in frames. Pins and pitfal
   open or build an item in, one for the items carried across while the image is rewritten.
   The attempt counter is a separate sector; an attempt is one word write with no erase,
   only via `NorFlash::write`.
-- Entropy: `TrngSource::new(RNG, ADC1)` before `Trng::try_new()`; do not drop the handle.
+- Entropy on the C6: `TrngSource::new(RNG, ADC1)` before `Trng::try_new()`; do not drop
+  the handle.
 - Acceptance happens on the board, in two tiers, because the full test wipes the device and
   a working key cannot be wiped after every change:
   - After **any** firmware change: `vkey totp selftest` green — one tap, destroys nothing,
@@ -230,13 +305,21 @@ the protocol and logs — hence the `VTC2` magic word in frames. Pins and pitfal
   - Before a **release**, and on every new board: `vkey check --wipe-everything` green too
     (it says when to tap, when to double tap and when to hold). It leaves the device with
     no PIN and no entries, so run it on an empty board — never on a key holding secrets.
-    Without a spare board, say plainly in the release that the full lifecycle test was not
-    re-run, rather than pretending it was.
+    There is no spare board: the C6 takes this test for core changes, once a `.vkb`
+    holds its `vkey-signing`, and the nRF only while it holds nothing a `.vkb` cannot
+    restore. A release that could not re-run it on
+    the nRF says so plainly rather than pretending it was.
 
   Gesture rules are proven on the host (`firmware/core/tests/key.rs`); the board verifies
   the hardware honours them.
 
 ### Points of no return
+
+**On the nRF52840, without a probe, the bootloader and UICR are irreversible.** A broken
+bootloader is a board no USB tool reaches, and UICR `APPROTECT` once written stays. Each
+such step happens only while the board holds nothing a `.vkb` cannot restore, and only on
+the maintainer's explicit go for that step (`docs/roadmap.md`, phases 3 and 4). The
+bootloader fork went in this way on 2026-10-14.
 
 **eFuses are irreversible.** Secure Boot, Flash Encryption and HMAC keys burn the chip
 forever. Never burn an eFuse without a direct instruction from the maintainer — and even
@@ -249,12 +332,18 @@ and not one line away from an everyday `setup`. The firmware detects a burned ke
 
 After any change under `firmware/`, run `./tools/build-vaultkey.sh`: it builds each board
 folder (from that folder, so its `.cargo/config.toml` applies), fails if a radio crate
-appeared in `firmware/Cargo.lock`, writes `images/vaultkey.bin` and rebuilds the CLI, since
+appeared in `firmware/Cargo.lock`, writes `images/vaultkey.bin` (through espflash or the
+toolchain's llvm-objcopy, as `image_tool` in `board.toml` says) and rebuilds the CLI, since
 images are embedded in the binary; then `cli/target/release/vkey install`. Commit images
 with the firmware change. After a change under `cli/`, `cargo build --release` and `vkey
-install`.
+install`. The no-radio check reads the lock file, which proves nothing on the nRF52840:
+its radio driver would sit inside `nrf-hal-common`. There `board.toml` names the radio's
+peripheral slot (`radio_base`), and the build fails if any data word or `movw`/`movt` pair
+in the image builds an address in it. The same search finds the slots the firmware does
+use. It catches a driver that addresses the radio directly, not an address computed from
+another peripheral's base plus an offset.
 
-Bootloaders and the partition table are built from the board's `bootloader/` folder in an
+The C6's bootloaders and partition table are built from its `bootloader/` folder in an
 ESP-IDF 5.5 Docker image by `./tools/build-bootloader.sh`, only when `bootloader/` changes.
 There are two: a plain bootloader, and a Secure Boot v2 one for a chip where
 `SECURE_BOOT_EN` is already burned. `vkey setup` asks the ROM (`GET_SECURITY_INFO`) which to
@@ -264,6 +353,30 @@ key held in vkey itself (PIN and a tap) after every firmware change; a hook veri
 signed image is the unsigned one plus a signature under `firmware/secure-boot/public.pem`.
 The partition table sits at 0xC000, because the Secure Boot bootloader does not fit below
 0x8000.
+
+The nRF52840's UF2 bootloader fork is built by the same script from its `bootloader/`
+folder: upstream Adafruit_nRF52_Bootloader at a pinned commit, the board definition read
+back from the factory binary, a patch series, a pinned Arm toolchain, all in Docker.
+`bootloader/check.py` fails the build on a UICR address in the code - as a word, an
+immediate or a movw/movt pair; like the radio search, not one computed from another base
+plus an offset. The fork runs only images signed with one Ed25519 key, checked on every
+boot (`bootloader/src/signature.c`, tested under qemu-arm by `bootloader/test/run.sh`
+before every build); `bootloader/sign.sh` makes the signed UF2. The real key is made
+once by `bootloader/signing-key.sh` and lives on the nRF itself as the `.env`
+`vkey-signing-nrf`, with a `.vkb` as the second copy. Its public half,
+`bootloader/signing-key.pem`, is committed. `bootloader/sign-vaultkey.sh` signs
+`images/vaultkey.bin`, and `images/bootloader.bin` once there, into `*.signed.uf2` (PIN
+and a tap). A hook (`check_signed_uf2`) checks each against its unsigned twin and the
+pem, and checks that `bootloader.bin` names that key. So once the pem exists, every
+firmware change is signed again too. The build needs the pem, or `BOOTLOADER_TEST_KEY`
+for a build that names itself a test build; either is refused if it holds more than a
+public key. A test-key build also makes `as-app.bin`: the same sources as an application
+at 0x1000 that runs under the factory bootloader and reports its verdicts in
+`INFO_UF2.TXT` (`bootloader/test/app_test.c`). `bootloader/test/board.sh copy` puts a UF2
+only on the drive it is meant for: a bootloader UF2 on the factory `UF2BOOT` would be
+installed. A real-key build writes `images/bootloader.bin`, which no `board.toml` names.
+A test build's outputs stay in a temporary directory. Installing the fork is never part
+of a build (`docs/roadmap.md`, phase 3).
 
 Compilation is the **only** exception to the check rule. Linters, formatters, tests and
 static analysers are not run without a direct request: git hooks in `.githooks/`
@@ -277,6 +390,13 @@ Both `Cargo.toml` files carry the same `[lints]` table: `unsafe_code = "forbid"`
 targeted `#[expect(lint, reason = "...")]` (`#[allow]` is denied by `allow_attributes`):
 when the reason disappears, the compiler says the `expect` is no longer needed.
 
+One exception, the maintainer's decision of 2026-10-04: `nrf52840-mdk-dongle` carries its
+own copy of the table with `unsafe_code = "deny"`, because its flash driver takes the
+data region (the vault and Trussed's filesystem) as a `&'static mut [u8]` and
+memory-mapped flash cannot be named in safe code. The one `unsafe` is `data_region` in its
+`main.rs`, under `#[expect]` and a `SAFETY` comment. `tools/checks.sh` fails if that copy differs from the workspace's in anything
+else.
+
 Invalid state does not exist as a value: `Pin`, `Name`, `Params`, `Entry`, `Record` are
 built only by constructors returning `Option`; in the CLI likewise `EnvBlob`. Parsing from
 the wire and from flash happens once, at the edge (`proto.rs`, `store.rs`), and nothing
@@ -286,16 +406,20 @@ cable. Add a new validity condition to the type's constructor, not to the call s
 
 ### Working with the board
 
-- Do not hardcode the port: after flashing or a reset `ttyACM0` may become `ttyACM1`. Find
-  it by VID `0x303A`.
+- Do not hardcode the port: after flashing or a reset `ttyACM0` may become `ttyACM1`. The
+  CLI finds it by the VID/PID in each `board.toml`, and refuses to guess when two keys are
+  plugged in; `--port` names one. The nRF also has
+  `/dev/serial/by-id/usb-vaulttecdev_vkey-if00`.
 - `pkill -f <pattern>` matches the shell that contains the pattern and kills the session.
   Kill by PID.
 - After a `cd` in a command, relative paths do not lead where they seem to. Use absolute.
 - A session without the `dialout` group cannot open the port; espflash says "busy or doesn't
   exist" and `vkey` says "no permission". Fix: re-login after `usermod`; in scripts,
   `sg dialout -c '...'`.
-- Firmware logs go to the same USB port as the protocol. Watch with `espflash monitor`;
-  `cat /dev/ttyACM0` stays silent.
+- C6 firmware logs go to the same USB port as the protocol. Watch with `espflash monitor`;
+  `cat /dev/ttyACM0` stays silent. The nRF firmware logs nothing.
+- After a UF2 copy the nRF's warm start does not enumerate (`descriptor read -110`):
+  replug it. A copy makes `sync` hang while the bootloader resets; use `timeout 20 sync`.
 - Before a physical test, confirm the board runs the intended firmware: `info` returns the
   version and the board name.
 - Do not guess the device PIN: every wrong attempt costs one of eight. Only the maintainer
