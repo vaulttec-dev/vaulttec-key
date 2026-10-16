@@ -1,0 +1,31 @@
+firmware/core/Cargo.toml
+  s_98f11d4f1f873b::t_f773dbcbececb8 3
+firmware/core/src/lib.rs
+  s_98f11d4f1f873b::t_1628e552b83729 28
+firmware/boards/esp32c6-zero/Cargo.toml
+  s_98f11d4f1f873b::t_107cdd23b5752e 3
+cli/Cargo.toml
+  s_98f11d4f1f873b::t_e92bff6d6bd533 3
+firmware/boards/nrf52840-mdk-dongle/Cargo.toml
+  s_98f11d4f1f873b::t_0947e96de80ecb 3
+cli/Cargo.lock
+  s_98f11d4f1f873b::t_fab4b71de37c10 1972,2000
+firmware/Cargo.lock
+  s_98f11d4f1f873b::t_874ccc58df7f5c 3033,3049,3064
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6e4813d9c5a0bc0a3ddb357f4900955d228d1e49",
+  "prompts": {},
+  "sessions": {
+    "s_98f11d4f1f873b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fa022102-2ef3-4e36-8c99-2207a61ae07b",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "VaultTec-Dev <vaulttec-dev@proton.me>"
+    }
+  }
+}
