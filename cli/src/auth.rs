@@ -69,7 +69,9 @@ pub fn enable() -> Result<u8, Error> {
     // Before the taps: a refusal should cost none.
     only_ours(&read_or_empty(Path::new(MAPPINGS))?, &user)?;
     let mapping = enrol(&user)?;
+    // And again after them, on what is about to be rewritten.
     let existing = read_or_empty(Path::new(MAPPINGS))?;
+    only_ours(&existing, &user)?;
     file::replace(
         Path::new(MAPPINGS),
         with_mapping(&existing, &user, &mapping).as_bytes(),
@@ -187,10 +189,13 @@ fn with_mapping(existing: &str, user: &str, mapping: &str) -> String {
 /// FIDO key - which `enable` or `disable` would erase without a word.
 fn only_ours(existing: &str, user: &str) -> Result<(), Error> {
     let mine = format!("{user}:");
-    let Some(line) = existing.lines().find(|l| l.starts_with(&mine)) else {
-        return Ok(());
-    };
-    if line[mine.len()..].split(':').count() > 1 {
+    // Every line of the user's counts: `without_mapping` drops them all.
+    let held: usize = existing
+        .lines()
+        .filter_map(|l| l.strip_prefix(&mine))
+        .map(|creds| creds.split(':').count())
+        .sum();
+    if held > 1 {
         return Err(Error::Value(format!(
             "{MAPPINGS} maps more than one key for {user}, and vkey replaces the line \
              whole: take the other keys out of that line by hand first, or add vkey's \
@@ -410,6 +415,10 @@ mod tests {
         assert!(
             only_ours(one, "alice").is_err(),
             "two credentials: one of them is not vkey's"
+        );
+        assert!(
+            only_ours("hifes:k,k\nhifes:m,m\n", "hifes").is_err(),
+            "two lines of one user are two credentials too"
         );
     }
 }
