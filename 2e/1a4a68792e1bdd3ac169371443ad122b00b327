@@ -1,0 +1,84 @@
+cli/src/op.rs
+  s_98f11d4f1f873b::t_134ac6d2f10d11 458,460-475,482
+cli/src/file.rs
+  s_98f11d4f1f873b::t_64087227993d66 15-16
+firmware/boards/nrf52840-mdk-dongle/bootloader/sign-vaultkey.sh
+  s_98f11d4f1f873b::t_fcfc862ba7b2c8 31-32
+tools/build-vaultkey.sh
+  s_98f11d4f1f873b::t_342a9a8ff24712 42,45-49
+firmware/boards/nrf52840-mdk-dongle/bootloader/signing-key.sh
+  s_98f11d4f1f873b::t_a8f8cadc9d96bb 35-36
+cli/src/fido.rs
+  s_98f11d4f1f873b::t_e36f21a50a4774 645-647
+  s_98f11d4f1f873b::t_3565085af0d997 298-302
+  s_98f11d4f1f873b::t_953db3f8d9e3cc 642-644,648-649
+  s_98f11d4f1f873b::t_582ce5ddc76b4f 277-281
+  s_98f11d4f1f873b::t_1a1cffb78ec25f 481,484-494
+cli/src/setup.rs
+  s_98f11d4f1f873b::t_af7b29d5b7dd11 204-205,209-211
+.github/workflows/ci.yml
+  s_98f11d4f1f873b::t_3d2989eb3c6f0b 137-138
+.githooks/pre-commit
+  s_98f11d4f1f873b::t_15faaa434b2d65 22
+tools/checks.sh
+  s_98f11d4f1f873b::t_6dc1db308f9751 149-155
+docs/makerdiary.md
+  s_98f11d4f1f873b::t_68fb50f0a95cbf 42
+  s_98f11d4f1f873b::t_c9f052d44f9ddb 4-5
+  s_98f11d4f1f873b::t_a7812e1648c777 78-79
+cli/src/check.rs
+  s_98f11d4f1f873b::t_75eb6358d0d074 389-390,394-395
+docs/hardware.md
+  s_98f11d4f1f873b::t_270b491c917b82 216
+docs/threat-model.md
+  s_98f11d4f1f873b::t_e5ecbb40e9246c 308
+CLAUDE.md
+  s_98f11d4f1f873b::t_5bb41b5e827370 164
+  s_98f11d4f1f873b::t_f550c9226e95bf 125
+  s_98f11d4f1f873b::t_7db42b3efe5b5b 10
+cli/src/shell.rs
+  s_98f11d4f1f873b::t_98a4ed7a84b37b 907-910
+  s_98f11d4f1f873b::t_dc226c6cc83641 1723
+cli/src/commits.rs
+  s_98f11d4f1f873b::t_36ddbd1136d124 38-39
+  s_98f11d4f1f873b::t_84ffe52177d2a7 188-189,191
+  s_98f11d4f1f873b::t_5418982606a8cd 79,81-82,85
+firmware/core/src/vault.rs
+  s_98f11d4f1f873b::t_68678a8710c5ca 36
+tools/build-bootloader.sh
+  s_98f11d4f1f873b::t_54f17b5e5d9e46 97-98
+cli/src/backup.rs
+  s_98f11d4f1f873b::t_daad7004290ad2 380,384
+  s_98f11d4f1f873b::t_05ee69b45d9976 379,381-383,385-391,400
+cli/src/auth.rs
+  s_98f11d4f1f873b::t_c941bd978b54b8 298-299
+README.md
+  s_98f11d4f1f873b::t_a14c5564f018f4 20-21
+  s_98f11d4f1f873b::t_10e276c8075fe7 61
+  s_98f11d4f1f873b::t_e459fdc3e25fc1 182-183
+firmware/boards/nrf52840-mdk-dongle/bootloader/check.py
+  s_98f11d4f1f873b::t_fb6e7253afef9e 49-50,53
+  s_98f11d4f1f873b::t_12576b134b4d5a 71-74
+  s_98f11d4f1f873b::t_2e9858b1d70472 8
+docs/roadmap.md
+  s_98f11d4f1f873b::t_f7500df13ebf97 37-38
+  s_98f11d4f1f873b::t_148c93b7508b9d 22-25
+  s_98f11d4f1f873b::t_2b6a5cb807d49c 65-66
+  s_98f11d4f1f873b::t_3bce48ce4c2b37 45
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2e1a4a68792e1bdd3ac169371443ad122b00b327",
+  "prompts": {},
+  "sessions": {
+    "s_98f11d4f1f873b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fa022102-2ef3-4e36-8c99-2207a61ae07b",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "VaultTec-Dev <vaulttec-dev@proton.me>"
+    }
+  }
+}
