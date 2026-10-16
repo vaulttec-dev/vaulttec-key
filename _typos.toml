@@ -1,14 +1,28 @@
 # Words the spell checker flags that are correct here. Each one is a name from
 # somewhere else - an API, a package, a diagram node - not prose we chose.
+[default]
+extend-ignore-re = [
+    "`[0-9a-f]{7,40}`",   # a commit hash in backticks, docs/
+]
+
 [default.extend-identifiers]
 nin = "nin"          # csv-core read_record: bytes consumed
 nout = "nout"        # csv-core read_record: bytes written
+BOOTLOADER_ADDR_NEW_RECIEVED = "BOOTLOADER_ADDR_NEW_RECIEVED"   # Adafruit_nRF52_Bootloader
+CFG_TUD_ENDOINT0_SIZE = "CFG_TUD_ENDOINT0_SIZE"                 # Adafruit_nRF52_Bootloader
 
 [default.extend-words]
 BA = "BA"            # mermaid node id, docs/threat-model.md
 BK = "BK"            # mermaid node id, docs/threat-model.md
+cose = "cose"        # COSE, RFC 9052: how CTAP2 encodes a public key
 gir = "gir"          # the Debian package gir1.2-vte-2.91
 Unparented = "Unparented"   # GTK term: a widget with no parent
+
+# A patch's context and removed lines are upstream's text, not ours to spell;
+# its added lines are checked like any other file.
+[type.patch]
+extend-glob = ["*.patch"]
+extend-ignore-re = ["(?m)^[- ].*$"]
 
 [files]
 extend-exclude = ["*.bin", "*.pem", "Cargo.lock"]
