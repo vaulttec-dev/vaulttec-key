@@ -787,11 +787,11 @@ Milestones, one commit each, each leaving a key that works:
    that leaves the vault and the passkeys as they were, then one that goes through
    with the hold; `/settings` → `auth` through the root copy.
 
-   **Accepted 2026-10-16**, but for `/settings` → `auth`: a `.vkb` of 48 items and the
+   **Accepted 2026-10-16**: a `.vkb` of 48 items and the
    passkeys; `selftest` green; the restore with the hold brought back 48 items and the
    passkeys (`github.com` still listed), one with a tap was refused; `sudo
-   ~/.local/bin/vkey auth enable` refused and named `/usr/local/sbin/vkey`. The
-   switch through the root copy is not yet run on this host.
+   ~/.local/bin/vkey auth enable` refused and named `/usr/local/sbin/vkey`; the
+   maintainer ran the `/settings` → `auth` switch through the root copy on this host.
 
 ---
 
