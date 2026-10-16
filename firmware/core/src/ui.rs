@@ -5,7 +5,8 @@
 //! exists to stop.
 //!
 //! There are three gestures, and the differences are the point. A code or a password
-//! is approved by a tap while the light is amber. The wipe needs five seconds of red.
+//! is approved by a tap while the light is amber. The wipe needs five seconds of red,
+//! and so does a restore, which replaces everything as a wipe does.
 //! A backup - every secret leaving at once, sealed - needs two taps in a row while
 //! the light is blue. Without that split the button would guard nothing against a
 //! hostile host: it would ask for a wipe while the owner expected a code request, and

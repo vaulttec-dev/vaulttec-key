@@ -92,6 +92,8 @@ const DANGER: usize = 2;
 /// `❯ /rm name` is a line that would work.
 const LIST_COMMANDS: &[&str] = &["add", "edit", "rm", "import", "passkeys", "passkey-rm"];
 const SETTLE: Duration = Duration::from_millis(120);
+/// By its full path: a `sudo` earlier in the user's PATH is not the one meant.
+const SUDO: &str = "/usr/bin/sudo";
 
 // The palette Claude Code uses: one warm accent (ACCENT and DIM live in prompt.rs),
 // everything else grey or semantic.
@@ -2263,6 +2265,7 @@ impl Shell {
         };
         passphrase(&pass)?;
         self.ensure_unlocked()?;
+        self.hold_hint(" - a restore replaces everything on the key");
         let restored = backup::import(self.dev()?, &path, passphrase(&pass)?)?;
         let done = format!(
             "  {} item{}{} restored from {}",
@@ -2428,22 +2431,41 @@ impl Shell {
                 return Ok(());
             }
             self.line(DIM, "  sudo asks for your password, or a tap");
-            if !self.outside(Command::new("sudo").args([
-                "apt-get",
-                "install",
-                "-y",
-                "libpam-u2f",
-            ]))? {
+            if !self.outside(Command::new(SUDO).args(["apt-get", "install", "-y", "libpam-u2f"]))? {
                 return Err(Error::Value("apt-get could not install libpam-u2f".into()));
             }
         }
-        // sudo's secure_path leaves out ~/.local/bin: the binary goes by its full path.
+        // Root runs its own copy, which only root can change; it is brought up to this
+        // binary first if it differs, so the switch never runs a stale one.
         let verb = if on { "disable" } else { "enable" };
         self.line(
             DIM,
             "  sudo asks for your password, or a tap if it already takes one",
         );
-        self.outside(Command::new("sudo").arg(&exe).args(["auth", verb]))?;
+        if std::fs::read(auth::ROOT_COPY).ok() != Some(std::fs::read(&exe)?) {
+            self.line(
+                DIM,
+                &format!(
+                    "  root runs vkey from {}, a copy only root can change",
+                    auth::ROOT_COPY
+                ),
+            );
+            let copied = self.outside(
+                Command::new(SUDO)
+                    .arg("install")
+                    .arg("-m")
+                    .arg("0755")
+                    .arg(&exe)
+                    .arg(auth::ROOT_COPY),
+            )?;
+            if !copied {
+                return Err(Error::Value(format!(
+                    "could not copy vkey to {}",
+                    auth::ROOT_COPY
+                )));
+            }
+        }
+        self.outside(Command::new(SUDO).args([auth::ROOT_COPY, "auth", verb]))?;
         Ok(())
     }
 

@@ -97,8 +97,10 @@ and every guarantee below that rests on the eFuse key, JTAG being off or Secure 
     Passkeys are not served while the backup runs, so the copy is never torn.
     - Whoever has the `.vkb` and its passphrase has the passkeys. Restored onto another
       nRF52840, they make a clone that answers every site and this host's `sudo`.
-    - A restore replaces the passkeys with the PIN alone and no gesture, as it replaces
-      the vault. A file with no passkeys leaves them as they are.
+    - A restore replaces the passkeys, as it replaces the vault, after the PIN and the
+      wipe's 5 s hold (since 2026-10-16; before, the PIN alone was enough, which let a
+      host that knew the PIN skip the hold authenticatorReset takes). A file with no
+      passkeys leaves them as they are.
     - Restoring an older backup winds the signature counters back. A site that checks
       them may take the key for a clone.
     - A restore cut short leaves the region torn. The key formats it on its next start,
@@ -184,7 +186,7 @@ before the burn became `Incompatible` and was wiped.
 | Gesture | Action | LED |
 |---|---|---|
 | Tap | code, the secret fields of an item, a `.env`, a passkey, a `vkey auth` login | amber |
-| Hold 5 s | wipe; on the nRF52840 also erasing every passkey | red |
+| Hold 5 s | wipe; a restore from a `.vkb`, which replaces everything; on the nRF52840 also erasing every passkey | red |
 | Double tap, 800 ms window | encrypted backup, **and an export or seed readout** | blue |
 
 A tap never wipes and never exports; a hold never exports; a double tap never wipes. One
@@ -277,8 +279,12 @@ its strength is the passphrase's — keep it where you keep other backups, and t
 passphrase elsewhere. Host malware during `backup` gets the same ciphertext the owner
 gets; it cannot swap a code request for an export, and it can substitute its own
 passphrase only if the owner happens to double tap, which is never needed otherwise.
-`vkey restore` writes the file back under PIN with no gesture, like `add`: nothing comes
-out, a duplicate name replaces, and entry versus blob the newer one from the file wins.
+`vkey restore` writes the file back under the PIN and the wipe's 5 s hold (since
+2026-10-16; before, the PIN alone): nothing comes out, but everything is replaced, the
+passkeys too, so a host that learned the PIN cannot swap in a vault or passkeys of its
+own. `vkey restore --only` adds items beside the vault under the PIN alone, like `add`;
+`add` and `rm` of one item stay gesture-free, so such a host can still delete items one
+by one, never the passkeys.
 Rejected: a flash-image copy as backup — PIN-encrypted, 8 digits fall offline in days, and
 it does not transfer while bound to the chip key.
 
@@ -302,6 +308,7 @@ mapping. The line is `sufficient`: what it adds is a way in, and the password st
 | Given | A login needs this physical key and a fresh tap after the request; the host holds a public key only; no vkey PIN, locked or not, and no attempt spent |
 | Laptop and key stolen together | The lock screen opens with a tap. A powered-off laptop is protected by disk encryption, not by this. Carry the key separately, do not leave it in the port |
 | Malware running as the user | Can start `sudo` and wait for a reflex tap. The light is the same amber as a code or a passkey; a tap you did not ask for is the thing to refuse |
+| Malware rewriting `vkey` | `~/.local/bin/vkey` is the user's to rewrite, so `enable` and `disable` refuse to run as root from a binary, or under a directory, that anyone but root can change, and name the copy to run instead: `/usr/local/sbin/vkey`, root's, in sudo's `secure_path`. `/settings` brings that copy up to date through `/usr/bin/sudo` before it calls it (since 2026-10-16). Not closed: malware running as the user can still put a `sudo` of its own first in PATH or alias it in the shell, and catch the password the next time `sudo` asks; no program of the user's can stop that |
 | Malware enrolling a key of its own | `/etc/u2f_mappings` is root's: adding a line needs root already |
 | Someone at the unlocked laptop while you are away, key in the port | Gets root with one tap where `sudo` used to want the password |
 | A copy of the board's flash (the revision-2 glitch) | The credential's key is wrapped by fido-authenticator's key, which sits unsealed in Trussed's filesystem: whoever reads the flash can answer this host's logins, given the host |

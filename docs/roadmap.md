@@ -771,6 +771,24 @@ Milestones, one commit each, each leaving a key that works:
    passkeys and its restore, after which the key did not restart (reset cause still
    power-on, vault still unlocked). The restore's "the key restarts" now reads "if a
    passkey changed": the CLI cannot tell whether one did.
+7. **A restore takes the wipe's hold** (maintainer's decision, 2026-10-16). A restore
+   replaced the vault and the passkeys under the PIN alone, so a host that learned the
+   PIN could swap in passkeys of its own and skip the 5 s hold that authenticatorReset
+   takes. `ImportBegin` now waits for that hold before it touches anything. A core
+   change: the C6's image is rebuilt with it, but the C6 is left alone, so
+   `check --wipe-everything` is not re-run on it. With it, `sudo vkey auth` refuses to
+   run as root from a binary anyone but root can change and names the root-owned copy
+   `/usr/local/sbin/vkey`, which `/settings` keeps current.
+
+   Acceptance, on the board: a `.vkb` first, `selftest`, a restore refused by a tap
+   that leaves the vault and the passkeys as they were, then one that goes through
+   with the hold; `/settings` → `auth` through the root copy.
+
+   **Accepted 2026-10-16**, but for `/settings` → `auth`: a `.vkb` of 48 items and the
+   passkeys; `selftest` green; the restore with the hold brought back 48 items and the
+   passkeys (`github.com` still listed), one with a tap was refused; `sudo
+   ~/.local/bin/vkey auth enable` refused and named `/usr/local/sbin/vkey`. The
+   switch through the root copy is not yet run on this host.
 
 ---
 

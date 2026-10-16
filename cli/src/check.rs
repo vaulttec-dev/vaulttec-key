@@ -371,10 +371,20 @@ fn backup(
     rep.check("backup written", n.items == 3, &n.describe());
     d.delete("t")?;
     d.delete("e")?;
+    println!(
+        "  >>> a restore replaces everything, so it takes the wipe's hold, and this one \
+         must then refuse the wrong passphrase: hold {} down for five seconds when the \
+         light turns red",
+        rep.button
+    );
     rep.expect(
         "restore refused with the wrong passphrase",
         &backup::import(d, &dir, passphrase("correct horse battery")?),
         &Error::BadBackup,
+    );
+    println!(
+        "  >>> hold {} down for five seconds again when the light turns red",
+        rep.button
     );
     let done = backup::import(d, &dir, passphrase(PASS)?)?;
     rep.check(

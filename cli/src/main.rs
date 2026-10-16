@@ -409,20 +409,7 @@ fn run(cli: Cli) -> Result<u8, Error> {
             Ok(0)
         }
 
-        Cmd::Wipe { yes } => {
-            if !confirm("wipe every secret and the PIN from this key?", yes)? {
-                println!("kept");
-                return Ok(0);
-            }
-            eprintln!(
-                "hold {} on the board down for five seconds - the light turns red...",
-                boards::button(Some(&version))
-            );
-            dev.wipe()?;
-            sources::forget_all();
-            println!("wiped: no PIN, no credentials - run  vkey pin set  or /pin");
-            Ok(0)
-        }
+        Cmd::Wipe { yes } => run_wipe(&mut dev, &version, yes),
 
         Cmd::Check { wipe_everything } => {
             if !wipe_everything {
@@ -462,8 +449,30 @@ fn run(cli: Cli) -> Result<u8, Error> {
             op,
             environments,
             only,
-        } => run_restore(&mut dev, file.as_deref(), op, &environments, &only),
+        } => run_restore(
+            &mut dev,
+            &version,
+            file.as_deref(),
+            op,
+            &environments,
+            &only,
+        ),
     }
+}
+
+fn run_wipe(dev: &mut Device, version: &str, yes: bool) -> Result<u8, Error> {
+    if !confirm("wipe every secret and the PIN from this key?", yes)? {
+        println!("kept");
+        return Ok(0);
+    }
+    eprintln!(
+        "hold {} on the board down for five seconds - the light turns red...",
+        boards::button(Some(version))
+    );
+    dev.wipe()?;
+    sources::forget_all();
+    println!("wiped: no PIN, no credentials - run  vkey pin set  or /pin");
+    Ok(0)
 }
 
 fn run_list(dev: &mut Device, long: bool) -> Result<u8, Error> {
@@ -577,6 +586,7 @@ fn run_pick(dev: &mut Device, file: &Path, names: &[String]) -> Result<u8, Error
 
 fn run_restore(
     dev: &mut Device,
+    version: &str,
     file: Option<&Path>,
     op: bool,
     environments: &[String],
@@ -649,7 +659,14 @@ fn run_restore(
     let file = backup::source(&file)?;
     let pass = prompt_secret("backup passphrase")?;
     passphrase(&pass)?;
-    let done = with_unlock(dev, |d| backup::import(d, &file, passphrase(&pass)?))?;
+    let button = boards::button(Some(version));
+    let done = with_unlock(dev, |d| {
+        eprintln!(
+            "a restore replaces everything on the key: hold {button} on the board down for \
+             five seconds - the light turns red..."
+        );
+        backup::import(d, &file, passphrase(&pass)?)
+    })?;
     println!(
         "{} item{}{} restored from {}",
         done.count,

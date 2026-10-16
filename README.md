@@ -148,9 +148,14 @@ first.
 
 ```bash
 sudo apt install libpam-u2f
-sudo "$(command -v vkey)" auth enable    # two taps: sudo and the lock screen are set up
-sudo "$(command -v vkey)" auth disable   # back to the password alone
+sudo install -m 0755 "$(command -v vkey)" /usr/local/sbin/vkey   # a copy only root can change
+sudo vkey auth enable     # two taps: sudo and the lock screen are set up
+sudo vkey auth disable    # back to the password alone
 ```
+
+`enable` and `disable` refuse to run as root from `~/.local/bin`: anything running as you
+could rewrite that file and would then run as root. The copy in `/usr/local/sbin` is
+root's, and `sudo` finds it by name.
 
 `enable` makes a credential on the key (a tap), tries it the way a login will (another
 tap), writes it to `/etc/u2f_mappings` (root's), and adds
@@ -160,8 +165,9 @@ recognise it leaves alone and prints the line to add by hand. Keep a root shell 
 another terminal until `sudo` and the lock screen have both worked, with the tap and with
 the password.
 
-In the shell, `/settings` → `auth` does the same in one step, and installs `libpam-u2f`
-with apt first if it is missing.
+In the shell, `/settings` → `auth` does the same in one step: it installs `libpam-u2f`
+with apt first if it is missing, and brings `/usr/local/sbin/vkey` up to date when it
+differs from the `vkey` you run.
 
 ## Passkeys on the key
 
@@ -205,7 +211,7 @@ for now; macOS and Windows are issues #18 and #19. What it costs is in
 | Gesture | LED | What it releases |
 |---|---|---|
 | Tap | amber | one TOTP code, the secret fields of one item, one `.env`, one passkey, one `vkey auth` login, or one signed git commit |
-| Hold 5 s | red | factory wipe: every secret and the PIN; on the nRF52840, erasing every passkey (within 10 s of plugging in) |
+| Hold 5 s | red | factory wipe: every secret and the PIN; a restore from a `.vkb`, which replaces everything; on the nRF52840, erasing every passkey (within 10 s of plugging in) |
 | Double tap | blue | the encrypted backup file, or an export / seed readout |
 
 A tap never wipes and never exports, so a hostile host cannot swap a code request for a

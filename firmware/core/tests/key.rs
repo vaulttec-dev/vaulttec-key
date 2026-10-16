@@ -188,10 +188,10 @@ impl MemFlash {
         self.key_full(button, clock, key, NoAttachment)
     }
 
-    /// Power on a board that keeps passkeys beside the vault, its finger tapping twice.
+    /// Power on a board that keeps passkeys beside the vault, its owner at the button.
     fn key_attached(&self, passkeys: &Passkeys) -> Key<Unbound, Passkeys> {
         let clock = Ticker::default();
-        let button = Button::new(&clock, Finger::DoubleTap { gap: 120 });
+        let button = Button::new(&clock, Finger::Owner);
         self.key_full(button, clock, Unbound, passkeys.clone())
     }
 
@@ -398,6 +398,9 @@ enum Finger {
     },
     /// One tap whose contact opens for 15 ms in the middle: one press, bouncing.
     BouncyTap,
+    /// The owner, doing what the light asks: two taps at blue, otherwise down for six
+    /// seconds, which a tap wait takes as a tap and a hold wait as the hold.
+    Owner,
     /// Down before the request arrives, and never let go.
     Taped,
 }
@@ -447,6 +450,10 @@ impl Ui for Button {
                 vec![(from, from + 200), (from + 200 + gap, from + 400 + gap)]
             }
             Finger::BouncyTap => vec![(from, from + 100), (from + 115, from + 300)],
+            Finger::Owner if state == State::Export => {
+                vec![(from, from + 200), (from + 320, from + 520)]
+            }
+            Finger::Owner => vec![(from, from + 6_000)],
             Finger::Away | Finger::Taped => Vec::new(),
         };
     }
@@ -612,6 +619,11 @@ fn double_tapping(flash: &MemFlash) -> Key {
         clock,
         Unbound,
     )
+}
+
+fn owned(flash: &MemFlash) -> Key {
+    let clock = Ticker::default();
+    flash.key_with(Button::new(&clock, Finger::Owner), clock, Unbound)
 }
 
 fn passphrase(s: &str) -> Passphrase<'_> {
@@ -1462,7 +1474,7 @@ fn a_backup_moves_every_item_to_another_board() {
 
     // A different board: a blank flash and a new PIN of its own.
     let target = MemFlash::blank();
-    let mut other = double_tapping(&target);
+    let mut other = owned(&target);
     other.pin_set(pin("87654321")).expect("sets its own PIN");
     import(&mut other, "correct horse battery staple", head, &items).expect("restores");
 
@@ -1513,7 +1525,7 @@ fn a_backup_refuses_the_wrong_passphrase_and_a_reordered_file() {
     let (head, items) = export(&mut dev, "correct horse battery staple").expect("exports");
 
     let target = MemFlash::blank();
-    let mut other = double_tapping(&target);
+    let mut other = owned(&target);
     other.pin_set(pin("87654321")).expect("sets a PIN");
     assert_eq!(
         import(&mut other, "wrong passphrase here", head, &items),
@@ -1619,7 +1631,7 @@ fn a_board_without_passkeys_or_laid_out_otherwise_refuses_them() {
     let (head, blobs) = export(&mut dev, PASS).expect("exports");
 
     let flash = MemFlash::blank();
-    let mut plain = tapping(&flash);
+    let mut plain = owned(&flash);
     plain.pin_set(pin("12345678")).expect("sets the PIN");
     assert_eq!(
         import(&mut plain, PASS, head, &blobs),
@@ -1639,6 +1651,45 @@ fn a_board_without_passkeys_or_laid_out_otherwise_refuses_them() {
         "a filesystem of another size would not mount: nothing of it is written"
     );
     assert!(!wider.frozen());
+}
+
+#[test]
+fn a_restore_takes_the_wipes_hold_and_nothing_less() {
+    let (_, _, mut dev) = board_with_passkeys();
+    let (head, blobs) = export(&mut dev, PASS).expect("exports");
+
+    for finger in [
+        Finger::Tap,
+        Finger::DoubleTap { gap: 120 },
+        Finger::Hold(2_000),
+    ] {
+        let passkeys = Passkeys::blank(4);
+        passkeys.fill(0, 0x55);
+        let flash = MemFlash::blank();
+        let clock = Ticker::default();
+        let mut other = flash.key_full(
+            Button::new(&clock, finger),
+            clock,
+            Unbound,
+            passkeys.clone(),
+        );
+        other.pin_set(pin("87654321")).expect("sets the PIN");
+        put(
+            &mut other,
+            "mine",
+            Category::Login,
+            &login_item("me", "pw"),
+            false,
+        )
+        .expect("stores");
+        assert_eq!(
+            import(&mut other, PASS, head, &blobs),
+            Err(Fail::Refused),
+            "a host that knows the PIN must not swap in passkeys of its own"
+        );
+        assert_eq!(passkeys.bytes(), [0x55, 0xFF, 0xFF, 0xFF], "untouched");
+        assert_eq!(names(&mut other).expect("lists"), ["mine"]);
+    }
 }
 
 #[test]

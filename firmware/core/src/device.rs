@@ -26,7 +26,8 @@ use crate::wire::{BackupHead, Fail, HAS_OPEN, HAS_SECRET, HAS_SEED, PinStatus};
 /// locked key.
 const AUTOLOCK_MS: u64 = 120_000;
 const TOUCH_TIMEOUT_MS: u64 = 30_000;
-/// A wipe after five seconds of red: no reflex reaches it.
+/// A wipe, or a restore that replaces everything, after five seconds of red: no reflex
+/// reaches it.
 const WIPE_HOLD_MS: u64 = 5_000;
 
 /// The board's working buffer: two item-sized halves. Two, because rewriting the image
@@ -887,12 +888,18 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey, A: 
         Ok(None)
     }
 
-    /// Starts a restore: the key for `pass` as the backup's head describes it, and a
-    /// fresh image to write the items into. The PIN is enough, like `put`: nothing
-    /// comes out. Everything already stored is replaced - a restore is a restore.
+    /// Starts a restore: the wipe's hold, then the key for `pass` as the backup's head
+    /// describes it, and a fresh image to write the items into. Everything already
+    /// stored is replaced - the vault, and on a board with passkeys those too - so it
+    /// takes what a wipe and erasing every passkey take, never the PIN alone: a host
+    /// that learned the PIN must not swap in passkeys of its own. Nothing comes out, so
+    /// a hold is enough, and it is asked before anything is touched.
     pub fn import_begin(&mut self, pass: Passphrase<'_>, head: BackupHead) -> Result<(), Fail> {
         self.dek()?;
         self.load()?;
+        if !ui::await_hold(&mut self.ui, &self.clock, TOUCH_TIMEOUT_MS, WIPE_HOLD_MS) {
+            return Err(Fail::Refused);
+        }
         let key = with_kdf_memory(|mem| vault::backup_key(pass, &head.salt, head.cost, mem))
             .ok_or(Fail::Internal)?;
         self.store

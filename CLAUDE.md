@@ -121,7 +121,8 @@ This is a security device. The rules below are not recommendations.
 - **A claim in the protocol must hold in the code.** Advertising a guarantee only half the
   paths enforce is worse than not advertising it.
 - **Irreversible actions get their own gesture.** Code, password, a `vkey auth` login, a
-  signed git commit and a passkey on the nRF52840 — a tap (amber); wipe, and erasing every passkey
+  signed git commit and a passkey on the nRF52840 — a tap (amber); wipe, a restore from a
+  `.vkb` (it replaces everything, passkeys included; 2026-10-16) and erasing every passkey
   (authenticatorReset) — hold 5 s (red); backup — double tap (blue). A tap never wipes and never exports; a hold
   never exports; a double tap never wipes. Password on a tap is the maintainer's decision of
   2026-09-08 — do not reintroduce a separate hold. A new command with consequences gets a
@@ -226,7 +227,10 @@ The boards:
   public half to
   `/etc/u2f_mappings` (root's) and one `sufficient` line in the PAM services of
   `SERVICES` (`cli/src/auth.rs`), each original kept as `*.before-vkey`; `disable` undoes
-  it. That is the one place the CLI writes system files. The Ed25519 scheme before it
+  it. That is the one place the CLI writes system files. Both refuse to run as root
+  from a binary anyone but root can change, and name `/usr/local/sbin/vkey`
+  (`auth::ROOT_COPY`, in sudo's `secure_path`); `/settings` installs that copy
+  through `/usr/bin/sudo` when it differs and runs it. The Ed25519 scheme before it
   (category 201 sealed under the chip key, command `Respond` 0x19) is gone, restorable
   from 4bd49f3; both numbers stay unused, and a restore leaves such an item in the file.
 - `vkey commits enable` (2026-10-15, `cli/src/commits.rs`) signs every git commit with
@@ -245,8 +249,9 @@ The boards:
   double tap; 2026-09-09) reseals every item under a key derived from a passphrase
   (Argon2id, `Passphrase` 12–128 bytes, without the chip key, so the file opens on another
   board) and returns them one at a time; the host sees only ciphertext and assembles a
-  `.vkb`. `ImportBegin`/`ImportItem`/`ImportEnd` is the reverse, under the PIN with no
-  gesture: the items are appended to a fresh image as they arrive and become the vault at
+  `.vkb`. `ImportBegin`/`ImportItem`/`ImportEnd` is the reverse, under the PIN and the
+  wipe's hold (2026-10-16; the PIN alone before, which let a host that knew it swap in
+  passkeys without the hold authenticatorReset takes): the items are appended to a fresh image as they arrive and become the vault at
   `ImportEnd`, so a restore that stops half-way leaves what was there before. A backup
   session is killed by any `load()`, by `lock`, and by the first error. An item's AAD is
   `BACKUP_AAD` plus its index in the file: a reordered or altered item does not open

@@ -50,6 +50,10 @@ const SERVICES: [&str; 6] = [
     "swaylock",
     "hyprlock",
 ];
+/// Where root runs vkey from: a copy only root can change, in sudo's `secure_path`, so
+/// `sudo vkey auth enable` finds it, and a program running as the user cannot swap
+/// what root runs, as it could `~/.local/bin/vkey`.
+pub const ROOT_COPY: &str = "/usr/local/sbin/vkey";
 /// A copy of each PAM file as it was before `enable` first touched it.
 const BEFORE: &str = ".before-vkey";
 /// What the scheme this replaced kept on the host: a public key per user.
@@ -61,6 +65,7 @@ const OLD_BINARY: &str = "/usr/local/bin/vkey";
 /// public half in the mapping, the line in PAM.
 pub fn enable() -> Result<u8, Error> {
     let user = sudo_user()?;
+    root_only("enable")?;
     let mapping = enrol(&user)?;
     let existing = read_or_empty(Path::new(MAPPINGS))?;
     file::replace(
@@ -103,6 +108,7 @@ pub fn enable() -> Result<u8, Error> {
 /// mapping. The credential stays on the key, unused, until authenticatorReset.
 pub fn disable() -> Result<u8, Error> {
     let user = sudo_user()?;
+    root_only("disable")?;
     for service in SERVICES {
         let path = Path::new("/etc/pam.d").join(service);
         if path.exists() {
@@ -281,6 +287,29 @@ fn remove_line(path: &Path) -> Result<(), Error> {
 }
 
 /// The user who ran sudo: the one whose logins the key will answer.
+/// Refuses to change PAM from a binary that anyone but root may rewrite, itself or
+/// through a directory above it: whoever can would run as root the next time it is
+/// called this way. It cannot stop a program running as the user from putting its
+/// own `sudo` first in PATH; `docs/threat-model.md` says so.
+fn root_only(verb: &str) -> Result<(), Error> {
+    let exe = std::env::current_exe()?;
+    for path in exe.ancestors() {
+        let meta = fs::metadata(path)?;
+        let writable = meta.mode() & 0o002 != 0 || (meta.mode() & 0o020 != 0 && meta.gid() != 0);
+        if meta.uid() != 0 || writable {
+            return Err(Error::Value(format!(
+                "this runs as root from {}, and {} can be changed by others than root, so \
+                 whoever changes it would run as root too. Run a copy only root can \
+                 change:\n  sudo install -m 0755 {} {ROOT_COPY}\n  sudo vkey auth {verb}",
+                exe.display(),
+                path.display(),
+                exe.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn sudo_user() -> Result<String, Error> {
     if fs::metadata("/proc/self")?.uid() != 0 {
         return Err(Error::Value("this changes PAM: run it with sudo".into()));
