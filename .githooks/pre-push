@@ -21,6 +21,8 @@ head=$(git -C "$ROOT" rev-parse HEAD)
 while read -r local_ref local_sha _remote_ref _remote_sha; do
     # A deletion pushes no commit of ours; nothing to check.
     [[ "$local_sha" =~ ^0+$ ]] && continue
+    # A signed tag is an object of its own; what it names is the commit underneath.
+    local_sha=$(git -C "$ROOT" rev-parse "$local_sha^{commit}")
     [[ "$local_sha" == "$head" ]] || fail "$local_ref is $local_sha, but the checks can only
 see the working tree, which is HEAD ($head). Check out what you are pushing first."
 done
