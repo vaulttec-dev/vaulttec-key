@@ -1,0 +1,22 @@
+cli/src/setup.rs
+  s_98f11d4f1f873b::t_60cfcc9de52cf8 212-217
+docs/roadmap.md
+  s_98f11d4f1f873b::t_c8d026af64cc44 26
+  s_98f11d4f1f873b::t_ee18a462cb733d 24-25
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c934feed42f612ea515a4100e227375173561217",
+  "prompts": {},
+  "sessions": {
+    "s_98f11d4f1f873b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fa022102-2ef3-4e36-8c99-2207a61ae07b",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "VaultTec-Dev <vaulttec-dev@proton.me>"
+    }
+  }
+}
