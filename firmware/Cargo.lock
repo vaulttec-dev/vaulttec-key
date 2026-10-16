@@ -3030,7 +3030,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vaultkey-core"
-version = "0.9.0"
+version = "1.0.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3046,7 +3046,7 @@ dependencies = [
 
 [[package]]
 name = "vaultkey-esp32c6-zero"
-version = "0.9.0"
+version = "1.0.0"
 dependencies = [
  "esp-backtrace",
  "esp-bootloader-esp-idf",
@@ -3061,7 +3061,7 @@ dependencies = [
 
 [[package]]
 name = "vaultkey-nrf52840-mdk-dongle"
-version = "0.9.0"
+version = "1.0.0"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",
