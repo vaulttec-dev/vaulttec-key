@@ -1,0 +1,27 @@
+cli/src/auth.rs
+  s_98f11d4f1f873b::t_f0b16dc3afb573 114
+  s_98f11d4f1f873b::t_dd1d1144bec0ed 404-414
+  s_98f11d4f1f873b::t_d7bd7959d9b9ee 185-202
+  s_98f11d4f1f873b::t_d6da397d83b865 69-70
+docs/threat-model.md
+  s_98f11d4f1f873b::t_910036892a18a0 313
+docs/roadmap.md
+  s_98f11d4f1f873b::t_bbd76f5de438c4 790
+  s_98f11d4f1f873b::t_613498f97e9507 793-794
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3746d63616f26adff48bd70c21b916821962121f",
+  "prompts": {},
+  "sessions": {
+    "s_98f11d4f1f873b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fa022102-2ef3-4e36-8c99-2207a61ae07b",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "VaultTec-Dev <vaulttec-dev@proton.me>"
+    }
+  }
+}
