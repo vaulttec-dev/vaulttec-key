@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serialport::{SerialPort, SerialPortType};
 pub use vaultkey_core::item::{Category, Class, FieldKind, VALUE_MAX};
+use vaultkey_core::login::{LOGIN_MAX, Login};
 pub use vaultkey_core::oath::{Algo, Digits, NAME_MAX, Name, Params};
 pub use vaultkey_core::store::MAX_ATTEMPTS;
 pub use vaultkey_core::vault::{PASS_MIN, PIN_LEN, Passphrase, Pin};
@@ -586,6 +587,23 @@ impl Device {
     /// Factory reset. The device waits for the long hold; `Refused` if it never comes.
     pub fn wipe(&mut self) -> Result<(), Error> {
         self.request(Cmd::Wipe, &[]).map(drop)
+    }
+
+    /// The login password the key's keyboard types on an unasked double tap, or none;
+    /// the PIN and a tap. Checked here as the device checks it, so a password it would
+    /// refuse costs no tap.
+    pub fn login_set(&mut self, login: Option<&[u8]>) -> Result<(), Error> {
+        let bytes = match login {
+            Some(b) => Login::new(b)
+                .ok_or_else(|| {
+                    Error::Value(format!(
+                        "a login password the key can type is 1-{LOGIN_MAX} characters a US keyboard has (ASCII, no Enter)"
+                    ))
+                })?
+                .as_bytes(),
+            None => &[],
+        };
+        self.request(Cmd::LoginSet, bytes).map(drop)
     }
 
     // --- entries ---------------------------------------------------------------

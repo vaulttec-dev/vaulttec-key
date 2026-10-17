@@ -41,14 +41,21 @@ vkey backup vault.vkb                 # everything, passkeys included, sealed on
 vkey restore [file] · restore --only NAME file.vkb
 vkey passkey list · rm · pin          # discoverable passkeys, under the FIDO PIN
 sudo vkey auth enable | disable       # sudo and the lock screen with a tap (pam_u2f)
+sudo vkey auth greeter typed | tap    # the login screen: the typed password, or a tap
+vkey login set | clear                # the login password, typed on two idle taps
 vkey commits enable | disable | github  # every git commit signed with a tap
 vkey check --wipe-everything          # lifecycle test; ERASES EVERYTHING
 ```
 
 `vkey auth` needs `libpam-u2f` and a root-owned copy:
 `sudo install -m 0755 "$(command -v vkey)" /usr/local/sbin/vkey`. Keep a root shell open
-until `sudo` and the lock screen work. The costs:
+until `sudo` and the lock screen work. On COSMIC a tap at the login screen leaves the
+keyring locked. The `login` switch in `/settings` (or `vkey login set` and `sudo vkey
+auth greeter typed`) has the key type the password there instead, in a US layout (a
+random part of digits only types the same in any layout that keeps digits unshifted);
+the lock screen keeps its tap. Off, the login screen takes a tap again. The costs:
 [sudo](docs/threat-model.md#vkey-auth--sudo-and-the-lock-screen-with-a-tap-through-pam_u2f),
+[login](docs/threat-model.md#the-login-password-typed-by-the-key),
 [commits](docs/threat-model.md#git-commits-signed-with-a-tap).
 
 ## Gestures and limits
@@ -58,6 +65,7 @@ until `sudo` and the lock screen work. The costs:
 | Tap | amber | a code, a password, a `.env`, a passkey, a login, a signature |
 | Hold 5 s | red | wipe, restore, erasing every passkey |
 | Double tap | blue | backup, export |
+| Double tap, nothing asked | green | the login password typed, then Enter (`vkey login set`) |
 
 | | |
 |---|---|

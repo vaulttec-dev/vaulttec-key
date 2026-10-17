@@ -17,6 +17,7 @@ use sha2::Sha256;
 use vaultkey_core::device::{self, Device, Reach};
 use vaultkey_core::hal::{Attachment, Clock, DeviceKey, NoAttachment, Ui};
 use vaultkey_core::item::{Category, Class, Field, FieldKind, Item, Writer};
+use vaultkey_core::login::{LOGIN_MAX, Login};
 use vaultkey_core::oath::{Algo, Digits, Name, Params};
 use vaultkey_core::store::{self, Layout, MAX_ATTEMPTS, Store};
 use vaultkey_core::ui::{self, State};
@@ -788,6 +789,7 @@ fn wire_codes_round_trip() {
         Cmd::ImportBegin,
         Cmd::ImportItem,
         Cmd::ImportEnd,
+        Cmd::LoginSet,
     ] {
         assert_eq!(Cmd::from_wire(cmd.wire()), Some(cmd), "{cmd:?}");
     }
@@ -1849,5 +1851,130 @@ fn the_list_says_what_each_item_is() {
         labels(&mut dev, "card", Reach::Open).expect("open fields"),
         ["number"],
         "a card number is not a secret; the CVV is"
+    );
+}
+
+// --- the login password and the unasked double tap -----------------------------------
+
+/// How often the board looks at an idle button, at least: every read of the vkey line.
+const IDLE_SAMPLE_MS: u64 = 5;
+
+/// When `IdleDoubleTap` fires over `until` ms of samples, the button down in each of
+/// `down`'s windows, and no sample at all during `pause`.
+fn idle_fires(down: &[(u64, u64)], pause: Option<(u64, u64)>, until: u64) -> Vec<u64> {
+    let mut gesture = ui::IdleDoubleTap::new();
+    let mut fired = Vec::new();
+    for now in (0..until).step_by(usize::try_from(IDLE_SAMPLE_MS).expect("small")) {
+        if pause.is_some_and(|(from, to)| (from..to).contains(&now)) {
+            continue;
+        }
+        let pressed = down.iter().any(|&(from, to)| (from..to).contains(&now));
+        if gesture.sample(pressed, now) {
+            fired.push(now);
+        }
+    }
+    fired
+}
+
+#[test]
+fn an_idle_double_tap_is_two_short_taps() {
+    assert_eq!(
+        idle_fires(&[(100, 180), (300, 380)], None, 1_000).len(),
+        1,
+        "two taps fire once, on the second release"
+    );
+    assert!(
+        idle_fires(&[(100, 180)], None, 2_000).is_empty(),
+        "one tap is a code's reflex, not this"
+    );
+    assert!(
+        idle_fires(&[(100, 180), (1_100, 1_180)], None, 2_000).is_empty(),
+        "taps too far apart are two single taps"
+    );
+    assert!(
+        idle_fires(&[(100, 800), (900, 980)], None, 2_000).is_empty(),
+        "a hold is not a tap"
+    );
+    assert!(
+        idle_fires(&[(100, 180), (300, 1_300)], None, 2_000).is_empty(),
+        "nor is a second press held on"
+    );
+    assert!(
+        idle_fires(&[(100, 140), (155, 200)], None, 1_000).is_empty(),
+        "a tap bouncing open for 15 ms is one tap"
+    );
+}
+
+#[test]
+fn an_idle_double_tap_starts_from_a_button_seen_up() {
+    assert!(
+        idle_fires(&[(0, 100), (250, 330)], None, 1_000).is_empty(),
+        "a press already down when the board starts looking is not the first tap"
+    );
+    assert!(
+        idle_fires(&[(100, 180), (300, 380)], Some((150, 250)), 1_000).is_empty(),
+        "a tap that went to a request the key was serving is not the first tap"
+    );
+}
+
+#[test]
+fn the_login_password_takes_the_pin_and_a_tap() {
+    fn typed(b: &[u8]) -> Login<'_> {
+        Login::new(b).expect("a valid login password")
+    }
+    let flash = MemFlash::blank();
+    let kept = RefCell::new(Vec::new());
+    let keep = |login: Option<Login<'_>>| {
+        kept.borrow_mut().push(login.map(|l| l.as_bytes().to_vec()));
+        true
+    };
+
+    let mut dev = tapping(&flash);
+    assert_eq!(
+        dev.login(Some(typed(b"hunter2")), keep),
+        Err(Fail::Locked),
+        "nothing is kept before the vault is unlocked"
+    );
+    dev.pin_set(pin("12345678")).expect("sets the PIN");
+    dev.login(Some(typed(b"hunter2")), keep)
+        .expect("kept after a tap");
+    dev.login(None, keep).expect("forgotten after a tap");
+    assert_eq!(*kept.borrow(), [Some(b"hunter2".to_vec()), None]);
+
+    let clock = Ticker::default();
+    let mut dev = flash.key_with(Button::new(&clock, Finger::Away), clock, Unbound);
+    dev.pin_unlock(pin("12345678")).expect("unlocks");
+    assert_eq!(
+        dev.login(Some(typed(b"evil")), keep),
+        Err(Fail::Refused),
+        "no tap, nothing kept"
+    );
+    assert_eq!(kept.borrow().len(), 2, "the board was never asked");
+
+    let mut dev = tapping(&flash);
+    dev.pin_unlock(pin("12345678")).expect("unlocks");
+    assert_eq!(
+        dev.login(Some(typed(b"hunter2")), |_| false),
+        Err(Fail::Internal),
+        "a board that cannot keep it says so"
+    );
+}
+
+#[test]
+fn a_login_password_is_printable_ascii_only() {
+    assert!(Login::new(b"Correct Horse 9!~").is_some());
+    assert!(
+        Login::new(b"").is_none(),
+        "empty means forget, not a password"
+    );
+    assert!(Login::new(&[b'a'; LOGIN_MAX]).is_some());
+    assert!(Login::new(&[b'a'; LOGIN_MAX + 1]).is_none());
+    assert!(
+        Login::new(b"pw\nrm -rf ~").is_none(),
+        "a control character would type a command after it"
+    );
+    assert!(
+        Login::new("пароль".as_bytes()).is_none(),
+        "no key for it on a US keyboard"
     );
 }

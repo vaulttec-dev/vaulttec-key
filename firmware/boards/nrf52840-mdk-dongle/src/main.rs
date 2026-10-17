@@ -10,6 +10,7 @@
 #![no_main]
 
 mod fido;
+mod keyboard;
 
 use core::cell::{Cell, RefCell};
 use core::fmt::Write;
@@ -38,11 +39,13 @@ use usb_device::device::{StringDescriptors, UsbDevice, UsbDeviceBuilder, UsbVidP
 use usbd_ctaphid::CtapHid;
 use usbd_serial::SerialPort;
 use vaultkey_core::device::{self, Device};
-use vaultkey_core::hal::{Clock, DeviceKey, Port, Ui};
+use vaultkey_core::hal::{Clock, DeviceKey, Keyboard, Port, Ui};
+use vaultkey_core::login::{LOGIN_MAX, Login};
 use vaultkey_core::proto::Proto;
 use vaultkey_core::store::{self, Layout, Store};
-use vaultkey_core::ui::State;
+use vaultkey_core::ui::{IdleDoubleTap, State};
 use vaultkey_core::vault::Cost;
+use zeroize::Zeroizing;
 
 /// The first line of INFO; the version number lives in the core crate.
 const VERSION: &str = vaultkey_core::version!("nrf52840-mdk-dongle");
@@ -158,8 +161,9 @@ impl Clock for Uptime {
     }
 }
 
-/// The USB device with its two interfaces - CDC-ACM for vkey's protocol and CTAPHID for
-/// FIDO (docs/roadmap.md, phase 6) - polled from the main loop: nothing runs from an
+/// The USB device with its three interfaces - CDC-ACM for vkey's protocol, CTAPHID for
+/// FIDO (docs/roadmap.md, phase 6) and a keyboard that types only the login password
+/// (`keyboard`) - polled from the main loop: nothing runs from an
 /// interrupt. The bus is served wherever the key waits - for the next request (`Usb`) and
 /// for the button (`Panel`), which together cover all but Argon2 and flash writes, when
 /// the host's transfers simply wait. Shared by both through one `RefCell`, borrowed only
@@ -168,6 +172,7 @@ struct UsbStack {
     dev: UsbDevice<'static, Bus>,
     serial: SerialPort<'static, Bus>,
     ctaphid: CtapHid<'static, 'static, 'static, Bus, CTAP_MESSAGE>,
+    keyboard: keyboard::Keyboard<'static, Bus>,
     /// True while a passkey waits for its tap (`fido::Touch`).
     awaiting_touch: bool,
     /// When the last keepalive went out.
@@ -182,7 +187,8 @@ impl UsbStack {
         // usb-device polls the classes only when the bus has an event, and an answer the
         // FIDO side has just finished is not one: it has to be picked up here.
         self.ctaphid.check_for_app_response();
-        self.dev.poll(&mut [&mut self.serial, &mut self.ctaphid]);
+        self.dev
+            .poll(&mut [&mut self.serial, &mut self.ctaphid, &mut self.keyboard]);
         let now = Uptime.now_ms();
         // The pipe times out a request whose packets stop arriving; it compares wrapping
         // millisecond stamps, so the low half of the uptime is all it needs.
@@ -223,6 +229,10 @@ struct Usb {
     passkeys: &'static mut fido::Passkeys,
     /// When vkey's last byte arrived.
     last_rx: u64,
+    /// The button while nothing is asked: the double tap that types the login password.
+    panel: Panel,
+    gesture: IdleDoubleTap,
+    login: fido::LoginFile,
 }
 
 impl Usb {
@@ -232,6 +242,28 @@ impl Usb {
     /// in back to back, so this never lands in the middle of one, and a CTAP request
     /// that waits for a touch never holds up a frame half read.
     const QUIET_MS: u64 = 50;
+
+    /// The login password typed, or red when none is kept or what is kept is not one.
+    fn type_login(&mut self) {
+        let mut buf = Zeroizing::new([0u8; LOGIN_MAX]);
+        let kept = self
+            .login
+            .read(&mut buf[..])
+            .and_then(|n| Login::new(&buf[..n]));
+        match kept {
+            Some(login) => keyboard::type_login(self.stack, self.panel, login.as_bytes()),
+            None => keyboard::show(self.stack, self.panel, State::Refused),
+        }
+    }
+}
+
+/// The login password kept for the keyboard, as the protocol sets it.
+struct KeptLogin(fido::LoginFile);
+
+impl Keyboard for KeptLogin {
+    fn keep(&mut self, login: Option<Login<'_>>) -> bool {
+        self.0.keep(login.map(|l| l.as_bytes()))
+    }
 }
 
 impl Port for Usb {
@@ -252,6 +284,11 @@ impl Port for Usb {
             // Outside the stack's borrow: a passkey's tap wait polls the bus itself.
             let passkeys: &mut dyn App<'static> = &mut *self.passkeys;
             self.fido.poll(&mut [passkeys]);
+        }
+        // Looked at between requests only: a request waits for the button itself, and the
+        // pause that leaves here starts the gesture over.
+        if byte.is_none() && self.gesture.sample(self.panel.pressed(), Uptime.now_ms()) {
+            self.type_login();
         }
         byte
     }
@@ -643,6 +680,8 @@ fn main() -> ! {
         .expect("the CTAPHID channel is split once, here");
     // CBOR announced in INIT, or hosts never send CTAP2.
     let ctaphid = CtapHid::with_interrupt(bus, requester, Some(&CTAP_CANCEL), 0).implements_ctap2();
+    // Last, so the interfaces before it keep their numbers.
+    let keyboard = keyboard::Keyboard::new(bus);
     let usb = UsbDeviceBuilder::new(bus, UsbVidPid(USB_VID, USB_PID))
         .strings(&[StringDescriptors::default()
             .manufacturer("vaulttecdev")
@@ -658,6 +697,7 @@ fn main() -> ! {
         dev: usb,
         serial,
         ctaphid,
+        keyboard,
         awaiting_touch: false,
         keepalive_ms: 0,
     }));
@@ -705,12 +745,16 @@ fn main() -> ! {
         BUF.take(),
     );
 
+    let (passkeys, login) = fido::start(passkeys, rng, panel, usb);
     let port = Usb {
         stack: usb,
         fido: Dispatch::with_interrupt(responder, Some(&CTAP_CANCEL)),
-        passkeys: fido::start(passkeys, rng, panel, usb),
+        passkeys,
         last_rx: 0,
+        panel,
+        gesture: IdleDoubleTap::new(),
+        login,
     };
-    let mut proto = Proto::new(port, Uptime, info.as_str());
+    let mut proto = Proto::new(port, Uptime, info.as_str(), KeptLogin(login));
     proto.run(&mut dev)
 }

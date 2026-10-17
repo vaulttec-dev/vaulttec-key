@@ -3,6 +3,8 @@
 //! ```text
 //! sudo vkey auth enable     once: a credential for this host's logins, PAM told
 //! sudo vkey auth disable    all of it undone
+//! sudo vkey auth greeter typed|tap
+//!                           the login screen: the password the key types, or a tap
 //! ```
 //!
 //! The key is a FIDO2 authenticator (the nRF52840's passkeys), so a login is the scheme
@@ -41,15 +43,24 @@ const MAPPINGS: &str = "/etc/u2f_mappings";
 /// else falls through to the password. `cue`: PAM says to tap the key.
 const PAM_LINE: &str = "auth sufficient pam_u2f.so authfile=/etc/u2f_mappings cue";
 /// The PAM services that get the line, when this host has them: `sudo`, and the lock
-/// screens of COSMIC, GNOME, KDE, sway and Hyprland.
-const SERVICES: [&str; 6] = [
-    "sudo",
-    "cosmic-greeter",
-    "gdm-password",
-    "kde",
-    "swaylock",
-    "hyprlock",
-];
+/// screens of GNOME, KDE, sway and Hyprland.
+const SERVICES: [&str; 5] = ["sudo", "gdm-password", "kde", "swaylock", "hyprlock"];
+/// Login screens: COSMIC's greeter is its login screen and its lock screen in one
+/// service. A tap at the login screen lets the user in with the keyring still locked,
+/// since only the password unlocks it, so while [`TYPED`] exists the key types that
+/// password there instead, and [`SKIP_AT_LOGIN`] keeps the tap for the lock screen
+/// (`vkey login`; maintainer's decisions, 2026-10-17).
+const GREETERS: [&str; 1] = ["cosmic-greeter"];
+/// There when the key types the login password at the login screen, absent when a tap
+/// opens it as before. Root's, like the PAM files it decides about.
+const TYPED: &str = "/etc/vkey/login-typed";
+/// Put above [`PAM_LINE`] in a greeter while [`TYPED`] exists: it skips the tap when root
+/// asks. The login is greetd's session worker, root; the lock screen is
+/// `cosmic-greeter` in the user's session, and `pam_exec` runs `test` as its caller. If
+/// COSMIC ever swaps who asks, the lock screen wants the typed password, or the login
+/// screen a tap that leaves the keyring locked: neither lets anyone in without the key.
+const SKIP_AT_LOGIN: &str =
+    "auth [success=1 default=ignore] pam_exec.so quiet /usr/bin/test -O /root";
 /// Where root runs vkey from: a copy only root can change, in sudo's `secure_path`, so
 /// `sudo vkey auth enable` finds it, and a program running as the user cannot swap
 /// what root runs, as it could `~/.local/bin/vkey`.
@@ -86,7 +97,19 @@ pub fn enable() -> Result<u8, Error> {
         if !path.exists() {
             continue;
         }
-        if add_line(&path)? {
+        if add_line(&path, &[PAM_LINE])? {
+            armed.push(service);
+        } else {
+            manual.push(path);
+        }
+    }
+
+    for service in GREETERS {
+        let path = Path::new("/etc/pam.d").join(service);
+        if !path.exists() {
+            continue;
+        }
+        if add_line(&path, greeter_lines(typed()))? {
             armed.push(service);
         } else {
             manual.push(path);
@@ -114,7 +137,7 @@ pub fn disable() -> Result<u8, Error> {
     let user = sudo_user()?;
     root_only("disable")?;
     only_ours(&read_or_empty(Path::new(MAPPINGS))?, &user)?;
-    for service in SERVICES {
+    for service in SERVICES.into_iter().chain(GREETERS) {
         let path = Path::new("/etc/pam.d").join(service);
         if path.exists() {
             remove_line(&path)?;
@@ -132,6 +155,68 @@ pub fn disable() -> Result<u8, Error> {
     forget_old(&user)?;
     println!("disabled: {user} logs in with the password alone");
     Ok(0)
+}
+
+/// `sudo vkey auth greeter typed|tap`: whether the login screen waits for the password
+/// the key types, or for a tap as `enable` arms it. `typed` takes the tap away from the
+/// login screen only, so that the double tap is not taken as a tap that logs in with the
+/// keyring locked; the lock screen keeps it. Either way the tap is there only while
+/// `enable` holds for the user.
+pub fn greeter(typed: bool) -> Result<u8, Error> {
+    let user = sudo_user()?;
+    root_only("greeter")?;
+    let mark = Path::new(TYPED);
+    if typed {
+        if let Some(dir) = mark.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        file::replace(mark, b"", 0o644)?;
+    } else if mark.exists() {
+        fs::remove_file(mark)?;
+    }
+    let armed = enabled(&user);
+    for service in GREETERS {
+        let path = Path::new("/etc/pam.d").join(service);
+        if !path.exists() {
+            continue;
+        }
+        if !armed {
+            remove_line(&path)?;
+        } else if !add_line(&path, greeter_lines(typed))? {
+            println!(
+                "{} has no line vkey recognises to put its own above; add these by hand:\n  {}",
+                path.display(),
+                greeter_lines(typed).join("\n  ")
+            );
+        }
+    }
+    println!(
+        "{}",
+        match (typed, armed) {
+            (true, true) =>
+                "the login screen waits for the password the key types on a double tap; the lock screen opens with a tap",
+            (true, false) =>
+                "the login screen waits for the password the key types on a double tap",
+            (false, true) => "the login and the lock screen open with a tap, as before",
+            (false, false) => "the login screen takes the password typed by hand",
+        }
+    );
+    Ok(0)
+}
+
+/// What a greeter gets above its password check.
+fn greeter_lines(typed: bool) -> &'static [&'static str] {
+    if typed {
+        &[SKIP_AT_LOGIN, PAM_LINE]
+    } else {
+        &[PAM_LINE]
+    }
+}
+
+/// Whether the key types the login password at the login screen. World-readable, so no
+/// root is needed to ask.
+pub fn typed() -> bool {
+    Path::new(TYPED).exists()
 }
 
 /// A credential for `user` on the key, made and then tried with a login exactly as
@@ -259,21 +344,26 @@ fn is_anchor(line: &str) -> bool {
     }
 }
 
-/// A line `enable` put there: this one, or the old scheme's `pam_exec` of `vkey auth`.
+/// A line `enable` put there: one of these, or the old scheme's `pam_exec` of `vkey auth`.
 fn is_ours(line: &str) -> bool {
-    line.trim() == PAM_LINE || (line.contains("pam_exec.so") && line.contains("vkey auth"))
+    let line = line.trim();
+    line == PAM_LINE
+        || line == SKIP_AT_LOGIN
+        || (line.contains("pam_exec.so") && line.contains("vkey auth"))
 }
 
-/// `text` with the line above the anchor, any earlier form of it gone. None when there
-/// is no anchor.
-fn with_line(text: &str) -> Option<String> {
+/// `text` with `ours` above the anchor, in that order, any earlier lines of ours gone.
+/// None when there is no anchor.
+fn with_line(text: &str, ours: &[&str]) -> Option<String> {
     let lines: Vec<&str> = text.lines().filter(|l| !is_ours(l)).collect();
     let at = lines.iter().position(|l| is_anchor(l))?;
     let mut out = String::new();
     for (i, line) in lines.iter().enumerate() {
         if i == at {
-            out.push_str(PAM_LINE);
-            out.push('\n');
+            for o in ours {
+                out.push_str(o);
+                out.push('\n');
+            }
         }
         out.push_str(line);
         out.push('\n');
@@ -281,11 +371,11 @@ fn with_line(text: &str) -> Option<String> {
     Some(out)
 }
 
-/// The line added to the file at `path`, the file as it was kept once beside it. False
+/// `ours` added to the file at `path`, the file as it was kept once beside it. False
 /// when there is no anchor, and then nothing is written.
-fn add_line(path: &Path) -> Result<bool, Error> {
+fn add_line(path: &Path, ours: &[&str]) -> Result<bool, Error> {
     let text = fs::read_to_string(path)?;
-    let Some(out) = with_line(&text) else {
+    let Some(out) = with_line(&text, ours) else {
         return Ok(false);
     };
     if out != text {
@@ -370,22 +460,39 @@ mod tests {
 
     #[test]
     fn the_line_replaces_the_old_scheme_above_the_password_check() {
-        let out = with_line(SUDO).expect("has an anchor");
+        let out = with_line(SUDO, &[PAM_LINE]).expect("has an anchor");
         assert!(!out.contains("pam_exec.so"), "the old line is gone:\n{out}");
         assert!(
             out.contains(&format!("{PAM_LINE}\n@include common-auth\n")),
             "right above the password check:\n{out}"
         );
         assert_eq!(
-            with_line(&out).as_deref(),
+            with_line(&out, &[PAM_LINE]).as_deref(),
             Some(out.as_str()),
             "and twice is once"
         );
     }
 
     #[test]
+    fn a_typed_login_skips_the_tap_only_right_above_it() {
+        let typed = with_line(SUDO, greeter_lines(true)).expect("has an anchor");
+        assert!(
+            typed.contains(&format!(
+                "{SKIP_AT_LOGIN}\n{PAM_LINE}\n@include common-auth\n"
+            )),
+            "the skip covers the tap and nothing else:\n{typed}"
+        );
+        let tap = with_line(&typed, greeter_lines(false)).expect("has an anchor");
+        assert!(
+            !tap.contains(SKIP_AT_LOGIN),
+            "and goes with the switch:\n{tap}"
+        );
+        assert!(tap.contains(&format!("{PAM_LINE}\n@include common-auth\n")));
+    }
+
+    #[test]
     fn a_file_without_the_password_check_is_left_alone() {
-        assert_eq!(with_line("auth required pam_unix.so\n"), None);
+        assert_eq!(with_line("auth required pam_unix.so\n", &[PAM_LINE]), None);
     }
 
     #[test]

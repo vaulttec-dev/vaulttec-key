@@ -56,6 +56,9 @@ CDC (no RTIC, no interrupt, no new `unsafe`). CTAP2 only.
 | Deepest passkey request | ≤ ≈154 KiB (call-graph bound; the high-water mark needs a probe) |
 | Argon2 at `t`=20 | ~1.1 s |
 
+A third USB interface, after CDC and CTAPHID, is a boot keyboard (`src/keyboard.rs`)
+that types only the login password, kept in littlefs as `/vkey-login` (2026-10-17).
+
 Room: fido-authenticator stores a resident key only if six blocks and its size stay free
 after it. `vkey passkey list` reports its own estimate, 13 on an empty filesystem; the real
 limit is not measured.

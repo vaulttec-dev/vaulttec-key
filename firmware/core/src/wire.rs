@@ -25,6 +25,9 @@
 //! empty answer ends it. `ImportBegin` is the head with the passphrase behind it,
 //! `ImportItem` one sealed item, `ImportEnd` makes them the vault. The host keeps the
 //! items in a file in that order; the device never sees the file.
+//!
+//! `LoginSet` carries the login password a board's keyboard types (`crate::login`: 1 to
+//! 64 printable ASCII bytes), or nothing to forget it.
 
 use crate::item::ITEM_MAX;
 use crate::oath::NAME_MAX;
@@ -104,6 +107,9 @@ pub enum Cmd {
     ImportItem = 0x33,
     /// The restored table written to flash.
     ImportEnd = 0x34,
+    /// The login password the keyboard types on an unasked double tap (`crate::login`),
+    /// or none when the payload is empty; the PIN and a tap.
+    LoginSet = 0x40,
 }
 
 impl Cmd {
@@ -128,6 +134,7 @@ impl Cmd {
             0x32 => Self::ImportBegin,
             0x33 => Self::ImportItem,
             0x34 => Self::ImportEnd,
+            0x40 => Self::LoginSet,
             _ => return None,
         })
     }

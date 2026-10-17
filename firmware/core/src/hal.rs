@@ -1,4 +1,4 @@
-//! What a board must provide. Deliberately tiny: five traits with one job each, so a
+//! What a board must provide. Deliberately tiny: six traits with one job each, so a
 //! new board is a page of glue, not a port of the firmware.
 //!
 //! Flash and entropy use the ecosystem traits directly
@@ -77,6 +77,23 @@ impl Attachment for NoAttachment {
     fn freeze(&mut self) {}
 
     fn thaw(&mut self, _: bool) {}
+}
+
+/// Where a board with a keyboard interface keeps the login password it types
+/// (`crate::login`). A board without one uses [`NoKeyboard`].
+pub trait Keyboard {
+    /// Keeps `login` for the keyboard, or forgets the one kept when `None`. False when
+    /// it could not, or the board has no keyboard.
+    fn keep(&mut self, login: Option<crate::login::Login<'_>>) -> bool;
+}
+
+/// The keyboard of a board without one: nothing is kept, so the command fails.
+pub struct NoKeyboard;
+
+impl Keyboard for NoKeyboard {
+    fn keep(&mut self, _: Option<crate::login::Login<'_>>) -> bool {
+        false
+    }
 }
 
 /// A secret only this chip has, mixed into the key derivation so that a copy of the
