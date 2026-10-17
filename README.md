@@ -25,7 +25,8 @@ yourself to `dialout` and log in again.
 ## Use
 
 `vkey` alone opens the shell: an item's name plus Enter gives it, empty Enter opens the
-menu, `/settings` turns `auth` and `commits` on and off.
+menu, `/settings` turns `auth`, `commits` and `login` on and off; `login` also changes
+the password the key types.
 
 ```bash
 vkey totp add GitHub:me               # otpauth URI or base32

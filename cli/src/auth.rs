@@ -27,6 +27,8 @@ use data_encoding::BASE64;
 use crate::device::Error;
 use crate::{fido, file};
 
+pub mod cosmic;
+
 /// Where distributions install the module - Debian's and Ubuntu's multiarch directories,
 /// Fedora's and Arch's. Without it the line would lock nobody out, but let nobody in.
 const PAM_U2F: [&str; 4] = [
@@ -45,22 +47,6 @@ const PAM_LINE: &str = "auth sufficient pam_u2f.so authfile=/etc/u2f_mappings cu
 /// The PAM services that get the line, when this host has them: `sudo`, and the lock
 /// screens of GNOME, KDE, sway and Hyprland.
 const SERVICES: [&str; 5] = ["sudo", "gdm-password", "kde", "swaylock", "hyprlock"];
-/// Login screens: COSMIC's greeter is its login screen and its lock screen in one
-/// service. A tap at the login screen lets the user in with the keyring still locked,
-/// since only the password unlocks it, so while [`TYPED`] exists the key types that
-/// password there instead, and [`SKIP_AT_LOGIN`] keeps the tap for the lock screen
-/// (`vkey login`; maintainer's decisions, 2026-10-17).
-const GREETERS: [&str; 1] = ["cosmic-greeter"];
-/// There when the key types the login password at the login screen, absent when a tap
-/// opens it as before. Root's, like the PAM files it decides about.
-const TYPED: &str = "/etc/vkey/login-typed";
-/// Put above [`PAM_LINE`] in a greeter while [`TYPED`] exists: it skips the tap when root
-/// asks. The login is greetd's session worker, root; the lock screen is
-/// `cosmic-greeter` in the user's session, and `pam_exec` runs `test` as its caller. If
-/// COSMIC ever swaps who asks, the lock screen wants the typed password, or the login
-/// screen a tap that leaves the keyring locked: neither lets anyone in without the key.
-const SKIP_AT_LOGIN: &str =
-    "auth [success=1 default=ignore] pam_exec.so quiet /usr/bin/test -O /root";
 /// Where root runs vkey from: a copy only root can change, in sudo's `secure_path`, so
 /// `sudo vkey auth enable` finds it, and a program running as the user cannot swap
 /// what root runs, as it could `~/.local/bin/vkey`.
@@ -104,12 +90,12 @@ pub fn enable() -> Result<u8, Error> {
         }
     }
 
-    for service in GREETERS {
+    for service in cosmic::GREETERS {
         let path = Path::new("/etc/pam.d").join(service);
         if !path.exists() {
             continue;
         }
-        if add_line(&path, greeter_lines(typed()))? {
+        if add_line(&path, cosmic::greeter_lines(cosmic::typed()))? {
             armed.push(service);
         } else {
             manual.push(path);
@@ -137,7 +123,7 @@ pub fn disable() -> Result<u8, Error> {
     let user = sudo_user()?;
     root_only("disable")?;
     only_ours(&read_or_empty(Path::new(MAPPINGS))?, &user)?;
-    for service in SERVICES.into_iter().chain(GREETERS) {
+    for service in SERVICES.into_iter().chain(cosmic::GREETERS) {
         let path = Path::new("/etc/pam.d").join(service);
         if path.exists() {
             remove_line(&path)?;
@@ -155,68 +141,6 @@ pub fn disable() -> Result<u8, Error> {
     forget_old(&user)?;
     println!("disabled: {user} logs in with the password alone");
     Ok(0)
-}
-
-/// `sudo vkey auth greeter typed|tap`: whether the login screen waits for the password
-/// the key types, or for a tap as `enable` arms it. `typed` takes the tap away from the
-/// login screen only, so that the double tap is not taken as a tap that logs in with the
-/// keyring locked; the lock screen keeps it. Either way the tap is there only while
-/// `enable` holds for the user.
-pub fn greeter(typed: bool) -> Result<u8, Error> {
-    let user = sudo_user()?;
-    root_only("greeter")?;
-    let mark = Path::new(TYPED);
-    if typed {
-        if let Some(dir) = mark.parent() {
-            fs::create_dir_all(dir)?;
-        }
-        file::replace(mark, b"", 0o644)?;
-    } else if mark.exists() {
-        fs::remove_file(mark)?;
-    }
-    let armed = enabled(&user);
-    for service in GREETERS {
-        let path = Path::new("/etc/pam.d").join(service);
-        if !path.exists() {
-            continue;
-        }
-        if !armed {
-            remove_line(&path)?;
-        } else if !add_line(&path, greeter_lines(typed))? {
-            println!(
-                "{} has no line vkey recognises to put its own above; add these by hand:\n  {}",
-                path.display(),
-                greeter_lines(typed).join("\n  ")
-            );
-        }
-    }
-    println!(
-        "{}",
-        match (typed, armed) {
-            (true, true) =>
-                "the login screen waits for the password the key types on a double tap; the lock screen opens with a tap",
-            (true, false) =>
-                "the login screen waits for the password the key types on a double tap",
-            (false, true) => "the login and the lock screen open with a tap, as before",
-            (false, false) => "the login screen takes the password typed by hand",
-        }
-    );
-    Ok(0)
-}
-
-/// What a greeter gets above its password check.
-fn greeter_lines(typed: bool) -> &'static [&'static str] {
-    if typed {
-        &[SKIP_AT_LOGIN, PAM_LINE]
-    } else {
-        &[PAM_LINE]
-    }
-}
-
-/// Whether the key types the login password at the login screen. World-readable, so no
-/// root is needed to ask.
-pub fn typed() -> bool {
-    Path::new(TYPED).exists()
 }
 
 /// A credential for `user` on the key, made and then tried with a login exactly as
@@ -348,7 +272,7 @@ fn is_anchor(line: &str) -> bool {
 fn is_ours(line: &str) -> bool {
     let line = line.trim();
     line == PAM_LINE
-        || line == SKIP_AT_LOGIN
+        || line == cosmic::SKIP_AT_LOGIN
         || (line.contains("pam_exec.so") && line.contains("vkey auth"))
 }
 
@@ -471,23 +395,6 @@ mod tests {
             Some(out.as_str()),
             "and twice is once"
         );
-    }
-
-    #[test]
-    fn a_typed_login_skips_the_tap_only_right_above_it() {
-        let typed = with_line(SUDO, greeter_lines(true)).expect("has an anchor");
-        assert!(
-            typed.contains(&format!(
-                "{SKIP_AT_LOGIN}\n{PAM_LINE}\n@include common-auth\n"
-            )),
-            "the skip covers the tap and nothing else:\n{typed}"
-        );
-        let tap = with_line(&typed, greeter_lines(false)).expect("has an anchor");
-        assert!(
-            !tap.contains(SKIP_AT_LOGIN),
-            "and goes with the switch:\n{tap}"
-        );
-        assert!(tap.contains(&format!("{PAM_LINE}\n@include common-auth\n")));
     }
 
     #[test]

@@ -2330,7 +2330,7 @@ impl Shell {
             .map(|(name, desc)| match *name {
                 "auth" => format!("[{} {desc}", state(auth::enabled(&user))),
                 "commits" => format!("[{} {desc}", state(commits::enabled())),
-                "login" => format!("[{} {desc}", state(auth::typed())),
+                "login" => format!("[{} {desc}", state(auth::cosmic::typed())),
                 _ => (*desc).to_string(),
             })
             .collect();
@@ -2491,12 +2491,22 @@ impl Shell {
     /// or the password forgotten and the tap given back - sudo, and the PIN and a tap on
     /// the key. The tap goes before the password arrives and comes back after it has
     /// gone, so a step that fails leaves neither, and the password is typed by hand.
+    /// While it is on, `change` keeps a new password with the PIN and a tap alone: the
+    /// login screen already waits for one.
     fn cmd_login(&mut self) -> Result<(), Error> {
-        let on = auth::typed();
-        if !self.flipped("the key types the login password at the login screen", on) {
-            return Ok(());
-        }
-        let pass = if on {
+        let on = auth::cosmic::typed();
+        let change = ("change", "keep a new password on the key");
+        let actions: &[(&str, &str)] = if on { &[change] } else { &[] };
+        let clearing = match self.switch(
+            "the key types the login password at the login screen",
+            on,
+            actions,
+        ) {
+            Some(prompt::Flip::Action(_)) => false,
+            Some(prompt::Flip::To(to)) if to != on => on,
+            _ => return Ok(()),
+        };
+        let pass = if clearing {
             None
         } else {
             self.line(
@@ -2530,13 +2540,13 @@ impl Shell {
                 ),
                 e => e,
             })?;
-        if on && !self.as_root(&["auth", "greeter", "tap"])? {
+        if clearing && !self.as_root(&["auth", "greeter", "tap"])? {
             return Err(Error::Value(
                 "the key forgot it, the login screen still waits for it:  sudo vkey auth greeter tap"
                     .into(),
             ));
         }
-        let done = if on {
+        let done = if clearing {
             "  forgotten: the key types nothing now"
         } else {
             "  kept: two taps with nothing asked, at the login screen, type it"

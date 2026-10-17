@@ -373,7 +373,7 @@ fn run_off_port(cli: &Cli) -> Option<Result<u8, Error>> {
         } => auth::disable(),
         Cmd::Auth {
             cmd: AuthCmd::Greeter { cmd },
-        } => auth::greeter(matches!(cmd, GreeterCmd::Typed)),
+        } => auth::cosmic::greeter(matches!(cmd, GreeterCmd::Typed)),
         Cmd::Commits {
             cmd: CommitsCmd::Enable,
         } => commits::enable(),

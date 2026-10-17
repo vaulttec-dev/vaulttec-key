@@ -231,7 +231,8 @@ The boards:
   public half to
   `/etc/u2f_mappings` (root's) and one `sufficient` line in the PAM services of
   `SERVICES` (`cli/src/auth.rs`), each original kept as `*.before-vkey`; `disable` undoes
-  it. `cosmic-greeter` is in `GREETERS` (2026-10-17): its tap leaves the keyring locked,
+  it. `cosmic-greeter` is in `GREETERS` (2026-10-17; everything COSMIC-only lives in
+  `cli/src/auth/cosmic.rs`, 2026-10-18): its tap leaves the keyring locked,
   so while root's `/etc/vkey/login-typed` exists (`sudo vkey auth greeter typed|tap`, the
   `login` switch in `/settings` together with `vkey login set|clear`) `SKIP_AT_LOGIN`
   above the tap skips it when root asks - greetd's login, not the lock screen in the
@@ -247,7 +248,10 @@ The boards:
   git's global signing settings pointed at it; `disable` unsets `commit.gpgsign` only.
   The shell's `/settings` turns `auth` and `commits` on and off by running these same
   commands outside raw mode (`sudo` for `auth`). Linux only; macOS and Windows are
-  issues #18 and #19.
+  issues #18 and #19. An OS gets `cfg(target_os)` per function when its issue starts,
+  not stub modules ahead of it; a distribution or a desktop stays a row in a table
+  (`SERVICES`, `PAM_U2F`, `is_anchor`), and a file of its own only for logic of its own,
+  as COSMIC's greeter (maintainer's decision, 2026-10-18).
 - `vkey passkey list|rm|pin` and the shell's `passkey` tab (2026-10-16,
   `cli/src/passkeys.rs`) list and erase the discoverable passkeys through CTAP2
   credentialManagement under the key's FIDO PIN, which stays apart from vkey's PIN
