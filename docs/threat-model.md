@@ -41,8 +41,9 @@ item     = AES-256-GCM(DEK), AAD = name + category
 backup   = Argon2id(passphrase, fresh salt), no chip key
 ```
 
-Only salt, cost and sealed items live in flash; everything derived lives in RAM while
-unlocked and is zeroized on lock.
+In the vault only salt, cost and sealed items live in flash; everything derived lives in
+RAM while unlocked and is zeroized on lock. Outside the vault, the nRF's Trussed littlefs
+keeps the passkeys and the login password unsealed by vkey's PIN (see their sections).
 
 | Choice | Reason |
 |---|---|

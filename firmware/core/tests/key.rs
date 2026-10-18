@@ -1899,6 +1899,16 @@ fn an_idle_double_tap_is_two_short_taps() {
         idle_fires(&[(100, 180), (300, 1_300)], None, 2_000).is_empty(),
         "nor is a second press held on"
     );
+    assert_eq!(
+        idle_fires(&[(100, 590), (700, 780)], None, 1_500).len(),
+        1,
+        "a tap is timed to its release, not to the debounce after it"
+    );
+    assert_eq!(
+        idle_fires(&[(100, 700), (800, 880), (1_000, 1_080)], None, 2_000).len(),
+        1,
+        "after a hold, the next two taps are the gesture"
+    );
     assert!(
         idle_fires(&[(100, 140), (155, 200)], None, 1_000).is_empty(),
         "a tap bouncing open for 15 ms is one tap"

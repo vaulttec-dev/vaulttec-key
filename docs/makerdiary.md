@@ -36,7 +36,7 @@ LEDs red P0.23, green P0.22, blue P0.24, all active low; amber is red plus green
 | 0x96000..0x97000 | 4 KiB | the app's signature slot |
 | 0x97000..0x98000 | 4 KiB | vkey attempt counter |
 | 0x98000..0xC8000 | 2 × 96 KiB | vkey image copies A and B (24 sectors each) |
-| 0xC8000..0xF4000 | 176 KiB | Trussed littlefs (passkeys), 44 blocks |
+| 0xC8000..0xF4000 | 176 KiB | Trussed littlefs (passkeys, `/vkey-login`), 44 blocks |
 | 0xF4000..0x100000 | 48 KiB | UF2 bootloader fork, CF2 page, MBR params, settings |
 
 No A/B firmware: two copies do not fit. RAM: a 200 KiB stack at the bottom, so an overflow

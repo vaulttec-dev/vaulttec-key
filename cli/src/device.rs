@@ -393,6 +393,15 @@ pub fn env_file(path: &Path) -> Result<EnvBlob, Error> {
     EnvBlob::new(blob)
 }
 
+/// A login password the key would take, or why not: asked before the PIN and the tap.
+pub fn login(bytes: &[u8]) -> Result<Login<'_>, Error> {
+    Login::new(bytes).ok_or_else(|| {
+        Error::Value(format!(
+            "a login password the key can type is 1-{LOGIN_MAX} characters a US keyboard has (ASCII, no Enter)"
+        ))
+    })
+}
+
 /// A login item: the login open, the password and the note behind a tap. What `add`
 /// builds, and what an import builds for every row that has a password.
 pub fn login_item(login: &str, password: &str, note: &str) -> Result<Item, Error> {
@@ -594,16 +603,19 @@ impl Device {
     /// refuse costs no tap.
     pub fn login_set(&mut self, login: Option<&[u8]>) -> Result<(), Error> {
         let bytes = match login {
-            Some(b) => Login::new(b)
-                .ok_or_else(|| {
-                    Error::Value(format!(
-                        "a login password the key can type is 1-{LOGIN_MAX} characters a US keyboard has (ASCII, no Enter)"
-                    ))
-                })?
-                .as_bytes(),
+            Some(b) => self::login(b)?.as_bytes(),
             None => &[],
         };
-        self.request(Cmd::LoginSet, bytes).map(drop)
+        self.request(Cmd::LoginSet, bytes)
+            .map(drop)
+            .map_err(|e| match e {
+                Error::Device(c) if c == Fail::Internal.code() => Error::Value(
+                    "the key could not keep it: only a board with a keyboard (the nRF52840) \
+                     types a login password, and not while a backup or a restore runs"
+                        .into(),
+                ),
+                e => e,
+            })
     }
 
     // --- entries ---------------------------------------------------------------

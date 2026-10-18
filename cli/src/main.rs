@@ -45,7 +45,6 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser, Subcommand};
-use vaultkey_core::wire::Fail;
 use zeroize::Zeroizing;
 
 use device::{Category, Class, Device, Error, Reach, login_item, passphrase, pin};
@@ -521,21 +520,15 @@ fn run_login(dev: &mut Device, version: &str, cmd: LoginCmd) -> Result<u8, Error
                 "anyone holding the key can make it type this: keep only a long random part \
                  here and type a short part you remember before the double tap"
             );
-            Some(twice("computer login password", "passwords")?)
+            let p = twice("computer login password", "passwords")?;
+            device::login(p.as_bytes())?;
+            Some(p)
         }
         LoginCmd::Clear => None,
     };
     with_unlock(dev, |d| {
         eprintln!("tap {button} on the board - the light turns amber...");
         d.login_set(pass.as_ref().map(|p| p.as_bytes()))
-    })
-    .map_err(|e| match e {
-        Error::Device(c) if c == Fail::Internal.code() => Error::Value(
-            "the key could not keep it: only a board with a keyboard (the nRF52840) types a \
-             login password"
-                .into(),
-        ),
-        e => e,
     })?;
     match cmd {
         LoginCmd::Set => println!(

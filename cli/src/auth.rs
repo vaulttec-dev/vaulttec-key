@@ -86,7 +86,7 @@ pub fn enable() -> Result<u8, Error> {
         if add_line(&path, &[PAM_LINE])? {
             armed.push(service);
         } else {
-            manual.push(path);
+            manual.push((path, &[PAM_LINE][..]));
         }
     }
 
@@ -95,19 +95,21 @@ pub fn enable() -> Result<u8, Error> {
         if !path.exists() {
             continue;
         }
-        if add_line(&path, cosmic::greeter_lines(cosmic::typed()))? {
+        let lines = cosmic::greeter_lines(cosmic::typed());
+        if add_line(&path, lines)? {
             armed.push(service);
         } else {
-            manual.push(path);
+            manual.push((path, lines));
         }
     }
 
     println!("a tap on this key now lets {user} in: {}", armed.join(", "));
-    for path in manual {
+    for (path, lines) in manual {
         println!(
-            "{} has no line vkey recognises to put its own above; add it by hand, above the\n\
-             line that brings in the password check:\n  {PAM_LINE}",
-            path.display()
+            "{} has no line vkey recognises to put its own above; add these by hand, above\n\
+             the line that brings in the password check:\n  {}",
+            path.display(),
+            lines.join("\n  ")
         );
     }
     println!(

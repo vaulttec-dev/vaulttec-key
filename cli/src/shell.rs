@@ -22,7 +22,6 @@ use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetFor
 use crossterm::terminal::{self, Clear, ClearType};
 use crossterm::{execute, queue};
 
-use vaultkey_core::wire::Fail;
 use zeroize::Zeroizing;
 
 use crate::device::{
@@ -2490,7 +2489,7 @@ impl Shell {
     /// `/login`: the password kept on the key and the login screen told to wait for it,
     /// or the password forgotten and the tap given back - sudo, and the PIN and a tap on
     /// the key. The tap goes before the password arrives and comes back after it has
-    /// gone, so a step that fails leaves neither, and the password is typed by hand.
+    /// gone, or when the key did not keep it, so a step that fails never leaves both.
     /// While it is on, `change` keeps a new password with the PIN and a tap alone: the
     /// login screen already waits for one.
     fn cmd_login(&mut self) -> Result<(), Error> {
@@ -2523,6 +2522,7 @@ impl Shell {
             let Some(p) = self.confirmed(p, "passwords") else {
                 return Ok(());
             };
+            crate::device::login(p.as_bytes())?;
             Some(p)
         };
         if !on && !self.as_root(&["auth", "greeter", "typed"])? {
@@ -2530,16 +2530,24 @@ impl Shell {
                 "the login screen did not change; nothing was kept".into(),
             ));
         }
-        self.ensure_unlocked()?;
-        self.tap_hint(" - the light turns amber");
-        self.dev()?
-            .login_set(pass.as_ref().map(|p| p.as_bytes()))
-            .map_err(|e| match e {
-                Error::Device(c) if c == Fail::Internal.code() => Error::Value(
-                    "the key could not keep it: only a board with a keyboard (the nRF52840) types a login password".into(),
-                ),
-                e => e,
-            })?;
+        let kept = match self.ensure_unlocked() {
+            Ok(()) => {
+                self.tap_hint(" - the light turns amber");
+                self.dev()
+                    .and_then(|d| d.login_set(pass.as_ref().map(|p| p.as_bytes())))
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = kept {
+            // Nothing kept: the tap goes back to the login screen it was just taken from.
+            if !on && !self.as_root(&["auth", "greeter", "tap"])? {
+                return Err(Error::Value(
+                    "nothing was kept, the login screen still waits for it:  sudo vkey auth greeter tap"
+                        .into(),
+                ));
+            }
+            return Err(e);
+        }
         if clearing && !self.as_root(&["auth", "greeter", "tap"])? {
             return Err(Error::Value(
                 "the key forgot it, the login screen still waits for it:  sudo vkey auth greeter tap"

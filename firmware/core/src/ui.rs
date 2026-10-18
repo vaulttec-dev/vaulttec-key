@@ -229,15 +229,24 @@ impl IdleDoubleTap {
         };
         let at = self.since;
         let (phase, done) = match (self.phase, edge) {
-            (Phase::Unarmed, Some(false)) => (Phase::Ready, false),
-            (Phase::Ready, Some(true)) => (Phase::First(at), false),
-            (Phase::First(down) | Phase::Second(down), _) if now - down > TAP_MAX_MS => {
-                (Phase::Unarmed, false)
+            // A tap is timed from when the level changed, not from when the debounce let
+            // the change through.
+            (Phase::First(down), Some(false)) if at - down <= TAP_MAX_MS => {
+                (Phase::Between(at), false)
             }
-            (Phase::First(_), Some(false)) => (Phase::Between(at), false),
-            (Phase::Between(up), _) if now - up > DOUBLE_TAP_MS => (Phase::Ready, false),
-            (Phase::Between(_), Some(true)) => (Phase::Second(at), false),
-            (Phase::Second(_), Some(false)) => (Phase::Ready, true),
+            (Phase::Second(down), Some(false)) if at - down <= TAP_MAX_MS => (Phase::Ready, true),
+            // The button seen up, or up after a press held too long: ready for a tap.
+            (Phase::Unarmed | Phase::First(_) | Phase::Second(_), Some(false)) => {
+                (Phase::Ready, false)
+            }
+            (Phase::Between(up), Some(true)) if at - up <= DOUBLE_TAP_MS => {
+                (Phase::Second(at), false)
+            }
+            // A press from ready, or one too late to be the second tap: a first tap.
+            (Phase::Ready | Phase::Between(_), Some(true)) => (Phase::First(at), false),
+            (Phase::Between(up), _) if now - up > DOUBLE_TAP_MS + DEBOUNCE_MS => {
+                (Phase::Ready, false)
+            }
             // No edge, or one this phase does not wait for: nothing changes.
             (phase, _) => (phase, false),
         };

@@ -7,8 +7,8 @@
 pub const LOGIN_MAX: usize = 64;
 
 /// A login password the keyboard can type: 1 to `LOGIN_MAX` printable ASCII characters.
-/// Nothing else has a key on a US keyboard, and a control character - Enter above all -
-/// would let whoever sets it type a second line after the password.
+/// Those are the only keys the board's keyboard knows; a control character - Enter above
+/// all - would let whoever sets it type a second line after the password.
 #[derive(Clone, Copy)]
 pub struct Login<'a>(&'a [u8]);
 
