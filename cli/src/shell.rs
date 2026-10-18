@@ -44,7 +44,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("lock", "forget the key until the next PIN"),
     (
         "settings",
-        "PIN, backup and restore, self-test, setup, factory reset, tap for sudo and commits",
+        "PIN, backup and restore, self-test, setup, factory reset, tap for sudo and commits, the login password",
     ),
 ];
 /// Behind `/settings`: what is done to the key rather than with an entry. They still
@@ -71,6 +71,10 @@ const SETTINGS: &[(&str, &str)] = &[
     (
         "commits",
         "sign every git commit with a tap - turn on or off",
+    ),
+    (
+        "login",
+        "the login screen: the key types the password on a double tap - turn on or off",
     ),
     (
         "passkey-pin",
@@ -2325,6 +2329,7 @@ impl Shell {
             .map(|(name, desc)| match *name {
                 "auth" => format!("[{} {desc}", state(auth::enabled(&user))),
                 "commits" => format!("[{} {desc}", state(commits::enabled())),
+                "login" => format!("[{} {desc}", state(auth::cosmic::typed())),
                 _ => (*desc).to_string(),
             })
             .collect();
@@ -2426,7 +2431,6 @@ impl Shell {
         if !self.flipped("sudo and the lock screen with a tap", on) {
             return Ok(());
         }
-        let exe = std::env::current_exe()?;
         if !on && !auth::module_present() {
             if !Path::new("/usr/bin/apt-get").exists() {
                 return Err(Error::Value(
@@ -2442,9 +2446,16 @@ impl Shell {
                 return Err(Error::Value("apt-get could not install libpam-u2f".into()));
             }
         }
-        // Root runs its own copy, which only root can change; it is brought up to this
-        // binary first if it differs, so the switch never runs a stale one.
         let verb = if on { "disable" } else { "enable" };
+        self.as_root(&["auth", verb])?;
+        Ok(())
+    }
+
+    /// `vkey <args>` run by root from its own copy, which only root can change; the copy
+    /// is brought up to this binary first if it differs, so a switch never runs a stale
+    /// one. True when it succeeded.
+    fn as_root(&mut self, args: &[&str]) -> Result<bool, Error> {
+        let exe = std::env::current_exe()?;
         self.line(
             DIM,
             "  sudo asks for your password, or a tap if it already takes one",
@@ -2472,7 +2483,83 @@ impl Shell {
                 )));
             }
         }
-        self.outside(Command::new(SUDO).args([auth::ROOT_COPY, "auth", verb]))?;
+        self.outside(Command::new(SUDO).arg(auth::ROOT_COPY).args(args))
+    }
+
+    /// `/login`: the password kept on the key and the login screen told to wait for it,
+    /// or the password forgotten and the tap given back - sudo, and the PIN and a tap on
+    /// the key. The tap goes before the password arrives and comes back after it has
+    /// gone, or when the key did not keep it, so a step that fails never leaves both.
+    /// While it is on, `change` keeps a new password with the PIN and a tap alone: the
+    /// login screen already waits for one.
+    fn cmd_login(&mut self) -> Result<(), Error> {
+        let on = auth::cosmic::typed();
+        let change = ("change", "keep a new password on the key");
+        let actions: &[(&str, &str)] = if on { &[change] } else { &[] };
+        let clearing = match self.switch(
+            "the key types the login password at the login screen",
+            on,
+            actions,
+        ) {
+            Some(prompt::Flip::Action(_)) => false,
+            Some(prompt::Flip::To(to)) if to != on => on,
+            _ => return Ok(()),
+        };
+        let pass = if clearing {
+            None
+        } else {
+            self.line(
+                DIM,
+                "  the key types it and Enter as a US-layout keyboard; switch the login screen to that layout",
+            );
+            self.line(
+                Color::Yellow,
+                "  anyone holding the key can make it type this: keep only a long random part here and type a short part you remember before the double tap",
+            );
+            let Some(p) = self.ask("computer login password: ", Field::Hidden) else {
+                return Ok(());
+            };
+            let Some(p) = self.confirmed(p, "passwords") else {
+                return Ok(());
+            };
+            crate::device::login(p.as_bytes())?;
+            Some(p)
+        };
+        if !on && !self.as_root(&["auth", "greeter", "typed"])? {
+            return Err(Error::Value(
+                "the login screen did not change; nothing was kept".into(),
+            ));
+        }
+        let kept = match self.ensure_unlocked() {
+            Ok(()) => {
+                self.tap_hint(" - the light turns amber");
+                self.dev()
+                    .and_then(|d| d.login_set(pass.as_ref().map(|p| p.as_bytes())))
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = kept {
+            // Nothing kept: the tap goes back to the login screen it was just taken from.
+            if !on && !self.as_root(&["auth", "greeter", "tap"])? {
+                return Err(Error::Value(
+                    "nothing was kept, the login screen still waits for it:  sudo vkey auth greeter tap"
+                        .into(),
+                ));
+            }
+            return Err(e);
+        }
+        if clearing && !self.as_root(&["auth", "greeter", "tap"])? {
+            return Err(Error::Value(
+                "the key forgot it, the login screen still waits for it:  sudo vkey auth greeter tap"
+                    .into(),
+            ));
+        }
+        let done = if clearing {
+            "  forgotten: the key types nothing now"
+        } else {
+            "  kept: two taps with nothing asked, at the login screen, type it"
+        };
+        self.line(Color::Green, done);
         Ok(())
     }
 
@@ -2600,6 +2687,7 @@ impl Shell {
             "wipe" => self.cmd_wipe(),
             "setup" => self.cmd_setup(arg),
             "selftest" => self.cmd_selftest(),
+            "login" => self.cmd_login(),
             "import" => self.cmd_import(arg),
             "backup" => self.cmd_backup(arg),
             "restore" => self.cmd_restore(arg),

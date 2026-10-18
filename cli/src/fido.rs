@@ -509,19 +509,24 @@ impl Key {
     }
 }
 
-/// The hidraw node of a vkey board: the one whose HID id names a board's USB pair.
+/// The hidraw node of a vkey board: the one whose HID id names a board's USB pair and
+/// whose reports are FIDO's - the key is a keyboard too (`vkey login`), on another node.
 fn node() -> Result<PathBuf, Error> {
+    // Usage page 0xF1D0, the first item of a FIDO report descriptor.
+    const FIDO_PAGE: [u8; 3] = [0x06, 0xD0, 0xF1];
     let mut found = Vec::new();
     for entry in fs::read_dir("/sys/class/hidraw")? {
         let entry = entry?;
         let uevent = fs::read_to_string(entry.path().join("device/uevent")).unwrap_or_default();
-        let ours = BOARDS.iter().any(|b| {
+        let board = BOARDS.iter().any(|b| {
             uevent.contains(&format!(
                 "HID_ID=0003:0000{:04X}:0000{:04X}",
                 b.usb_vid, b.usb_pid
             ))
         });
-        if ours {
+        let fido = fs::read(entry.path().join("device/report_descriptor"))
+            .is_ok_and(|d| d.starts_with(&FIDO_PAGE));
+        if board && fido {
             found.push(PathBuf::from("/dev").join(entry.file_name()));
         }
     }

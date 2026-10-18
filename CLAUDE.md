@@ -7,7 +7,7 @@ real secrets yet.
 
 | Part | What it is |
 |---|---|
-| `firmware/core` | Firmware as a chip-free library: `proto` (frames), `device` (PIN, entries), `vault` (KDF/AEAD), `store` (flash, A/B image), `oath` (entry kinds, HOTP/TOTP), `ui` (button rules), `hal` (five traits — port, clock, button+LED, chip key, attachment: flash a backup carries besides the vault; flash and RNG arrive via `embedded-storage` and `rand_core`). Bare-metal Rust, `no_std`, no RTOS; crypto from RustCrypto. |
+| `firmware/core` | Firmware as a chip-free library: `proto` (frames), `device` (PIN, entries), `vault` (KDF/AEAD), `store` (flash, A/B image), `oath` (entry kinds, HOTP/TOTP), `ui` (button rules), `hal` (six traits — port, clock, button+LED, chip key, attachment: flash a backup carries besides the vault, keyboard: where the typed login password is kept; flash and RNG arrive via `embedded-storage` and `rand_core`). Bare-metal Rust, `no_std`, no RTOS; crypto from RustCrypto. |
 | `firmware/boards/<board>/` | One board = one folder: `Cargo.toml` with the chip crates, `.cargo/config.toml` with the target, `src/main.rs` with pins and trait impls, `board.toml`, `bootloader/`, `images/`. The chip name appears **nowhere** outside such a folder. |
 | `cli/` | The `vkey` command: one static binary. Subcommands for scripts (`clap`), an interactive shell (`crossterm`, draws itself), flashing through `espflash` as a library with images embedded via `include_bytes!`. All user work goes through this CLI. |
 
@@ -124,7 +124,9 @@ This is a security device. The rules below are not recommendations.
   signed git commit and a passkey on the nRF52840 — a tap (amber); wipe, a restore from a
   `.vkb` (it replaces every item, and the passkeys when the file carries them; 2026-10-16) and erasing every passkey
   (authenticatorReset) — hold 5 s (red); backup — double tap (blue). A tap never wipes and never exports; a hold
-  never exports; a double tap never wipes. Password on a tap is the maintainer's decision of
+  never exports; a double tap never wipes. The one gesture with nothing asked: a double
+  tap at idle makes the nRF52840 type the login password and Enter as a keyboard
+  (`vkey login`, `ui::IdleDoubleTap`; 2026-10-17). Password on a tap is the maintainer's decision of
   2026-09-08 — do not reintroduce a separate hold. A new command with consequences gets a
   new gesture, not an existing one.
 - **`unsafe`** only with a comment on why it is unavoidable; in the frame parser, never.
@@ -152,9 +154,11 @@ folder's business.
 The boards:
 
 - **`nrf52840-mdk-dongle`**, the primary. USB from the firmware (`1209:0001`), polled:
-  CDC-ACM for vkey and CTAPHID for passkeys (Trussed + `fido-authenticator` in
+  CDC-ACM for vkey, CTAPHID for passkeys (Trussed + `fido-authenticator` in
   `src/fido.rs`, their littlefs at 0xC8000..0xF4000, 44 blocks up to the bootloader,
-  `passkey_sectors` in its `board.toml`). The stack sits at the bottom of RAM,
+  `passkey_sectors` in its `board.toml`) and a boot keyboard that types only the login
+  password (`src/keyboard.rs`; the password unsealed in that littlefs as `/vkey-login`,
+  because the login screen comes before any PIN). The stack sits at the bottom of RAM,
   200 KiB, so an overflow resets the chip ("lockup" in `vkey info`). Our UF2 bootloader fork (installed 2026-10-14, below) is how it is flashed: hold
   the button while plugging in, copy `images/vaultkey.signed.uf2` to `UF2BOOT`, replug. It
   runs only images signed with the key in `bootloader/signing-key.pem`; the app ends by
@@ -227,7 +231,12 @@ The boards:
   public half to
   `/etc/u2f_mappings` (root's) and one `sufficient` line in the PAM services of
   `SERVICES` (`cli/src/auth.rs`), each original kept as `*.before-vkey`; `disable` undoes
-  it. That is the one place the CLI writes system files. Both refuse to run as root
+  it. `cosmic-greeter` is in `GREETERS` (2026-10-17; everything COSMIC-only lives in
+  `cli/src/auth/cosmic.rs`, 2026-10-18): its tap leaves the keyring locked,
+  so while root's `/etc/vkey/login-typed` exists (`sudo vkey auth greeter typed|tap`, the
+  `login` switch in `/settings` together with `vkey login set|clear`) `SKIP_AT_LOGIN`
+  above the tap skips it when root asks - greetd's login, not the lock screen in the
+  user's session - and the key types the password there instead. That is the one place the CLI writes system files. Both refuse to run as root
   from a binary anyone but root can change, and name `/usr/local/sbin/vkey`
   (`auth::ROOT_COPY`, in sudo's `secure_path`); `/settings` installs that copy
   through `/usr/bin/sudo` when it differs and runs it. The Ed25519 scheme before it
@@ -239,7 +248,10 @@ The boards:
   git's global signing settings pointed at it; `disable` unsets `commit.gpgsign` only.
   The shell's `/settings` turns `auth` and `commits` on and off by running these same
   commands outside raw mode (`sudo` for `auth`). Linux only; macOS and Windows are
-  issues #18 and #19.
+  issues #18 and #19. An OS gets `cfg(target_os)` per function when its issue starts,
+  not stub modules ahead of it; a distribution or a desktop stays a row in a table
+  (`SERVICES`, `PAM_U2F`, `is_anchor`), and a file of its own only for logic of its own,
+  as COSMIC's greeter (maintainer's decision, 2026-10-18).
 - `vkey passkey list|rm|pin` and the shell's `passkey` tab (2026-10-16,
   `cli/src/passkeys.rs`) list and erase the discoverable passkeys through CTAP2
   credentialManagement under the key's FIDO PIN, which stays apart from vkey's PIN

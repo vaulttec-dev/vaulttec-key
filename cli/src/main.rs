@@ -12,6 +12,7 @@
 //! vkey restore vault.vkb                  # everything back, onto this or another key
 //! vkey check --wipe-everything            # lifecycle test; ERASES the device
 //! sudo vkey auth enable                   # sudo and the lock screen with a tap (pam_u2f)
+//! vkey login set                          # the login password, typed on an unasked double tap
 //! vkey install                            # copy this binary to ~/.local/bin
 //! ```
 //!
@@ -211,8 +212,23 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PasskeyCmd,
     },
+    /// The computer's login password, which the key types as a keyboard, then Enter,
+    /// when its button is tapped twice with nothing asked - at the login screen, where
+    /// it also unlocks the keyring. Kept outside the vault: see docs/threat-model.md
+    Login {
+        #[command(subcommand)]
+        cmd: LoginCmd,
+    },
     /// Copy this binary to ~/.local/bin/vkey
     Install,
+}
+
+#[derive(Subcommand, Clone, Copy)]
+enum LoginCmd {
+    /// The password asked twice, kept on the key after the PIN and a tap
+    Set,
+    /// The key types nothing any more; the PIN and a tap
+    Clear,
 }
 
 #[derive(Subcommand, Clone, Copy)]
@@ -244,6 +260,19 @@ enum AuthCmd {
     Enable,
     /// The `pam_u2f` lines out and the user out of `/etc/u2f_mappings`
     Disable,
+    /// What the login screen waits for: the password the key types, or a tap
+    Greeter {
+        #[command(subcommand)]
+        cmd: GreeterCmd,
+    },
+}
+
+#[derive(Subcommand, Clone, Copy)]
+enum GreeterCmd {
+    /// The password, typed by the key on a double tap (`vkey login set`); no tap line
+    Typed,
+    /// A tap, as `enable` arms it; the default
+    Tap,
 }
 
 #[derive(Subcommand, Clone, Copy)]
@@ -341,6 +370,9 @@ fn run_off_port(cli: &Cli) -> Option<Result<u8, Error>> {
         Cmd::Auth {
             cmd: AuthCmd::Disable,
         } => auth::disable(),
+        Cmd::Auth {
+            cmd: AuthCmd::Greeter { cmd },
+        } => auth::cosmic::greeter(matches!(cmd, GreeterCmd::Typed)),
         Cmd::Commits {
             cmd: CommitsCmd::Enable,
         } => commits::enable(),
@@ -423,6 +455,7 @@ fn run(cli: Cli) -> Result<u8, Error> {
         }
 
         Cmd::Pin { cmd } => run_pin(&mut dev, cmd),
+        Cmd::Login { cmd } => run_login(&mut dev, &version, cmd),
         Cmd::Get { name, copy } => run_get(&mut dev, &version, &name, copy),
         Cmd::Totp { cmd } => run_totp(&mut dev, &version, cmd),
         Cmd::Pass { cmd } => run_pass(&mut dev, cmd),
@@ -472,6 +505,41 @@ fn run_wipe(dev: &mut Device, version: &str, yes: bool) -> Result<u8, Error> {
     dev.wipe()?;
     sources::forget_all();
     println!("wiped: no PIN, no credentials - run  vkey pin set  or /pin");
+    Ok(0)
+}
+
+fn run_login(dev: &mut Device, version: &str, cmd: LoginCmd) -> Result<u8, Error> {
+    let button = boards::button(Some(version));
+    let pass = match cmd {
+        LoginCmd::Set => {
+            eprintln!(
+                "the key types this and Enter as a US-layout keyboard; switch the login \
+                 screen to that layout"
+            );
+            eprintln!(
+                "anyone holding the key can make it type this: keep only a long random part \
+                 here and type a short part you remember before the double tap"
+            );
+            let p = twice("computer login password", "passwords")?;
+            device::login(p.as_bytes())?;
+            Some(p)
+        }
+        LoginCmd::Clear => None,
+    };
+    with_unlock(dev, |d| {
+        eprintln!("tap {button} on the board - the light turns amber...");
+        d.login_set(pass.as_ref().map(|p| p.as_bytes()))
+    })?;
+    match cmd {
+        LoginCmd::Set => println!(
+            "kept: tap {button} twice with nothing asked, at the login screen, to type it;\n\
+             so that screen waits for it:  sudo vkey auth greeter typed"
+        ),
+        LoginCmd::Clear => println!(
+            "forgotten: the key types nothing now; a tap at the login screen again:  \
+             sudo vkey auth greeter tap"
+        ),
+    }
     Ok(0)
 }
 

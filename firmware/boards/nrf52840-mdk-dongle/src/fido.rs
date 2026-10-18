@@ -19,7 +19,7 @@ use fido_authenticator::{Authenticator, Config, TrussedRequirements, UserPresenc
 use heapless_bytes::BytesView;
 use littlefs2::consts::{U1, U256, U512};
 use littlefs2::driver::Storage;
-use littlefs2::fs::{Allocation, Filesystem};
+use littlefs2::fs::{Allocation, File, Filesystem};
 use littlefs2::object_safe::DynFilesystem;
 use littlefs2::{const_ram_storage, io, path};
 use static_cell::{ConstStaticCell, StaticCell};
@@ -373,7 +373,7 @@ pub(crate) fn start(
     rng: Entropy,
     panel: Panel,
     usb: &'static RefCell<UsbStack>,
-) -> &'static mut Passkeys {
+) -> (&'static mut Passkeys, LoginFile) {
     let internal = Filesystem::mount_or_else(
         INTERNAL_ALLOC.init(Allocation::new()),
         INTERNAL.init(Internal(region)),
@@ -386,10 +386,11 @@ pub(crate) fn start(
         |_, storage, _| Filesystem::format(storage),
     )
     .expect("RAM mounts once formatted");
+    let internal: &'static Filesystem<'static, Internal> = INTERNAL_FS.init(internal);
     let board = Board {
         rng,
         store: Store {
-            internal: INTERNAL_FS.init(internal),
+            internal,
             volatile: VOLATILE_FS.init(volatile),
         },
         ui: Clockwork,
@@ -414,11 +415,54 @@ pub(crate) fn start(
         large_blobs: None,
         nfc_transport: false,
     };
-    PASSKEYS.init(Passkeys(Authenticator::new(
+    let passkeys = PASSKEYS.init(Passkeys(Authenticator::new(
         client,
         Touch { panel, usb },
         config,
-    )))
+    )));
+    (passkeys, LoginFile(internal))
+}
+
+// --- the login password the keyboard types ---------------------------------------------
+
+/// The login password (`crate::keyboard`), a file of its own in Trussed's filesystem,
+/// outside fido-authenticator's directory: unsealed like the passkeys, because the login
+/// screen comes before any PIN, and carried by a backup with them. authenticatorReset
+/// leaves it; `vkey login clear` removes it.
+const LOGIN: &path::Path = path!("vkey-login");
+
+/// Trussed's filesystem as the login password sees it: that one file.
+#[derive(Clone, Copy)]
+pub(crate) struct LoginFile(&'static Filesystem<'static, Internal>);
+
+impl LoginFile {
+    /// Keeps `login`, or removes it when None. Refused while a backup or a restore has
+    /// the flash.
+    pub(crate) fn keep(self, login: Option<&[u8]>) -> bool {
+        if !serving() {
+            return false;
+        }
+        match login {
+            Some(bytes) => self.0.write(LOGIN, bytes).is_ok(),
+            None => matches!(self.0.remove(LOGIN), Ok(()) | Err(io::Error::NO_SUCH_ENTRY)),
+        }
+    }
+
+    /// The login password into `buf`: its length, or None when there is none, it does
+    /// not fit, or the flash is not Trussed's to read now.
+    pub(crate) fn read(self, buf: &mut [u8]) -> Option<usize> {
+        if !serving() {
+            return None;
+        }
+        File::open_and_then(self.0, LOGIN, |file| {
+            let len = file.len()?;
+            if len > buf.len() {
+                return Err(io::Error::FILE_TOO_BIG);
+            }
+            file.read(&mut buf[..len])
+        })
+        .ok()
+    }
 }
 
 // --- the passkeys in a backup ----------------------------------------------------------

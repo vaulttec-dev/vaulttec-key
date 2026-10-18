@@ -26,7 +26,9 @@ cortex-m-rt = { version = "0.7", features = ["set-vtor", "paint-stack"] }
 critical-section = "1"
 embedded-hal = "1.0"
 embedded-storage = "0.3"
-usb-device = "0.3"
+# The configuration descriptor of CDC, CTAPHID and the keyboard is ~132 bytes, past the
+# 128 the control buffer holds by default: the host then cannot read it (-110).
+usb-device = { version = "0.3", features = ["control-buffer-256"] }
 usbd-serial = "0.2"
 # CTAPHID, the HID interface FIDO2 speaks (docs/roadmap.md, phase 6), beside the CDC one.
 usbd-ctaphid = { version = "0.5", default-features = false }
@@ -58,6 +60,8 @@ littlefs2-sys = { version = "0.4", features = ["tinyrlibc"] }
 rand_core = "0.9"
 rand_core_06 = { package = "rand_core", version = "0.6" }
 static_cell = "2"
+# The login password read back for the keyboard is scrubbed after typing.
+zeroize = { version = "1.9", default-features = false }
 # The INFO text, built at boot; already in the tree through usb-device.
 heapless = "0.8"
 

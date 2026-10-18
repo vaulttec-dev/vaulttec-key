@@ -25,7 +25,7 @@ use esp_storage::FlashStorage;
 use smart_leds::{RGB8, SmartLedsWrite, brightness};
 use static_cell::{ConstStaticCell, StaticCell};
 use vaultkey_core::device::{self, Device};
-use vaultkey_core::hal::{Clock, DeviceKey, NoAttachment, Port, Ui};
+use vaultkey_core::hal::{Clock, DeviceKey, NoAttachment, NoKeyboard, Port, Ui};
 use vaultkey_core::proto::Proto;
 use vaultkey_core::store::{self, Layout, Store};
 use vaultkey_core::ui::State;
@@ -199,6 +199,12 @@ fn main() -> ! {
     );
 
     esp_println::println!("{VERSION}: listening");
-    let mut proto = Proto::new(Usb(UsbSerialJtag::new(p.USB_DEVICE)), Uptime, VERSION);
+    // A fixed Serial/JTAG port is no keyboard: there is no login password to keep.
+    let mut proto = Proto::new(
+        Usb(UsbSerialJtag::new(p.USB_DEVICE)),
+        Uptime,
+        VERSION,
+        NoKeyboard,
+    );
     proto.run(&mut dev)
 }

@@ -3089,6 +3089,7 @@ dependencies = [
  "usbd-ctaphid",
  "usbd-serial",
  "vaultkey-core",
+ "zeroize",
 ]
 
 [[package]]

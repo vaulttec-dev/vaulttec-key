@@ -41,8 +41,9 @@ item     = AES-256-GCM(DEK), AAD = name + category
 backup   = Argon2id(passphrase, fresh salt), no chip key
 ```
 
-Only salt, cost and sealed items live in flash; everything derived lives in RAM while
-unlocked and is zeroized on lock.
+In the vault only salt, cost and sealed items live in flash; everything derived lives in
+RAM while unlocked and is zeroized on lock. Outside the vault, the nRF's Trussed littlefs
+keeps the passkeys and the login password unsealed by vkey's PIN (see their sections).
 
 | Choice | Reason |
 |---|---|
@@ -61,6 +62,7 @@ unlocked and is zeroized on lock.
 | Tap | amber | a code, an item's secret fields, a `.env`, a passkey, a `vkey auth` login, a signed commit |
 | Hold 5 s | red | wipe; a restore from a `.vkb`; on the nRF erasing every passkey |
 | Double tap | blue | a backup; an export or seed readout |
+| Double tap, nothing asked | green | the login password typed, then Enter (nRF) |
 
 A tap never wipes or exports, a hold never exports, a double tap never wipes: a hostile host
 cannot swap a code request for a wipe or an export. A password is on the same tap as a code
@@ -144,12 +146,44 @@ stays a way in.
 | Another FIDO key already mapped | Refused when the user's line holds more than one credential. A single hand-mapped key is taken for vkey's and replaced |
 | Flash copy or `.vkb` with passphrase | Answers this host's logins |
 | Nobody taps | The password prompt comes after 30 s |
-| COSMIC greeter | Shares `cosmic-greeter`, so a tap may log in there; the keyring then stays locked |
+| COSMIC greeter | It is the login and the lock screen in one service, and a tap at the login leaves the keyring locked. Armed as the rest by default. With the `login` switch on (root's `/etc/vkey/login-typed`, `sudo vkey auth greeter typed`) a `pam_exec` of `test -O /root` above the tap skips it when root asks: the login is greetd's session worker, root, so there the key types the password instead (below); the lock screen runs in the user's session and keeps the tap, the keyring being open already - the pattern of macOS, where the first login after a restart takes the password and Touch ID only unlocks. This rests on who asks today: if COSMIC swaps it, the lock screen wants the typed password, or the login a tap that leaves the keyring locked, and neither lets anyone in without the key. Confirmed on the maintainer's COSMIC on 2026-10-17: a reboot by the double tap with the keyring open, the lock screen by a tap. The switch takes the tap away before the password reaches the key and gives it back after it has gone, so a failed step leaves the password to be typed by hand. `vkey login set` alone leaves the tap armed at the login: then the first tap of a double tap is taken as presence and logs in with the keyring locked, and nothing is typed, since the key does not watch for the gesture while it waits for presence |
 
 The scheme before (Ed25519 under the chip key, command `Respond` 0x19, category 201) was
 removed 2026-10-15, restorable from `4bd49f3`; both numbers stay unused. An old `.vkb` may
 hold its item; a restore leaves it in the file. Rejected: USB presence as proof, PIN plus
 tap, rotating HMAC challenge-response, a PAM `cdylib`, a scheme of our own beside `pam_u2f`.
+
+### The login password typed by the key
+
+Since 2026-10-17 (maintainer's decision) `vkey login set` keeps the computer's login
+password on the nRF, and two taps with nothing asked make the key type it, then Enter, as a
+USB keyboard. `pam_u2f` cannot unlock the keyring; the password does. Setting or clearing it
+takes the vkey PIN and a tap; the key checks it is 1-64 printable ASCII characters, so
+no text can carry a second line. The key adds Enter itself, so whatever single line is
+kept is submitted.
+
+| | |
+|---|---|
+| Where it lives | A file in Trussed's littlefs, **not sealed**: the login screen comes before any PIN. A flash copy reads it in the clear, like the passkeys |
+| Key stolen alone | Two taps type the password into any computer; it is the password of this one |
+| Laptop and key stolen together | Two taps log in **and unlock the keyring**, every password the browser keeps included |
+| Focus elsewhere | The password and Enter go wherever the focus is: a chat, a terminal |
+| A late double tap | Two taps that come after a backup or export request timed out land as this gesture and type the password |
+| Malware as the user | With the PIN and a reflex tap it can replace the password with any printable text, which the key then types with Enter; it cannot read it back, no command returns it |
+| Layout | US key codes; another layout, at the login screen or switched in the session, types other characters and the login fails (seen on the board). A part of digits only types the same in layouts that keep them unshifted, Ukrainian among them. Caps Lock is compensated when the host reports its LEDs to the key, which is not yet confirmed on the board |
+| Backup | Carried in the `.vkb` with the passkeys; authenticatorReset and the vault's wipe leave it |
+| `vkey login clear` | Removes the file, not the bytes: littlefs is copy-on-write, so the old password, and any replaced one, stays readable in a flash dump until its block is reused |
+
+The mitigation is a split password, Yubico's advice for its static password: the login
+password is a short part the user remembers followed by a long random part, and only the
+random part is kept. At the login screen the user types the remembered part, then double
+taps. A flash copy, a stolen key and a laptop stolen with the key then each lack the
+remembered part; the rows on focus, a late double tap and `clear` still hold, for the
+random part only. `vkey login set` says so before it asks. Nothing on the key enforces
+it: the key cannot tell a whole password from a part.
+
+Rejected: typing it only while the vault is unlocked (useless at the login screen, where it
+is needed); a single tap or a hold (a late tap after a code request would type it).
 
 ### Git commits signed with a tap
 

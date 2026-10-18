@@ -12,8 +12,9 @@ use rand_core::{CryptoRng, RngCore};
 use zeroize::Zeroizing;
 
 use crate::device::{Device, Reach};
-use crate::hal::{Attachment, Clock, DeviceKey, Port, Ui};
+use crate::hal::{Attachment, Clock, DeviceKey, Keyboard, Port, Ui};
 use crate::item::{Category, ITEM_MAX};
+use crate::login::Login;
 use crate::oath::{NAME_MAX, Name, len_u8};
 use crate::store::MAX_ENTRIES;
 use crate::vault::{Passphrase, Pin};
@@ -35,20 +36,22 @@ enum Malformed {
     Arg,
 }
 
-pub struct Proto<P: Port, C: Clock> {
+pub struct Proto<P: Port, C: Clock, KB: Keyboard> {
     port: P,
     clock: C,
     version: &'static str,
+    keyboard: KB,
 }
 
-impl<P: Port, C: Clock> Proto<P, C> {
+impl<P: Port, C: Clock, KB: Keyboard> Proto<P, C, KB> {
     /// `version` is what INFO answers. Its first line is `vaultkey_core::version!`; a
     /// board may add lines about its chip after it.
-    pub fn new(port: P, clock: C, version: &'static str) -> Self {
+    pub fn new(port: P, clock: C, version: &'static str, keyboard: KB) -> Self {
         Proto {
             port,
             clock,
             version,
+            keyboard,
         }
     }
 
@@ -358,6 +361,20 @@ impl<P: Port, C: Clock> Proto<P, C> {
 
             Cmd::ImportEnd => {
                 let r = dev.import_end();
+                self.result(r);
+            }
+
+            Cmd::LoginSet => {
+                let login = if p.is_empty() {
+                    None
+                } else {
+                    match Login::new(p) {
+                        Some(login) => Some(login),
+                        None => return self.reject(Malformed::Arg),
+                    }
+                };
+                let keyboard = &mut self.keyboard;
+                let r = dev.login(login, |login| keyboard.keep(login));
                 self.result(r);
             }
         }

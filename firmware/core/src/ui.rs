@@ -13,6 +13,10 @@
 //! the reflex that approves a code would hand it over. A tap never wipes and never
 //! exports; a hold never exports either, and two taps never wipe.
 //!
+//! One gesture answers no request: two taps while nothing is asked (`IdleDoubleTap`)
+//! make a board with a keyboard type the login password (maintainer's decision,
+//! 2026-10-17).
+//!
 //! A request can be withdrawn while it waits (`Ui::withdrawn`, a passkey request the
 //! host cancels). That ends the wait the way its deadline would - refused - and never
 //! counts as a press or a hold.
@@ -149,6 +153,106 @@ fn await_release<U: Ui, C: Clock>(ui: &U, clock: &C, deadline: u64) -> bool {
         }
     }
     true
+}
+
+/// The longest press that still counts as one tap of [`IdleDoubleTap`]: a hold is not one.
+const TAP_MAX_MS: u64 = 500;
+/// A pause between samples longer than this starts [`IdleDoubleTap`] over: the key was
+/// serving a request, which waits for the button itself, and whatever the button did
+/// meanwhile belonged to that request.
+const SAMPLE_GAP_MS: u64 = 50;
+
+/// The one gesture made with nothing asked: two short taps within `DOUBLE_TAP_MS`, from a
+/// button seen up first, so one held at boot or still down from a request does not
+/// start it. It types the login password (`crate::login`); nothing else listens to an
+/// idle button. Fed by the board on every idle look at the button, never blocking.
+pub struct IdleDoubleTap {
+    phase: Phase,
+    /// The level as last sampled, and since when.
+    raw: bool,
+    since: u64,
+    /// The level once it has held for `DEBOUNCE_MS`; unknown after a start.
+    settled: Option<bool>,
+    last: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+enum Phase {
+    /// Waiting for the button to be seen up.
+    Unarmed,
+    Ready,
+    /// Down for the first tap, since.
+    First(u64),
+    /// Up after it, since.
+    Between(u64),
+    Second(u64),
+}
+
+impl Default for IdleDoubleTap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IdleDoubleTap {
+    #[must_use]
+    pub const fn new() -> Self {
+        IdleDoubleTap {
+            phase: Phase::Unarmed,
+            raw: false,
+            since: 0,
+            settled: None,
+            last: None,
+        }
+    }
+
+    /// One look at the button at `now`: true when it completes the gesture.
+    pub fn sample(&mut self, pressed: bool, now: u64) -> bool {
+        if self
+            .last
+            .is_none_or(|t| now.saturating_sub(t) > SAMPLE_GAP_MS)
+        {
+            *self = Self::new();
+            self.raw = pressed;
+            self.since = now;
+        }
+        self.last = Some(now);
+        if pressed != self.raw {
+            self.raw = pressed;
+            self.since = now;
+        }
+        let edge = if now - self.since >= DEBOUNCE_MS && self.settled != Some(pressed) {
+            self.settled = Some(pressed);
+            Some(pressed)
+        } else {
+            None
+        };
+        let at = self.since;
+        let (phase, done) = match (self.phase, edge) {
+            // A tap is timed from when the level changed, not from when the debounce let
+            // the change through.
+            (Phase::First(down), Some(false)) if at - down <= TAP_MAX_MS => {
+                (Phase::Between(at), false)
+            }
+            (Phase::Second(down), Some(false)) if at - down <= TAP_MAX_MS => (Phase::Ready, true),
+            // The button seen up, or up after a press held too long: ready for a tap.
+            (Phase::Unarmed | Phase::First(_) | Phase::Second(_), Some(false)) => {
+                (Phase::Ready, false)
+            }
+            (Phase::Between(up), Some(true)) if at - up <= DOUBLE_TAP_MS => {
+                (Phase::Second(at), false)
+            }
+            // A press from ready, or one too late to be the second tap: a first tap.
+            (Phase::Ready | Phase::Between(_), Some(true)) => (Phase::First(at), false),
+            (Phase::Between(up), _) if now - up > DOUBLE_TAP_MS + DEBOUNCE_MS => {
+                (Phase::Ready, false)
+            }
+            // No edge, or one this phase does not wait for: nothing changes.
+            (phase, _) => (phase, false),
+        };
+        self.phase = phase;
+        done
+    }
 }
 
 fn finish<U: Ui, C: Clock>(ui: &mut U, clock: &C, ok: bool) -> bool {

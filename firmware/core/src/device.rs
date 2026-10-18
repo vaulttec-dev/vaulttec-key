@@ -12,6 +12,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::hal::{Attachment, Clock, DeviceKey, Ui};
 use crate::item::{Category, Class, Item, Writer};
+use crate::login::Login;
 use crate::oath::{self, NAME_MAX, Name, Params, len_u8};
 use crate::store::{self, Header, ITEM_BUF_LEN, Index, MAX_ATTEMPTS, Slot, Store, StoredName};
 use crate::ui;
@@ -743,6 +744,25 @@ impl<'m, F: NorFlash, R: RngCore + CryptoRng, U: Ui, C: Clock, K: DeviceKey, A: 
             self.store.save_abort();
         }
         r
+    }
+
+    /// The login password a board's keyboard types, handed to `keep` after the PIN and a
+    /// tap, or forgotten when `None`. It leaves the vault's care for good: the board keeps
+    /// it where the login screen can reach it, which is outside the vault.
+    pub fn login<'a>(
+        &mut self,
+        login: Option<Login<'a>>,
+        keep: impl FnOnce(Option<Login<'a>>) -> bool,
+    ) -> Result<(), Fail> {
+        self.dek()?;
+        if !ui::await_confirmation(&mut self.ui, &self.clock, TOUCH_TIMEOUT_MS) {
+            return Err(Fail::Refused);
+        }
+        if !keep(login) {
+            return Err(Fail::Internal);
+        }
+        self.touch();
+        Ok(())
     }
 
     // --- backup ----------------------------------------------------------------------

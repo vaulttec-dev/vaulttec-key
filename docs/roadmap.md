@@ -68,6 +68,24 @@ All accepted 2026-10-15/16:
 6. Room for more passkeys: vault copies 32 → 24 sectors, littlefs 20 → 44 blocks.
 7. A restore takes the wipe's hold.
 
+## Phase 7 - the login password typed by the key
+
+Built 2026-10-17 and on the board the same day (maintainer's decision): a boot keyboard
+on the nRF that types the login password and Enter on an idle double tap, kept in
+littlefs, set by `vkey login set` under the PIN and a tap; while the `login` switch in
+`/settings` is on, `cosmic-greeter` skips its tap when root asks (the login, not the lock
+screen), and off the login opens with a tap as before. A core change, so the C6's image
+is rebuilt and signed again. Acceptance on the board: a `.vkb` first, `selftest`, the
+`login` switch on, then the COSMIC login after a reboot and the lock screen each by a
+double tap with the keyring unlocked, a double tap with Caps Lock on, `sudo` still by a
+tap, and the switch off leaving a double tap red and the login screen open to a tap
+again. The C6 takes `check --wipe-everything` for the core change; until it does, a release
+says it was not run. Seen on the board: the reboot by a double tap with the keyring
+open, the lock screen and `sudo` by a tap; Caps Lock and the switch off not yet. The
+first image did not enumerate (-110): CDC, CTAPHID and the keyboard make a ~132-byte
+configuration descriptor, past usb-device's 128-byte control buffer, hence
+`control-buffer-256`.
+
 ## Open
 
 - Measure the real passkey capacity (fido-authenticator's estimate is 13).

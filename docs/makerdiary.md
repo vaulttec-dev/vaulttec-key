@@ -36,7 +36,7 @@ LEDs red P0.23, green P0.22, blue P0.24, all active low; amber is red plus green
 | 0x96000..0x97000 | 4 KiB | the app's signature slot |
 | 0x97000..0x98000 | 4 KiB | vkey attempt counter |
 | 0x98000..0xC8000 | 2 × 96 KiB | vkey image copies A and B (24 sectors each) |
-| 0xC8000..0xF4000 | 176 KiB | Trussed littlefs (passkeys), 44 blocks |
+| 0xC8000..0xF4000 | 176 KiB | Trussed littlefs (passkeys, `/vkey-login`), 44 blocks |
 | 0xF4000..0x100000 | 48 KiB | UF2 bootloader fork, CF2 page, MBR params, settings |
 
 No A/B firmware: two copies do not fit. RAM: a 200 KiB stack at the bottom, so an overflow
@@ -55,6 +55,9 @@ CDC (no RTIC, no interrupt, no new `unsafe`). CTAP2 only.
 | Deepest key derivation | ≈166 KiB of stack |
 | Deepest passkey request | ≤ ≈154 KiB (call-graph bound; the high-water mark needs a probe) |
 | Argon2 at `t`=20 | ~1.1 s |
+
+A third USB interface, after CDC and CTAPHID, is a boot keyboard (`src/keyboard.rs`)
+that types only the login password, kept in littlefs as `/vkey-login` (2026-10-17).
 
 Room: fido-authenticator stores a resident key only if six blocks and its size stay free
 after it. `vkey passkey list` reports its own estimate, 13 on an empty filesystem; the real
